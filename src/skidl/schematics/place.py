@@ -207,10 +207,12 @@ def add_anchor_pull_pins(parts, nets, **options):
 
             # Add each pin as an anchor on the part that contains it and
             # as a pull pin on all the other parts that will be pulled by this part.
-            for pin in pins:
+            # Iterate in a stable, id-independent order so the anchor/pull pin
+            # LISTS (and thus the force computation) are reproducible across builds.
+            for pin in sorted(pins, key=_pin_order_key):
                 pin.part.anchor_pins[net].append(pin)
                 add_place_pt(pin.part, pin)
-                for part in net.parts - {pin.part}:
+                for part in sorted(net.parts - {pin.part}, key=_part_order_key):
                     # NetTerminals are pulled towards connected parts, but
                     # those parts are not attracted towards NetTerminals.
                     if not is_net_terminal(pin.part):
@@ -218,7 +220,7 @@ def add_anchor_pull_pins(parts, nets, **options):
 
         # For each net, assign the centroid of the part's anchor pins for that net.
         for net in nets:
-            for part in net.parts:
+            for part in sorted(net.parts, key=_part_order_key):
                 if part.anchor_pins[net]:
                     part.pin_ctrs[net] = pt_sum(
                         pin.place_pt for pin in part.anchor_pins[net]
@@ -737,6 +739,28 @@ def net_force_dist(part, **options):
 attractive_force = net_force_dist
 
 
+def _part_order_key(part):
+    """Stable, id-independent sort key for a Part.
+
+    Placement consumes ``random`` inside loops over parts, so the ITERATION
+    ORDER decides which part/pair gets which random value. Iterating a ``set``
+    of Part objects orders them by ``id()`` (object identity), which differs
+    every build — so a seeded run is still non-deterministic. Sorting on the
+    reference designator (unique, stable across builds) makes the random draw
+    reproducible. ``num`` disambiguates multi-unit parts that share a ref.
+    """
+    return (str(getattr(part, "ref", "") or ""), getattr(part, "num", 0) or 0)
+
+
+def _pin_order_key(pin):
+    """Stable, id-independent sort key for a Pin (see :func:`_part_order_key`)."""
+    return (
+        _part_order_key(pin.part),
+        str(getattr(pin, "num", "") or ""),
+        str(getattr(pin, "name", "") or ""),
+    )
+
+
 @export_to_all
 def overlap_force(part, parts, **options):
     """Compute the repulsive force on a part from overlapping other parts.
@@ -754,8 +778,10 @@ def overlap_force(part, parts, **options):
     part_bbox = part.place_bbox * part.tx
 
     # Compute the overlap force of the bbox of this part with every other part.
+    # Iterate in a stable, id-independent order: random is consumed below to break
+    # symmetry, so set-ordering (by object id) would make a seeded run diverge.
     total_force = Vector(0, 0)
-    for other_part in set(parts) - {part}:
+    for other_part in sorted((p for p in parts if p is not part), key=_part_order_key):
         other_part_bbox = other_part.place_bbox * other_part.tx
 
         # No force unless parts overlap.
@@ -1369,9 +1395,12 @@ class Placer:
                     adjacency[id(p1)].add(p2)
                     adjacency[id(p2)].add(p1)
 
-        # Pick seed: part with most connections.
+        # Pick seed: part with most connections. Iterate parts in a stable,
+        # id-independent order so ties (and the BFS below) resolve reproducibly
+        # across builds — otherwise the row layout is non-deterministic.
+        parts_sorted = sorted(parts, key=_part_order_key)
         id_to_part = {id(p): p for p in parts}
-        seed = max(parts, key=lambda p: len(adjacency.get(id(p), set())))
+        seed = max(parts_sorted, key=lambda p: len(adjacency.get(id(p), set())))
 
         # BFS traversal, placing in rows.
         visited = {id(seed)}
@@ -1380,13 +1409,13 @@ class Placer:
         while queue:
             part = queue.popleft()
             order.append(part)
-            for neighbor in adjacency.get(id(part), set()):
+            for neighbor in sorted(adjacency.get(id(part), set()), key=_part_order_key):
                 if id(neighbor) not in visited:
                     visited.add(id(neighbor))
                     queue.append(neighbor)
 
         # Add any parts not reached by BFS (disconnected within the group).
-        for part in parts:
+        for part in parts_sorted:
             if id(part) not in visited:
                 order.append(part)
 
