@@ -1,0 +1,720 @@
+{
+  "mode": "random",
+  "seeds": [
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "row_threshold_override": null,
+  "max_group_override": null,
+  "results": {
+    "divider": {
+      "seeds": {
+        "1": {
+          "hpwl": 800.0,
+          "routed_wl": 800.0,
+          "wires": 4,
+          "crossings": 0,
+          "time_s": 0.0286,
+          "place_fail": 0,
+          "route_fail": 0,
+          "group_sizes": [
+            2
+          ],
+          "placement_path": [
+            "force"
+          ]
+        },
+        "2": {
+          "hpwl": 800.0,
+          "routed_wl": 850.0,
+          "wires": 6,
+          "crossings": 0,
+          "time_s": 0.0544,
+          "place_fail": 0,
+          "route_fail": 0,
+          "group_sizes": [
+            2
+          ],
+          "placement_path": [
+            "force"
+          ]
+        },
+        "3": {
+          "hpwl": 800.0,
+          "routed_wl": 850.0,
+          "wires": 6,
+          "crossings": 0,
+          "time_s": 0.0463,
+          "place_fail": 0,
+          "route_fail": 0,
+          "group_sizes": [
+            2
+          ],
+          "placement_path": [
+            "force"
+          ]
+        },
+        "4": {
+          "hpwl": 800.0,
+          "routed_wl": 850.0,
+          "wires": 6,
+          "crossings": 0,
+          "time_s": 0.0485,
+          "place_fail": 0,
+          "route_fail": 0,
+          "group_sizes": [
+            2
+          ],
+          "placement_path": [
+            "force"
+          ]
+        },
+        "5": {
+          "hpwl": 800.0,
+          "routed_wl": 800.0,
+          "wires": 4,
+          "crossings": 0,
+          "time_s": 0.2792,
+          "place_fail": 0,
+          "route_fail": 0,
+          "group_sizes": [
+            2
+          ],
+          "placement_path": [
+            "force"
+          ]
+        }
+      },
+      "summary": {
+        "hpwl": {
+          "median": 800.0,
+          "min": 800.0,
+          "max": 800.0,
+          "spread": 0.0
+        },
+        "routed_wl": {
+          "median": 850.0,
+          "min": 800.0,
+          "max": 850.0,
+          "spread": 50.0
+        },
+        "wires": {
+          "median": 6,
+          "min": 4,
+          "max": 6,
+          "spread": 2
+        },
+        "crossings": {
+          "median": 0,
+          "min": 0,
+          "max": 0,
+          "spread": 0
+        },
+        "time_s": {
+          "median": 0.049,
+          "min": 0.029,
+          "max": 0.279,
+          "spread": 0.251
+        }
+      }
+    },
+    "rc_chain8": {
+      "seeds": {
+        "1": {
+          "hpwl": 3800.0,
+          "routed_wl": 4550.0,
+          "wires": 36,
+          "crossings": 0,
+          "time_s": 1.1797,
+          "place_fail": 0,
+          "route_fail": 0,
+          "group_sizes": [
+            8
+          ],
+          "placement_path": [
+            "force"
+          ]
+        },
+        "2": {
+          "hpwl": 3800.0,
+          "routed_wl": 4400.0,
+          "wires": 36,
+          "crossings": 0,
+          "time_s": 0.7044,
+          "place_fail": 0,
+          "route_fail": 0,
+          "group_sizes": [
+            8
+          ],
+          "placement_path": [
+            "force"
+          ]
+        },
+        "3": {
+          "hpwl": 3250.0,
+          "routed_wl": 3300.0,
+          "wires": 25,
+          "crossings": 0,
+          "time_s": 2.8356,
+          "place_fail": 0,
+          "route_fail": 0,
+          "group_sizes": [
+            8
+          ],
+          "placement_path": [
+            "force"
+          ]
+        },
+        "4": {
+          "hpwl": 3350.0,
+          "routed_wl": 3550.0,
+          "wires": 27,
+          "crossings": 0,
+          "time_s": 2.8485,
+          "place_fail": 0,
+          "route_fail": 0,
+          "group_sizes": [
+            8
+          ],
+          "placement_path": [
+            "force"
+          ]
+        },
+        "5": {
+          "hpwl": 3800.0,
+          "routed_wl": 4450.0,
+          "wires": 36,
+          "crossings": 0,
+          "time_s": 4.5555,
+          "place_fail": 0,
+          "route_fail": 0,
+          "group_sizes": [
+            8
+          ],
+          "placement_path": [
+            "force"
+          ]
+        }
+      },
+      "summary": {
+        "hpwl": {
+          "median": 3800.0,
+          "min": 3250.0,
+          "max": 3800.0,
+          "spread": 550.0
+        },
+        "routed_wl": {
+          "median": 4400.0,
+          "min": 3300.0,
+          "max": 4550.0,
+          "spread": 1250.0
+        },
+        "wires": {
+          "median": 36,
+          "min": 25,
+          "max": 36,
+          "spread": 11
+        },
+        "crossings": {
+          "median": 0,
+          "min": 0,
+          "max": 0,
+          "spread": 0
+        },
+        "time_s": {
+          "median": 2.836,
+          "min": 0.704,
+          "max": 4.556,
+          "spread": 3.851
+        }
+      }
+    },
+    "tia_feedback": {
+      "seeds": {
+        "1": {
+          "hpwl": 2450.0,
+          "routed_wl": 750.0,
+          "wires": 5,
+          "crossings": 0,
+          "time_s": 0.2161,
+          "place_fail": 0,
+          "route_fail": 0,
+          "group_sizes": [
+            6
+          ],
+          "placement_path": [
+            "force"
+          ]
+        },
+        "2": {
+          "hpwl": 2450.0,
+          "routed_wl": 650.0,
+          "wires": 5,
+          "crossings": 0,
+          "time_s": 0.16,
+          "place_fail": 0,
+          "route_fail": 0,
+          "group_sizes": [
+            6
+          ],
+          "placement_path": [
+            "force"
+          ]
+        },
+        "3": {
+          "hpwl": 2350.0,
+          "routed_wl": 600.0,
+          "wires": 4,
+          "crossings": 0,
+          "time_s": 0.3014,
+          "place_fail": 0,
+          "route_fail": 0,
+          "group_sizes": [
+            6
+          ],
+          "placement_path": [
+            "force"
+          ]
+        },
+        "4": {
+          "hpwl": 2400.0,
+          "routed_wl": 600.0,
+          "wires": 5,
+          "crossings": 0,
+          "time_s": 0.2197,
+          "place_fail": 0,
+          "route_fail": 0,
+          "group_sizes": [
+            6
+          ],
+          "placement_path": [
+            "force"
+          ]
+        },
+        "5": {
+          "hpwl": 2350.0,
+          "routed_wl": 600.0,
+          "wires": 4,
+          "crossings": 0,
+          "time_s": 0.4938,
+          "place_fail": 0,
+          "route_fail": 0,
+          "group_sizes": [
+            6
+          ],
+          "placement_path": [
+            "force"
+          ]
+        }
+      },
+      "summary": {
+        "hpwl": {
+          "median": 2400.0,
+          "min": 2350.0,
+          "max": 2450.0,
+          "spread": 100.0
+        },
+        "routed_wl": {
+          "median": 600.0,
+          "min": 600.0,
+          "max": 750.0,
+          "spread": 150.0
+        },
+        "wires": {
+          "median": 5,
+          "min": 4,
+          "max": 5,
+          "spread": 1
+        },
+        "crossings": {
+          "median": 0,
+          "min": 0,
+          "max": 0,
+          "spread": 0
+        },
+        "time_s": {
+          "median": 0.22,
+          "min": 0.16,
+          "max": 0.494,
+          "spread": 0.334
+        }
+      }
+    },
+    "mcu_star": {
+      "seeds": {
+        "1": {
+          "hpwl": 7250.0,
+          "routed_wl": 8250.0,
+          "wires": 23,
+          "crossings": 2,
+          "time_s": 0.6996,
+          "place_fail": 0,
+          "route_fail": 0,
+          "group_sizes": [
+            9
+          ],
+          "placement_path": [
+            "force"
+          ]
+        },
+        "2": {
+          "hpwl": 7200.0,
+          "routed_wl": 8000.0,
+          "wires": 26,
+          "crossings": 6,
+          "time_s": 0.5709,
+          "place_fail": 0,
+          "route_fail": 0,
+          "group_sizes": [
+            9
+          ],
+          "placement_path": [
+            "force"
+          ]
+        },
+        "3": {
+          "hpwl": 7050.0,
+          "routed_wl": 4719.0,
+          "wires": 86,
+          "crossings": 5,
+          "time_s": 0.8066,
+          "place_fail": 0,
+          "route_fail": 1,
+          "group_sizes": [
+            9
+          ],
+          "placement_path": [
+            "force"
+          ]
+        },
+        "4": {
+          "hpwl": 7000.0,
+          "routed_wl": 8300.0,
+          "wires": 25,
+          "crossings": 12,
+          "time_s": 0.6018,
+          "place_fail": 0,
+          "route_fail": 0,
+          "group_sizes": [
+            9
+          ],
+          "placement_path": [
+            "force"
+          ]
+        },
+        "5": {
+          "hpwl": 7450.0,
+          "routed_wl": 8550.0,
+          "wires": 22,
+          "crossings": 10,
+          "time_s": 1.0308,
+          "place_fail": 0,
+          "route_fail": 0,
+          "group_sizes": [
+            9
+          ],
+          "placement_path": [
+            "force"
+          ]
+        }
+      },
+      "summary": {
+        "hpwl": {
+          "median": 7200.0,
+          "min": 7000.0,
+          "max": 7450.0,
+          "spread": 450.0
+        },
+        "routed_wl": {
+          "median": 8250.0,
+          "min": 4719.0,
+          "max": 8550.0,
+          "spread": 3831.0
+        },
+        "wires": {
+          "median": 25,
+          "min": 22,
+          "max": 86,
+          "spread": 64
+        },
+        "crossings": {
+          "median": 6,
+          "min": 2,
+          "max": 12,
+          "spread": 10
+        },
+        "time_s": {
+          "median": 0.7,
+          "min": 0.571,
+          "max": 1.031,
+          "spread": 0.46
+        }
+      }
+    },
+    "two_groups": {
+      "seeds": {
+        "1": {
+          "hpwl": 2600.0,
+          "routed_wl": 2700.0,
+          "wires": 18,
+          "crossings": 0,
+          "time_s": 0.3633,
+          "place_fail": 0,
+          "route_fail": 0,
+          "group_sizes": [
+            3,
+            3
+          ],
+          "placement_path": [
+            "force",
+            "force"
+          ]
+        },
+        "2": {
+          "hpwl": 2600.0,
+          "routed_wl": 2700.0,
+          "wires": 18,
+          "crossings": 0,
+          "time_s": 0.2723,
+          "place_fail": 0,
+          "route_fail": 0,
+          "group_sizes": [
+            3,
+            3
+          ],
+          "placement_path": [
+            "force",
+            "force"
+          ]
+        },
+        "3": {
+          "hpwl": 2600.0,
+          "routed_wl": 2750.0,
+          "wires": 20,
+          "crossings": 0,
+          "time_s": 0.8495,
+          "place_fail": 0,
+          "route_fail": 0,
+          "group_sizes": [
+            3,
+            3
+          ],
+          "placement_path": [
+            "force",
+            "force"
+          ]
+        },
+        "4": {
+          "hpwl": 2600.0,
+          "routed_wl": 600.0,
+          "wires": 6,
+          "crossings": 0,
+          "time_s": 0.3107,
+          "place_fail": 0,
+          "route_fail": 1,
+          "group_sizes": [
+            3,
+            3
+          ],
+          "placement_path": [
+            "force",
+            "force"
+          ]
+        },
+        "5": {
+          "hpwl": 2600.0,
+          "routed_wl": 600.0,
+          "wires": 6,
+          "crossings": 0,
+          "time_s": 0.8266,
+          "place_fail": 0,
+          "route_fail": 1,
+          "group_sizes": [
+            3,
+            3
+          ],
+          "placement_path": [
+            "force",
+            "force"
+          ]
+        }
+      },
+      "summary": {
+        "hpwl": {
+          "median": 2600.0,
+          "min": 2600.0,
+          "max": 2600.0,
+          "spread": 0.0
+        },
+        "routed_wl": {
+          "median": 2700.0,
+          "min": 600.0,
+          "max": 2750.0,
+          "spread": 2150.0
+        },
+        "wires": {
+          "median": 18,
+          "min": 6,
+          "max": 20,
+          "spread": 14
+        },
+        "crossings": {
+          "median": 0,
+          "min": 0,
+          "max": 0,
+          "spread": 0
+        },
+        "time_s": {
+          "median": 0.363,
+          "min": 0.272,
+          "max": 0.85,
+          "spread": 0.577
+        }
+      }
+    },
+    "scale_chain28": {
+      "seeds": {
+        "1": {
+          "hpwl": 11350.0,
+          "routed_wl": 2600.0,
+          "wires": 16,
+          "crossings": 0,
+          "time_s": 9.5101,
+          "place_fail": 0,
+          "route_fail": 0,
+          "group_sizes": [
+            14,
+            11,
+            4,
+            1
+          ],
+          "placement_path": [
+            "force",
+            "force",
+            "force",
+            "force"
+          ]
+        },
+        "2": {
+          "hpwl": 11300.0,
+          "routed_wl": 2550.0,
+          "wires": 18,
+          "crossings": 0,
+          "time_s": 6.3052,
+          "place_fail": 0,
+          "route_fail": 0,
+          "group_sizes": [
+            14,
+            11,
+            4,
+            1
+          ],
+          "placement_path": [
+            "force",
+            "force",
+            "force",
+            "force"
+          ]
+        },
+        "3": {
+          "hpwl": 11150.0,
+          "routed_wl": 2400.0,
+          "wires": 16,
+          "crossings": 0,
+          "time_s": 9.1944,
+          "place_fail": 0,
+          "route_fail": 0,
+          "group_sizes": [
+            14,
+            11,
+            4,
+            1
+          ],
+          "placement_path": [
+            "force",
+            "force",
+            "force",
+            "force"
+          ]
+        },
+        "4": {
+          "hpwl": 11350.0,
+          "routed_wl": 2700.0,
+          "wires": 20,
+          "crossings": 0,
+          "time_s": 7.9178,
+          "place_fail": 0,
+          "route_fail": 0,
+          "group_sizes": [
+            14,
+            11,
+            4,
+            1
+          ],
+          "placement_path": [
+            "force",
+            "force",
+            "force",
+            "force"
+          ]
+        },
+        "5": {
+          "hpwl": 11250.0,
+          "routed_wl": 2500.0,
+          "wires": 17,
+          "crossings": 0,
+          "time_s": 7.8569,
+          "place_fail": 0,
+          "route_fail": 0,
+          "group_sizes": [
+            14,
+            11,
+            4,
+            1
+          ],
+          "placement_path": [
+            "force",
+            "force",
+            "force",
+            "force"
+          ]
+        }
+      },
+      "summary": {
+        "hpwl": {
+          "median": 11300.0,
+          "min": 11150.0,
+          "max": 11350.0,
+          "spread": 200.0
+        },
+        "routed_wl": {
+          "median": 2550.0,
+          "min": 2400.0,
+          "max": 2700.0,
+          "spread": 300.0
+        },
+        "wires": {
+          "median": 17,
+          "min": 16,
+          "max": 20,
+          "spread": 4
+        },
+        "crossings": {
+          "median": 0,
+          "min": 0,
+          "max": 0,
+          "spread": 0
+        },
+        "time_s": {
+          "median": 7.918,
+          "min": 6.305,
+          "max": 9.51,
+          "spread": 3.205
+        }
+      }
+    }
+  }
+}

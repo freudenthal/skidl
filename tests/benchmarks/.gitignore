@@ -1,0 +1,4 @@
+# The parent tests/.gitignore ignores *.json, but the seed-placement baseline
+# (stage 19) is a committed reference artifact — re-include it.
+!baseline_random.json
+__pycache__/
