@@ -1440,9 +1440,17 @@ class Placer:
             # Abort if nothing to place.
             return
 
-        # Use row-based placement for large groups.
+        # Use row-based placement for large groups. When seeding, an optional
+        # seed_row_threshold raises this cutoff so constructively-seeded groups
+        # up to that size still get force-directed refinement (NOTE: this is
+        # coupled with auto_stub_max_group, which fragments groups > 20 BEFORE
+        # this point when auto_stub is on — raising one without the other has no
+        # effect; see the stage-19 Phase-A scale finding).
         real_count = sum(1 for p in parts if not is_net_terminal(p))
-        if real_count > node._ROW_PLACE_THRESHOLD:
+        row_threshold = node._ROW_PLACE_THRESHOLD
+        if options.get("seed_placement") and options.get("seed_row_threshold"):
+            row_threshold = options["seed_row_threshold"]
+        if real_count > row_threshold:
             return node.place_connected_parts_rowbased(parts, nets, **options)
 
         # Add bboxes with surrounding area so parts are not butted against each other.
@@ -1451,8 +1459,26 @@ class Placer:
         # Set anchor and pull pins that determine attractive forces between parts.
         add_anchor_pull_pins(parts, nets, **options)
 
-        # Randomly place connected parts.
-        random_placement(parts)
+        # Constructively seed the placement (stage 19) or scatter randomly. The
+        # seed replaces only the INITIAL state; force-directed refinement below
+        # runs identically either way. NetTerminals are skipped (they are
+        # (re)placed by place_net_terminals regardless of their pre-evolve tx).
+        if options.get("seed_placement"):
+            # Absolute import: place()'s constant-injection (line ~1709)
+            # overwrites this module's __package__ with the tool module's, so a
+            # relative import here would resolve under skidl.tools.kicad9.
+            from skidl.schematics.seed_place import seed_placement
+
+            seed_placement(
+                parts,
+                nets,
+                skip=is_net_terminal,
+                max_fanout=options.get("seed_max_fanout", 3),
+                grid=GRID,
+                **{k: v for k, v in options.items() if k not in ("skip", "grid", "max_fanout")},
+            )
+        else:
+            random_placement(parts)
 
         if options.get("draw_placement"):
             # Draw the placement for debug purposes.

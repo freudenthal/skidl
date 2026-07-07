@@ -648,6 +648,19 @@ def gen_schematic(
             "raise" — raise the RoutingFailure so the caller sees it.
             "warn" — produce labels-only but also raise a warning exception.
 
+    Seed-placement options (stage 19; pass as keyword arguments):
+        seed_placement (bool): Replace the random initial placement of each
+            connected group with a deterministic, pin-geometry-aware constructive
+            seed before force-directed refinement. Default False (no change).
+        seed_max_fanout (int): Max pins on a net for it to contribute edges to
+            the seed's wired-adjacency graph (power/high-fanout nets are
+            excluded). Only used when seed_placement=True. Default 3.
+        seed_row_threshold (int): Raises the force-directed vs row-based cutoff
+            for seeded groups only. Coupled with auto_stub_max_group, which
+            fragments groups > 20 BEFORE placement when auto_stub=True — raising
+            this alone has no effect on already-fragmented groups. Only honored
+            when seed_placement=True. Default: node._ROW_PLACE_THRESHOLD.
+
     Tips for best results with auto_stub:
         - Use @subcircuit to group related parts (e.g. power supply, MCU, amplifier).
           Each subcircuit gets placed and routed independently, producing more wired

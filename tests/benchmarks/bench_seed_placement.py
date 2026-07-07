@@ -163,17 +163,20 @@ def _count_crossings(segs):
     return n
 
 
-def run_one(fixture_name, mode, seed, row_threshold=None, max_group=None):
+def run_one(
+    fixture_name, mode, seed, row_threshold=None, max_group=None,
+    seed_max_fanout=None, seed_row_threshold=None,
+):
     """Build + place + route one fixture and return its metrics dict."""
-    if mode == "seed":
-        # Phase C wires this to options["seed_placement"]=True.
-        raise NotImplementedError(
-            "seed mode is implemented in Phase C (stage 19.3)"
-        )
-
     _GROUP_RECORDS.clear()
     circuit = FIXTURES[fixture_name]()
     options = _base_options(seed)
+    if mode == "seed":
+        options["seed_placement"] = True
+        if seed_max_fanout is not None:
+            options["seed_max_fanout"] = seed_max_fanout
+        if seed_row_threshold is not None:
+            options["seed_row_threshold"] = seed_row_threshold
     if max_group is not None:
         options["auto_stub_max_group"] = max_group
 
@@ -291,6 +294,14 @@ def main(argv=None):
         "--max-group", type=int, default=None,
         help="diagnostic: override auto_stub_max_group (keep big groups whole)",
     )
+    ap.add_argument(
+        "--seed-max-fanout", type=int, default=None,
+        help="seed mode: max net fanout to keep in the wired graph (default 3)",
+    )
+    ap.add_argument(
+        "--seed-row-threshold", type=int, default=None,
+        help="seed mode: force-directed cutoff for seeded groups",
+    )
     args = ap.parse_args(argv)
 
     results = {}
@@ -300,6 +311,8 @@ def main(argv=None):
             m = run_one(
                 fx, args.mode, seed,
                 row_threshold=args.row_threshold, max_group=args.max_group,
+                seed_max_fanout=args.seed_max_fanout,
+                seed_row_threshold=args.seed_row_threshold,
             )
             results[fx]["seeds"][str(seed)] = m
             print(
