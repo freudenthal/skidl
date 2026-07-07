@@ -25,11 +25,14 @@ The tool-specific emitter (e.g. kicad9/sexp_schematic.py) reads these
 attributes to draw wires and suppress the corresponding pin labels.
 """
 
+import logging
 import re
 from collections import defaultdict
 
 from skidl.geometry import Point, Tx
 from skidl.schematics.net_terminal import NetTerminal
+
+logger = logging.getLogger(__name__)
 
 
 # PROPOSAL FLAG (default OFF): when True, _stagger_tjunctions drops a junction
@@ -155,6 +158,106 @@ def _compute_snap_tx(my_pin, other_pin, target_world, extend_dir):
     return new_tx.move(offset)
 
 
+# --------------------------------------------------------------------------- #
+# Cross-net collision guard (Blocker B, stage 19)
+# --------------------------------------------------------------------------- #
+#
+# The snap passes place one pin of a 2-pin part exactly on a target pin and let
+# the OTHER pin fall wherever the part geometry puts it, with no check on where
+# that far pin lands. When a far pin (or the snapped pin) coincides with a pin of
+# a DIFFERENT net, the kicad emitter draws a power symbol / label / wire at that
+# shared point and KiCad's connectivity engine fuses the two nets (measured:
+# ldo_bias R7/2(VBIAS_SENSE) landing on C7/2(GND); sipm_tia C15/2(GND) on
+# U1/3(SN)). These helpers let each snap site veto a colliding transform and a
+# final sweep guarantees no cross-net coincidence survives.
+
+_COLLISION_TOL = 1.0  # mils; pins sit on a 100-mil grid, so this is exact-ish.
+
+
+def _net_ident(pin):
+    """A hashable identity for a pin's net: its name if named, else object id.
+
+    Two Net objects can represent the same electrical net; comparing by name
+    treats same-named nets as the same net (correct for coincidence purposes).
+    """
+    net = getattr(pin, "net", None)
+    if net is None:
+        return None
+    return getattr(net, "name", None) or id(net)
+
+
+def _would_collide(part, cand_tx, node, ignore_parts=()):
+    """True if any pin of *part* at *cand_tx* lands on a foreign-net pin.
+
+    Scans every other real part in *node* (at its current ``tx``) for a pin
+    within ``_COLLISION_TOL`` of one of *part*'s pins that belongs to a
+    DIFFERENT net. Everything is in mils, pre-sheet-tx (snap's working space);
+    the per-node sheet transform is affine + uniform, so a pre-sheet-tx
+    coincidence maps 1:1 to an emitted coincidence. NetTerminals are labels
+    relocated at emission, so they are skipped.
+    """
+    mine = []
+    for p in part.pins:
+        w = p.pt * cand_tx
+        mine.append((w.x, w.y, _net_ident(p)))
+
+    for other in node.parts:
+        if other is part or other in ignore_parts:
+            continue
+        if isinstance(other, NetTerminal):
+            continue
+        for op in other.pins:
+            ow = op.pt * other.tx
+            onet = _net_ident(op)
+            for (mx, my, mnet) in mine:
+                if abs(mx - ow.x) <= _COLLISION_TOL and abs(my - ow.y) <= _COLLISION_TOL:
+                    if onet != mnet:
+                        return True
+    return False
+
+
+def _revert_cross_net_snaps(node, snapped, presnap_tx):
+    """Post-snap invariant sweep: revert any snap that fused two nets.
+
+    Runs after every snap stage. For any snapped 2-pin part whose current
+    placement leaves a pin coincident with a foreign-net pin, restore its
+    pre-snap transform (where it kept its labels — always electrically safe).
+    Repeats until clean because reverting one part can clear a collision that
+    was masking another. A cross-net coincidence between two NON-snapped parts
+    is a genuine placement bug we cannot fix here, so it is logged loudly.
+    """
+    for _sweep in range(8):
+        reverted = False
+        for part in node.parts:
+            if id(part) not in snapped:
+                continue
+            if _would_collide(part, part.tx, node):
+                old = presnap_tx.get(id(part))
+                if old is not None and old is not part.tx:
+                    part.tx = old
+                    snapped.discard(id(part))
+                    reverted = True
+                    logger.info(
+                        "snap: reverted %s to pre-snap position (would have fused "
+                        "nets)",
+                        getattr(part, "ref", part),
+                    )
+        if not reverted:
+            break
+
+    # Anything still coincident across nets now involves an unsnapped part; that
+    # is a placement-level collision this pass cannot repair — surface it.
+    for part in node.parts:
+        if isinstance(part, NetTerminal):
+            continue
+        if _would_collide(part, part.tx, node):
+            logger.warning(
+                "snap: residual cross-net pin coincidence at %s after sweep "
+                "(non-snap placement collision)",
+                getattr(part, "ref", part),
+            )
+
+
 def snap_two_pin_parts(node):
     """Snap 2-pin parts onto their connected IC or already-snapped part pins.
 
@@ -174,6 +277,9 @@ def snap_two_pin_parts(node):
         snap_two_pin_parts(child)
 
     node_part_ids = {id(p) for p in node.parts}
+    # Remember every part's placement before any snap runs, so the final
+    # invariant sweep can revert a snap that fused two nets (Blocker B).
+    presnap_tx = {id(p): p.tx for p in node.parts}
     snapped = set()
     occupied_pins = set()
     # How many decoupling caps have already snapped onto each +supply pin, so
@@ -230,22 +336,37 @@ def snap_two_pin_parts(node):
         extend_dir = _pin_world_orient(target_pin, target_part)
         other_pin = p2 if my_pin is p1 else p1
 
-        part.tx = _compute_snap_tx(my_pin, other_pin, target_world, extend_dir)
         if both_power:
             # Multiple decoupling caps share one +supply pin: push each out by a
             # base offset along the pin, then fan successive caps perpendicular
             # so they sit in a readable row instead of stacking on top of
             # each other.
             n = power_pin_cap_idx.get(id(target_pin), 0)
-            power_pin_cap_idx[id(target_pin)] = n + 1
             _offset_dir = {"R": (200, 0), "L": (-200, 0), "U": (0, 200), "D": (0, -200)}
             ax, ay = _offset_dir.get(extend_dir, (200, 0))
             # Unit perpendicular to the outward pin direction (rotate 90°).
             perp_x, perp_y = (-ay // 200, ax // 200)
             FAN_STEP = 300
-            dx = ax + perp_x * FAN_STEP * n
-            dy = ay + perp_y * FAN_STEP * n
-            part.tx = part.tx.move(Point(dx, dy))
+
+            def _fan_tx(fan_n):
+                base = _compute_snap_tx(my_pin, other_pin, target_world, extend_dir)
+                dx = ax + perp_x * FAN_STEP * fan_n
+                dy = ay + perp_y * FAN_STEP * fan_n
+                return base.move(Point(dx, dy))
+
+            # On collision advance the fan index (walk further out along the
+            # perpendicular row) rather than flipping direction, so the fan stays
+            # a straight bus. Give up after a few steps and leave labels.
+            cand = _fan_tx(n)
+            tries = 0
+            while _would_collide(part, cand, node) and tries < 4:
+                n += 1
+                tries += 1
+                cand = _fan_tx(n)
+            if _would_collide(part, cand, node):
+                continue  # skip the snap; part keeps its labels (safe)
+            power_pin_cap_idx[id(target_pin)] = n + 1
+            part.tx = cand
             # Emit a wire from the IC's power pin back to the now-offset cap +ve pin
             # so the connection is visually drawn rather than relying on two power
             # labels. Suppress the cap +ve pin's label since the wire makes it
@@ -258,6 +379,19 @@ def snap_two_pin_parts(node):
             power_cap_suppressed = getattr(node, "_power_cap_suppressed_pins", set())
             power_cap_suppressed.add(id(my_pin))
             node._power_cap_suppressed_pins = power_cap_suppressed
+        else:
+            cand = _compute_snap_tx(my_pin, other_pin, target_world, extend_dir)
+            if _would_collide(part, cand, node):
+                # Try the other extend directions before giving up so a good
+                # layout is preserved where possible.
+                for alt in [d for d in "RLUD" if d != extend_dir]:
+                    alt_cand = _compute_snap_tx(my_pin, other_pin, target_world, alt)
+                    if not _would_collide(part, alt_cand, node):
+                        cand = alt_cand
+                        break
+                else:
+                    continue  # skip the snap entirely; part keeps labels (safe)
+            part.tx = cand
         _stub_snapped_part(part)
         snapped.add(id(part))
         # Decoupling caps fan out off a shared +supply pin, so don't mark it
@@ -333,7 +467,16 @@ def snap_two_pin_parts(node):
             extend_dir = _pin_world_orient(target_pin, target_part)
             other_pin = p2 if my_pin is p1 else p1
 
-            part.tx = _compute_snap_tx(my_pin, other_pin, target_world, extend_dir)
+            cand = _compute_snap_tx(my_pin, other_pin, target_world, extend_dir)
+            if _would_collide(part, cand, node):
+                for alt in [d for d in "RLUD" if d != extend_dir]:
+                    alt_cand = _compute_snap_tx(my_pin, other_pin, target_world, alt)
+                    if not _would_collide(part, alt_cand, node):
+                        cand = alt_cand
+                        break
+                else:
+                    continue  # skip the snap entirely; part keeps labels (safe)
+            part.tx = cand
             _stub_snapped_part(part)
             newly_snapped.add(id(part))
             occupied_pins.add(id(target_pin))
@@ -382,11 +525,26 @@ def snap_two_pin_parts(node):
         extend_dir = perp_map.get(ic_dir, ic_dir)
         other_pin = p2 if my_pin is p1 else p1
 
-        part.tx = _compute_snap_tx(my_pin, other_pin, target_world, extend_dir)
+        cand = _compute_snap_tx(my_pin, other_pin, target_world, extend_dir)
+        if _would_collide(part, cand, node):
+            for alt in [d for d in "RLUD" if d != extend_dir]:
+                alt_cand = _compute_snap_tx(my_pin, other_pin, target_world, alt)
+                if not _would_collide(part, alt_cand, node):
+                    cand = alt_cand
+                    break
+            else:
+                continue  # skip the snap entirely; part keeps labels (safe)
+        part.tx = cand
         _stub_snapped_part(part)
         snapped.add(id(part))
 
     _stagger_tjunctions(node, node_part_ids, snapped, occupied_pins)
+
+    # Guarantee: no snapped 2-pin part may leave a pin coincident with a
+    # foreign-net pin. Any veto above is best-effort per-site; this sweep is the
+    # backstop that reverts any residual cross-net fusion to the pre-snap
+    # placement (where the part kept its labels — always electrically safe).
+    _revert_cross_net_snaps(node, snapped, presnap_tx)
 
 
 def _stagger_tjunctions(node, node_part_ids, snapped, occupied_pins, min_group=2):
@@ -541,16 +699,38 @@ def _stagger_tjunctions(node, node_part_ids, snapped, occupied_pins, min_group=2
 
             parts_list.sort(key=lambda t: getattr(t[0], "ref", ""))
 
-            offset_n = pin_idx + 1
-            ox = ic_pin_world.x + step_dx * (label_clearance + step_size * offset_n)
-            oy = ic_pin_world.y + step_dy * (label_clearance + step_size * offset_n)
-            junction_pt = Point(ox, oy)
+            # Walk the fan's junction point outward (advance offset_n) until no
+            # staggered part lands a pin on a foreign net; keep the fan geometry
+            # consistent by moving the shared junction rather than flipping
+            # individual parts. Give up after a few steps and skip this fan
+            # (parts keep their labels — electrically safe).
+            def _fan_candidates(offset_n):
+                ox = ic_pin_world.x + step_dx * (label_clearance + step_size * offset_n)
+                oy = ic_pin_world.y + step_dy * (label_clearance + step_size * offset_n)
+                jp = Point(ox, oy)
+                cands = []
+                for part_idx, (part, my_pin, other_pin, _, _) in enumerate(parts_list):
+                    ext_dir = extend_dirs[part_idx % len(extend_dirs)]
+                    cands.append(
+                        (part, my_pin, _compute_snap_tx(my_pin, other_pin, jp, ext_dir))
+                    )
+                return ox, oy, cands
 
-            for part_idx, (part, my_pin, other_pin, _, _) in enumerate(parts_list):
-                ext_dir = extend_dirs[part_idx % len(extend_dirs)]
-                part.tx = _compute_snap_tx(
-                    my_pin, other_pin, junction_pt, ext_dir
-                )
+            offset_n = pin_idx + 1
+            ox, oy, cands = _fan_candidates(offset_n)
+            tries = 0
+            while (
+                any(_would_collide(part, tx, node) for part, _, tx in cands)
+                and tries < 3
+            ):
+                offset_n += 1
+                tries += 1
+                ox, oy, cands = _fan_candidates(offset_n)
+            if any(_would_collide(part, tx, node) for part, _, tx in cands):
+                continue  # skip this fan; parts keep their labels (safe)
+
+            for part, my_pin, tx in cands:
+                part.tx = tx
                 _stub_snapped_part(part)
                 snapped.add(id(part))
                 suppressed_pins.add(id(my_pin))
