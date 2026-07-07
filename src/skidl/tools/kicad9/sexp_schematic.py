@@ -44,6 +44,23 @@ _NAMESPACE_UUID = uuid.UUID("7026fcc6-e1a0-409e-aaf4-6a17ea82654f")
 # symbols. Do not change these without re-rendering the vertical + mirrored cases.
 _PIN_LABEL_ANGLE = {"R": 180, "L": 0, "U": 270, "D": 90}
 
+
+def _lib_nickname(part):
+    """Return the library NICKNAME for a part's lib_id (e.g. "Connector_Generic").
+
+    ``part.lib.filename`` may be a bare nickname, a basename with extension, or a
+    full absolute path (when the symbol was resolved by scanning an absolute
+    ``KICAD*_SYMBOL_DIR``). Only the final path component without its extension is
+    a valid KiCad lib nickname; emitting the full path yields a lib_id with
+    backslashes and an extra colon that KiCad refuses to load. Handle both path
+    separators so this is correct regardless of the OS that produced the path.
+    """
+    filename = getattr(getattr(part, "lib", None), "filename", None)
+    if not filename:
+        return "Device"
+    base = str(filename).replace("\\", "/").rsplit("/", 1)[-1]
+    return os.path.splitext(base)[0]
+
 # ---------------------------------------------------------------------------
 # Power symbol support
 # ---------------------------------------------------------------------------
@@ -323,11 +340,7 @@ def part_to_sexp(part, uuid_path, tx=Tx()):
     origin = Point(_round_mm(tx.origin.x), _round_mm(tx.origin.y))
     unit_num = getattr(part, "num", 1)
 
-    lib_name = (
-        os.path.splitext(part.lib.filename)[0]
-        if hasattr(part.lib, "filename") and part.lib.filename
-        else "Device"
-    )
+    lib_name = _lib_nickname(part)
     part_name = part.name or "Unknown"
     lib_id = f"{lib_name}:{part_name}"
 
@@ -485,11 +498,7 @@ def part_to_lib_symbol_definition(part):
     Returns:
         list: Nested list for the lib_symbols section.
     """
-    lib_name = (
-        os.path.splitext(part.lib.filename)[0]
-        if hasattr(part.lib, "filename") and part.lib.filename
-        else "Device"
-    )
+    lib_name = _lib_nickname(part)
     part_name = part.name or "Unknown"
     lib_id = f"{lib_name}:{part_name}"
 
@@ -1086,7 +1095,7 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
     lib_symbols = {}
     for part in node.parts:
         if not isinstance(part, NetTerminal):
-            lib_id = f"{part.lib.filename}:{part.name}"
+            lib_id = f"{_lib_nickname(part)}:{part.name or 'Unknown'}"
             lib_symbols[lib_id] = part
 
     # Power-symbol definitions are emitted later from the instances actually
