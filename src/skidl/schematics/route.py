@@ -11,7 +11,7 @@ import random
 import sys
 from collections import Counter, defaultdict
 from enum import Enum
-from itertools import chain, zip_longest
+from itertools import chain, count, zip_longest
 
 from skidl import Part
 from skidl.utilities import export_to_all, rmv_attr
@@ -360,6 +360,13 @@ class Adjacency:
 class Face(Interval):
     """A side of a rectangle bounding a routing switchbox."""
 
+    # Monotonic creation counter giving every Face a stable total order that is
+    # independent of id()/hash iteration. Face creation order is itself
+    # deterministic (tracks built from sorted coord lists; splits iterate a set
+    # hashed by the stable GlobalTrack.__hash__ == self.idx), so this yields a
+    # reproducible key for the router's face-iteration sites. (stage 19 determinism)
+    _order_counter = count()
+
     def __init__(self, part, track, beg, end):
         """One side of a routing switchbox.
 
@@ -377,6 +384,9 @@ class Face(Interval):
 
         # Initialize the interval beginning and ending defining the Face.
         super().__init__(beg, end)
+
+        # Stable creation-order index for deterministic face iteration.
+        self.order = next(Face._order_counter)
 
         # Store Part/Boundary the Face is part of, if any.
         self.part = set()
@@ -906,6 +916,10 @@ class GlobalTrack(list):
 
     def __hash__(self):
         """This method lets a track be inserted into a set of splits."""
+        # NOTE (stage 19 determinism): this hash MUST stay == self.idx. split_faces
+        # iterates a set of tracks; a stable idx-based hash makes that iteration
+        # order deterministic, which in turn makes Face creation order (and hence
+        # Face.order, relied on by the router's sorted() iteration sites) reproducible.
         return self.idx
 
     def add_split(self, orthogonal_track):
@@ -2059,6 +2073,10 @@ class Router:
     def create_routing_tracks(node, routing_bbox):
         """Create horizontal & vertical global routing tracks."""
 
+        # Reset the Face creation counter per node so order values stay small and
+        # only reflect ordering within this node's routing pass. (stage 19 determinism)
+        Face._order_counter = count()
+
         # Find the coords of the horiz/vert tracks that will hold the H/V faces of the routing switchboxes.
         v_track_coord = []
         h_track_coord = []
@@ -2261,8 +2279,9 @@ class Router:
                         break
 
                     # Get the distances to the faces adjacent to this previously-visited face
-                    # and update the closest face if appropriate.
-                    for adj in visited_face.adjacent:
+                    # and update the closest face if appropriate. Iterate in stable
+                    # Face.order (not id()-hashed set order) for determinism.
+                    for adj in sorted(visited_face.adjacent, key=lambda a: a.face.order):
                         if adj.face in visited_faces:
                             # Don't re-visit faces that have already been visited.
                             continue
@@ -2320,7 +2339,9 @@ class Router:
             bbox = BBox()
             for pin in node.get_internal_pins(net):
                 bbox.add(pin.route_pt)
-            return (bbox.w + bbox.h, len(net.pins))
+            # net.name tiebreak makes the order total (bbox+pin-count ties were
+            # previously left to input order). (stage 19 determinism)
+            return (bbox.w + bbox.h, len(net.pins), getattr(net, "name", "") or "")
 
         # Set order in which nets will be routed.
         nets.sort(key=rank_net)
@@ -2337,7 +2358,9 @@ class Router:
             start_faces = set(net_pin_faces)
 
             # Select a random start face and look for a route to *any* of the other start faces.
-            start_face = random.choice(list(start_faces))
+            # Sort by stable Face.order first so random.choice draws from a
+            # deterministic sequence (set order is id()-hashed). (stage 19 determinism)
+            start_face = random.choice(sorted(start_faces, key=lambda f: f.order))
             start_faces.discard(start_face)
             stop_faces = set(start_faces)
             initial_route = rt_srch(start_face, stop_faces)
@@ -2347,7 +2370,8 @@ class Router:
             stop_faces = set(initial_route)
 
             # Go thru the other start faces looking for a connection to any existing route.
-            for start_face in start_faces:
+            # Iterate in stable Face.order for determinism.
+            for start_face in sorted(start_faces, key=lambda f: f.order):
                 next_route = rt_srch(start_face, stop_faces)
                 global_route.append(next_route)
 
@@ -2395,7 +2419,17 @@ class Router:
         seeds = [swbx for swbx in switchboxes if swbx.has_nets()]
 
         # Sort seeds by perimeter so smaller ones are coalesced before larger ones.
-        seeds.sort(key=lambda swbx: swbx.bbox.w + swbx.bbox.h)
+        # Face.order tuple tiebreak makes equal-perimeter seed order total
+        # (previously equal perimeters were left to id()-order). (stage 19 determinism)
+        seeds.sort(
+            key=lambda swbx: (
+                swbx.bbox.w + swbx.bbox.h,
+                swbx.top_face.order,
+                swbx.bottom_face.order,
+                swbx.left_face.order,
+                swbx.right_face.order,
+            )
+        )
 
         # Coalesce smaller switchboxes into larger ones having more routing area.
         # The smaller switchboxes are removed from the list of switchboxes.
