@@ -140,3 +140,48 @@ def test_seed_tia_completes_without_routing_failure(out_dir):
     # The run must complete (fallback may stub nets, but no unhandled failure).
     path = _gen(c, out_dir, "tia_seed", seed_placement=True)
     assert os.path.getsize(path) > 0
+
+
+def _build_hier_rc(circuit):
+    """One small @subcircuit (RC with an internal wireable ``mid`` net)."""
+    from skidl import Net, Part, subcircuit
+
+    @subcircuit
+    def rc(vin, gnd):
+        mid = Net()
+        r1 = Part("Device", "R", value="10k")
+        c1 = Part("Device", "C", value="100n")
+        vin += r1[1]
+        r1[2] += mid
+        mid += c1[1]
+        c1[2] += gnd
+
+    with circuit:
+        vin, gnd = Net("VIN"), Net("GND")
+        rc(vin, gnd, tag="b1")
+
+
+def _child_wire_count(out, top, **opts):
+    from skidl import Circuit
+
+    os.makedirs(out, exist_ok=True)
+    c = Circuit(name=top)
+    _build_hier_rc(c)
+    _gen(c, out, top, flatness=0.0, **opts)
+    child = os.path.join(out, f"{top}_b1.kicad_sch")
+    assert os.path.exists(child), f"child sheet not generated at {child}"
+    return len(re.findall(r"\(wire\b", _read(child)))
+
+
+@requires_libs
+def test_small_subcircuit_max_zero_keeps_child_wires(out_dir):
+    # Default (skidl blanket-stubs <=6-net subcircuits to labels): the small RC
+    # child sheet routes no wires. Setting the knob to 0 keeps its local wire.
+    default_wires = _child_wire_count(
+        os.path.join(out_dir, "def"), "hier_def"
+    )
+    kept_wires = _child_wire_count(
+        os.path.join(out_dir, "keep"), "hier_keep", auto_stub_small_subcircuit_max=0
+    )
+    assert default_wires == 0
+    assert kept_wires >= 1

@@ -298,6 +298,13 @@ def _classify_and_stub_complex_nets(circuit, node, **options):
 
     max_wire_pins = options.get("auto_stub_max_wire_pins", 3)
     max_wire_dist = options.get("auto_stub_max_wire_dist", 2000)
+    # A child subcircuit with this many routeable nets or fewer has ALL of them
+    # stubbed to labels (small blocks were judged to read cleaner label-only).
+    # This is purely cosmetic — high-pin, distant, and single-pin cross-sheet
+    # nets are already stubbed by the passes above — and it is exactly what
+    # suppresses wires in readable hierarchical sheets (few nets per block).
+    # Set to 0 to keep those wires (the circuit-synth hierarchical renderer does).
+    small_subcircuit_max = options.get("auto_stub_small_subcircuit_max", 6)
 
     def _classify_node(target_node):
         target_parts = set(target_node.parts)
@@ -372,9 +379,10 @@ def _classify_and_stub_complex_nets(circuit, node, **options):
         non_stubbed = [n for n in child_internal
                        if not getattr(n, "_stub", False)]
 
-        # Stub all remaining nets in small subcircuits (<=6 routeable nets).
+        # Stub all remaining nets in small subcircuits (<=N routeable nets).
         # Only large chain structures (switch->R->IC grids) benefit from wiring.
-        if len(non_stubbed) <= 6:
+        # N=0 disables this cosmetic blanket-stub so small sheets keep their wires.
+        if small_subcircuit_max and len(non_stubbed) <= small_subcircuit_max:
             for net in non_stubbed:
                 net._stub = True
                 net._stub_explicit = False
@@ -642,6 +650,10 @@ def gen_schematic(
             post-placement. Default 3.
         auto_stub_max_wire_dist (int): Max manhattan distance (mils) between pins before
             selective routing stubs the net. Default 2000.
+        auto_stub_small_subcircuit_max (int): A child subcircuit with this many routeable
+            nets or fewer has ALL of them stubbed to labels (cosmetic — small blocks were
+            judged to read cleaner label-only). Default 6. Set to 0 to keep wires in small
+            hierarchical sheets (few nets per functional block).
         erc_max_iterations (int): Max ERC correction loop passes. Default 8.
         auto_stub_fallback (str): What to do when routing fails with auto_stub enabled.
             "labels" (default) — fall back to labels-only schematic.
