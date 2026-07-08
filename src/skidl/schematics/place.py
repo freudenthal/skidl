@@ -1701,7 +1701,7 @@ class Placer:
             block_lists = [(g, 1) for g in connected_parts] + [(floating_parts, 2)]
 
         part_blocks = []
-        for part_list, tag in block_lists:
+        for _blk_idx, (part_list, tag) in enumerate(block_lists):
             if not part_list:
                 # No parts in this list for some reason...
                 continue
@@ -1719,8 +1719,13 @@ class Placer:
             pad = BLK_EXT_PAD
             bbox = bbox.resize(Vector(pad, pad))
 
-            # Create the part block and place it on the list.
-            part_blocks.append(PartBlock(part_list, bbox, bbox.ctr, snap_pt, tag))
+            # Create the part block and place it on the list. Give each block a
+            # unique, stable ref so _part_order_key is a TOTAL order over blocks
+            # (all blocks shared ref "REF" before, so overlap_force's sorted()
+            # tie-broke by id() → non-deterministic block layout). (stage 19 determinism)
+            blk = PartBlock(part_list, bbox, bbox.ctr, snap_pt, tag)
+            blk.ref = f"BLK{_blk_idx:04d}"
+            part_blocks.append(blk)
 
         # Add part blocks for child nodes.
         for child in children:
@@ -2098,12 +2103,25 @@ class Placer:
                     **options
                 )
 
+            # Determinism (stage 19): group_parts yields SETS of parts, so
+            # `list(group)` and the group order are id()-ordered — and that order
+            # feeds random_placement (RNG per part) and the force-directed pass,
+            # making a seeded render non-reproducible. Sort by the stable
+            # ref-based key so the RNG draw sequence is build-independent. Sort
+            # the group list too (each place_connected_parts consumes RNG, so
+            # group ORDER matters for later groups + place_blocks).
+            connected_parts = sorted(
+                (sorted(group, key=_part_order_key) for group in connected_parts),
+                key=lambda g: _part_order_key(g[0]) if g else ("", 0),
+            )
+            floating_parts = sorted(floating_parts, key=_part_order_key)
+
             # Place each group of connected parts.
             for group in connected_parts:
-                node.place_connected_parts(list(group), internal_nets, **options)
+                node.place_connected_parts(group, internal_nets, **options)
 
             # Place the floating parts that have no connections to anything else.
-            node.place_floating_parts(list(floating_parts), **options)
+            node.place_floating_parts(floating_parts, **options)
 
             # Now arrange all the blocks of placed parts and the child nodes within this node.
             node.place_blocks(
