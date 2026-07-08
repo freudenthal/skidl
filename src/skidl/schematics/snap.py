@@ -258,6 +258,73 @@ def _revert_cross_net_snaps(node, snapped, presnap_tx):
             )
 
 
+def _resolve_cluster(decl, part, node):
+    """Resolve a declared ``cluster="REF.PIN"`` / ``"REF"`` snap target (stage 24).
+
+    Lets the designer state design intent -- "this 2-pin part belongs on that IC
+    pin" -- so snap honors the declaration instead of guessing by the pin-count
+    heuristic (the Blocker-B root). Returns ``(my_pin, target_pin, target_part)``
+    on success, or ``None`` (after a warning) so the caller falls back to the
+    heuristic. A declaration says WHERE to try, not permission to collide -- every
+    Blocker-B guard (``_would_collide`` veto, ``_revert_cross_net_snaps`` sweep)
+    still applies at the call site. Never fails the render on a bad hint.
+    """
+    decl = str(decl).strip()
+    if not decl:
+        return None
+    ref, _, pin_id = decl.partition(".")
+    ref, pin_id = ref.strip(), pin_id.strip()
+    who = getattr(part, "ref", part)
+
+    # Target part must live on THIS node/sheet (snap works in one node's frame).
+    target_part = next(
+        (p for p in node.parts
+         if not isinstance(p, NetTerminal) and getattr(p, "ref", None) == ref),
+        None,
+    )
+    if target_part is None:
+        logger.warning(
+            "cluster: %s target ref %r not on this sheet; using heuristic", who, ref)
+        return None
+
+    # Candidate target pins: the named/numbered pin, or all pins for a bare ref.
+    if pin_id:
+        cand_pins = [
+            tp for tp in target_part.pins
+            if str(getattr(tp, "num", "")) == pin_id
+            or getattr(tp, "name", None) == pin_id
+        ]
+        if not cand_pins:
+            logger.warning(
+                "cluster: %s pin %r not on %r; using heuristic", who, pin_id, ref)
+            return None
+    else:
+        cand_pins = list(target_part.pins)
+
+    # The target pin must share a net with one of our pins (that shared net's
+    # pin on OUR side becomes my_pin).
+    my_by_net = {
+        id(getattr(p, "net", None)): p
+        for p in part.pins if getattr(p, "net", None) is not None
+    }
+    matches = [
+        (my_by_net[id(tp.net)], tp)
+        for tp in cand_pins
+        if getattr(tp, "net", None) is not None and id(tp.net) in my_by_net
+    ]
+    if not matches:
+        logger.warning(
+            "cluster: %s shares no net with target %r; using heuristic", who, decl)
+        return None
+    if len(matches) > 1 and not pin_id:
+        logger.warning(
+            "cluster: %s bare ref %r ambiguous (%d shared pins); using heuristic",
+            who, ref, len(matches))
+        return None
+    my_pin, target_pin = matches[0]
+    return my_pin, target_pin, target_part
+
+
 def snap_two_pin_parts(node):
     """Snap 2-pin parts onto their connected IC or already-snapped part pins.
 
@@ -289,7 +356,12 @@ def snap_two_pin_parts(node):
     # routed as a single right-angle bus instead of a star of diagonals.
     power_cap_groups = {}
 
-    for part in list(node.parts):
+    # Declared-adjacency (cluster=) parts snap FIRST so they claim their declared
+    # pin before an undeclared part's heuristic can steal it. (stage 24)
+    ordered_parts = sorted(
+        list(node.parts), key=lambda p: 0 if getattr(p, "cluster", None) else 1
+    )
+    for part in ordered_parts:
         if not _is_two_pin_part(part):
             continue
 
@@ -306,28 +378,39 @@ def snap_two_pin_parts(node):
         both_power = _is_power_net(net1) and _is_power_net(net2)
         min_target_pins = 8 if both_power else 2
 
-        for my_p, other_net in [(p1, net1), (p2, net2)]:
-            if _is_power_net(other_net) and not both_power:
-                continue
-            # Decoupling caps (both pins on power) anchor only to the +supply
-            # pin, never GND — this clusters them at the IC's VIN/VDD pin.
-            if both_power and _is_gnd_net(other_net):
-                continue
-            for net_pin in other_net.pins:
-                other_part = net_pin.part
-                if (
-                    other_part is not part
-                    and id(other_part) in node_part_ids
-                    and not isinstance(other_part, NetTerminal)
-                    and len(other_part.pins) > min_target_pins
-                    and id(net_pin) not in occupied_pins
-                ):
-                    target_pin = net_pin
-                    target_part = other_part
-                    my_pin = my_p
+        # Honor an explicit cluster="REF.PIN" declaration before the pin-count
+        # heuristic; on any resolution failure it returns None and we fall
+        # through. The declaration bypasses the size heuristic but keeps every
+        # Blocker-B guard (the _would_collide veto + revert sweep below).
+        decl = getattr(part, "cluster", None)
+        if decl:
+            resolved = _resolve_cluster(decl, part, node)
+            if resolved:
+                my_pin, target_pin, target_part = resolved
+
+        if target_pin is None:
+            for my_p, other_net in [(p1, net1), (p2, net2)]:
+                if _is_power_net(other_net) and not both_power:
+                    continue
+                # Decoupling caps (both pins on power) anchor only to the +supply
+                # pin, never GND — this clusters them at the IC's VIN/VDD pin.
+                if both_power and _is_gnd_net(other_net):
+                    continue
+                for net_pin in other_net.pins:
+                    other_part = net_pin.part
+                    if (
+                        other_part is not part
+                        and id(other_part) in node_part_ids
+                        and not isinstance(other_part, NetTerminal)
+                        and len(other_part.pins) > min_target_pins
+                        and id(net_pin) not in occupied_pins
+                    ):
+                        target_pin = net_pin
+                        target_part = other_part
+                        my_pin = my_p
+                        break
+                if target_pin:
                     break
-            if target_pin:
-                break
 
         if not target_pin:
             continue
