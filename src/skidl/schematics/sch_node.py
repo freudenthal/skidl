@@ -200,6 +200,23 @@ class SchNode(Placer, Router):
                 # Record that this hierarchical node was visited.
                 visited.append(part.hiertuple)
 
+        # find_node_with_part navigates via the children defaultdict, which can
+        # MATERIALISE phantom intermediate children that never receive parts.
+        # Such a node has no .name / .sheet_filename, so place/calc_bbox/emit
+        # crash on it (str+None / AttributeError). Prune them now.
+        self._prune_empty_children()
+
+    def _prune_empty_children(self):
+        """Recursively drop child nodes that have no parts and no non-empty
+        descendants (phantoms from the children defaultdict). Returns True if
+        THIS node is itself empty."""
+        for name in list(self.children.keys()):
+            child = self.children[name]
+            child._prune_empty_children()
+            if not child.parts and not child.children:
+                del self.children[name]
+        return not self.parts and not self.children
+
         # Flatten the hierarchy as specified by the flatness parameter.
         self.flatten(self.flatness)
 
@@ -297,9 +314,15 @@ class SchNode(Placer, Router):
 
     def external_bbox(self):
         """Return the bounding box of a hierarchical sheet as seen by its parent node."""
+        # An empty child node (materialised by the children defaultdict but never
+        # given parts) has sheet_filename/name == None; guard exactly as the
+        # emitter does (sheet_filename or "no_sheet_filename") so calc_bbox on
+        # such a placeholder doesn't crash with a str+None concat.
+        sheet_filename = getattr(self, "sheet_filename", None) or "no_sheet_filename"
+        name = getattr(self, "name", None) or ""
         bbox = BBox(Point(0, 0), Point(500, 500))
-        bbox.add(Point(len("File: " + self.sheet_filename) * self.filename_sz, 0))
-        bbox.add(Point(len("Sheet: " + self.name) * self.name_sz, 0))
+        bbox.add(Point(len("File: " + sheet_filename) * self.filename_sz, 0))
+        bbox.add(Point(len("Sheet: " + name) * self.name_sz, 0))
 
         # Pad the bounding box for extra spacing when placed.
         bbox = bbox.resize(Vector(100, 100))

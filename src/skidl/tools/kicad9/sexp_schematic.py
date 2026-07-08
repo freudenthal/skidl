@@ -24,7 +24,7 @@ from collections import OrderedDict
 
 from simp_sexp import Sexp
 
-from skidl.geometry import Point, Tx
+from skidl.geometry import Point, Segment, Tx
 from skidl.net import NCNet
 from skidl.pckg_info import __version__
 from skidl.schematics.net_terminal import NetTerminal
@@ -724,7 +724,7 @@ def calc_pin_dir(pin):
     }[pin_vector]
 
 
-def net_label_to_sexp(pin, tx=Tx(), force=False, local=False):
+def net_label_to_sexp(pin, tx=Tx(), force=False, local=False, at_world=None):
     """Create S-expression for a net label at a pin stub.
 
     Generates a power symbol if the net name matches a known KiCad power
@@ -768,10 +768,15 @@ def net_label_to_sexp(pin, tx=Tx(), force=False, local=False):
     # ``shape`` field.
     label_type = "label" if local else "global_label"
 
-    # Position at pin location (Y-flip is already in sheet_tx).
-    pin_pt = getattr(pin, "pt", Point(pin.x, pin.y))
-    part_tx = getattr(pin.part, "tx", Tx())
-    pt = pin_pt * part_tx * tx
+    # Position at pin location (Y-flip is already in sheet_tx), unless the
+    # caller overrides with an explicit placement-space point (deconflict-stub
+    # closure labels sit at the pin's deconflicted STUB END, not on the pin).
+    if at_world is not None:
+        pt = at_world * tx
+    else:
+        pin_pt = getattr(pin, "pt", Point(pin.x, pin.y))
+        part_tx = getattr(pin.part, "tx", Tx())
+        pt = pin_pt * part_tx * tx
 
     # Angle + justification chosen so the label text always extends AWAY from
     # the pin (and therefore clear of the part body), for every pin direction
@@ -1218,6 +1223,11 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
 
     # Recurse into children.
     for i, child in enumerate(node.children.values()):
+        # Skip phantom children (materialised by the children defaultdict but
+        # never given parts): they have no .name / .sheet_filename and carry no
+        # circuitry, so there is nothing to emit.
+        if not child.parts and not child.children:
+            continue
         # Give each child a unique UUID path based on its name and index.
         child.uuid = _gen_uuid(f"{child.name}_{i}")
         child_uuid_path = f"{uuid_path}/{child.uuid}"
@@ -1295,6 +1305,13 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
 
     onpin_net_ids = set()  # id(net) of nets relocated on-pin (wire/junction suppressed)
 
+    # Deconflict-stub mode (stage 25): every pin has a deconflicted on-grid stub
+    # end (node._stub_ends); closure labels sit at those ends, one per connected
+    # component, replacing the on-pin / one-backstop label paths below.
+    deconflict = getattr(node, "_deconflict_stubs", False)
+    stub_ends = getattr(node, "_stub_ends", {})
+    terminal_pin_ids = getattr(node, "_stub_terminal_pins", set())
+
     # Generate part S-expressions.
     for part in node.parts:
         if isinstance(part, NetTerminal):
@@ -1302,9 +1319,12 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
             pin = part.pins[0]
             if not pin.is_connected():
                 continue
-            if pin.net.name in nets_with_real_pins:
+            # In deconflict mode the terminal ALWAYS emits its label (at its
+            # stub end): real pins no longer self-label on-pin, so the terminal
+            # is the label for its island; closure labels cover the others.
+            if not deconflict and pin.net.name in nets_with_real_pins:
                 continue
-            real_pin = _onpin_real_pin(pin.net)
+            real_pin = None if deconflict else _onpin_real_pin(pin.net)
             if real_pin is not None:
                 # Emit the label at the real component pin, suppress the
                 # NetTerminal (channel-edge) label + route wire for this net.
@@ -1316,7 +1336,8 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
                     onpin_net_ids.add(id(pin.net))
                 continue
             label = net_label_to_sexp(
-                pin, tx=tx, force=True, local=_is_internal(pin.net)
+                pin, tx=tx, force=True, local=_is_internal(pin.net),
+                at_world=stub_ends.get(id(pin)) if deconflict else None,
             )
             if label:
                 elements.append(label)
@@ -1447,15 +1468,25 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
     wired_pin_ids.update(getattr(node, "_power_cap_suppressed_pins", set()))
 
     # Generate net labels for stubbed pins (skip pins that got direct wires).
+    # In deconflict mode the closure labeller below replaces this per-pin path
+    # for SIGNAL nets (one label per island at a deconflicted stub end, not one
+    # per pin on the pin); only POWER pins are still handled here so they emit
+    # their power symbol at the pin (power nets are excluded from stubbing).
     for part in node.parts:
         if isinstance(part, NetTerminal):
             continue
         for pin in part:
             if id(pin) in wired_pin_ids:
                 continue
-            label = net_label_to_sexp(
-                pin, tx=tx, local=_is_internal(getattr(pin, "net", None))
+            net = getattr(pin, "net", None)
+            is_power = (
+                pin.is_connected()
+                and net is not None
+                and getattr(net, "name", None) in pwr_symbol_names
             )
+            if deconflict and not is_power:
+                continue  # closure labeller handles non-power pins in this mode
+            label = net_label_to_sexp(pin, tx=tx, local=_is_internal(net))
             if label:
                 elements.append(label)
             elif (
@@ -1468,39 +1499,100 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
                 if label:
                     elements.append(label)
 
-    # Backstop label on every ROUTED sheet-internal net (stage 24): a wired net
-    # otherwise carries no on-sheet name. Emit exactly ONE local ``label`` at a
-    # deterministic pin so (a) the net name is visible, (b) if any wire segment
-    # is imperfect the shared local name still closes the net, and (c) the ERC
-    # gate has an anchor. Power nets (power symbols) and cross-sheet nets
-    # (global/hierarchical labels) are excluded; stubbed nets already self-label
-    # above; on-pin-relocated nets keep their single label. Deconfliction
-    # (apply_label_deconfliction, below) resolves any coordinate collision.
-    _labeled_backstop = set()
-    for net, wire in node.wires.items():
-        if not wire or getattr(net, "_stub", False) or id(net) in onpin_net_ids:
-            continue
-        if not _is_internal(net):
-            continue
-        nm = getattr(net, "name", None)
-        if not nm or nm in pwr_symbol_names or id(net) in _labeled_backstop:
-            continue
-        # Deterministic anchor pin: internal pin with the smallest world coord.
-        cand = [
-            p for p in node.get_internal_pins(net)
-            if id(p) not in wired_pin_ids
-        ] or list(node.get_internal_pins(net))
-        if not cand:
-            continue
-        def _pin_world(p):
-            pp = getattr(p, "pt", Point(p.x, p.y))
-            w = pp * getattr(p.part, "tx", Tx()) * tx
-            return (_round_mm(w.x), _round_mm(w.y))
-        anchor = min(cand, key=_pin_world)
-        label = net_label_to_sexp(anchor, tx=tx, force=True, local=True)
-        if label:
-            elements.append(label)
-            _labeled_backstop.add(id(net))
+    if deconflict:
+        # Stage-25 closure labels: ONE label per connected component of each
+        # non-power net's (wires ∪ pins), anchored at a deconflicted stub end.
+        # A fully wired net -> 1 label; a split net -> one label per island,
+        # closing it by shared name WITHOUT a false merge (ends are net-unique,
+        # on-grid cells). Stubbed (label-only) nets also get their pin->end stub
+        # wires drawn here. Half-grid coincidence tolerance (ends are on the
+        # 50-mil grid; nothing lands closer than one grid across nets).
+        _CLOSE_TOL = 25.0
+        net_pins = OrderedDict()
+        for part in node.parts:
+            for pin in part:
+                if not pin.is_connected():
+                    continue
+                net = pin.net
+                if isinstance(net, NCNet) or getattr(net, "_is_power_net", False):
+                    continue
+                if id(pin) not in stub_ends:
+                    continue
+                net_pins.setdefault(id(net), (net, []))[1].append(pin)
+        for _nid, (net, pins) in net_pins.items():
+            nm = getattr(net, "name", None)
+            if not nm or nm in pwr_symbol_names:
+                continue
+            is_stub_net = getattr(net, "_stub", False) or id(net) in onpin_net_ids
+            if is_stub_net:
+                # Draw the pin->end stub wires (the wire block skipped this net)
+                # and use them as the island geometry.
+                segs = []
+                for pin in pins:
+                    end = stub_ends[id(pin)]
+                    pin_w = (pin.pt * pin.part.tx).round()
+                    if (pin_w.x, pin_w.y) != (end.x, end.y):
+                        elements.extend(wire_to_sexp(
+                            net, [Segment(Point(pin_w.x, pin_w.y),
+                                          Point(end.x, end.y))], tx=tx))
+                    segs.append((pin_w.x, pin_w.y, end.x, end.y))
+            else:
+                segs = [(s.p1.x, s.p1.y, s.p2.x, s.p2.y)
+                        for s in node.wires.get(net, [])]
+            pin_by_id = {id(pin): pin for pin in pins}
+            pin_pts = [(id(pin), stub_ends[id(pin)].x, stub_ends[id(pin)].y)
+                       for pin in pins]
+            islands = _decisions.net_islands(pin_pts, segs, tol=_CLOSE_TOL)
+            local = _is_internal(net)
+            for island in islands:
+                # Prefer a real (non-terminal) pin as the anchor; skip an island
+                # that is only a NetTerminal (it already carries the label).
+                real = [pid for pid in island if pid not in terminal_pin_ids]
+                if not real:
+                    continue
+                anchor_pid = min(real, key=lambda pid: (
+                    str(getattr(pin_by_id[pid].part, "ref", "") or ""),
+                    str(pin_by_id[pid].num), pid))
+                label = net_label_to_sexp(
+                    pin_by_id[anchor_pid], tx=tx, force=True, local=local,
+                    at_world=stub_ends[anchor_pid],
+                )
+                if label:
+                    elements.append(label)
+    else:
+        # Backstop label on every ROUTED sheet-internal net (stage 24): a wired
+        # net otherwise carries no on-sheet name. Emit exactly ONE local
+        # ``label`` at a deterministic pin so (a) the net name is visible, (b) if
+        # any wire segment is imperfect the shared local name still closes the
+        # net, and (c) the ERC gate has an anchor. Power nets (power symbols) and
+        # cross-sheet nets (global/hierarchical labels) are excluded; stubbed
+        # nets already self-label above; on-pin-relocated nets keep their single
+        # label. Deconfliction (apply_label_deconfliction) resolves collisions.
+        _labeled_backstop = set()
+        for net, wire in node.wires.items():
+            if not wire or getattr(net, "_stub", False) or id(net) in onpin_net_ids:
+                continue
+            if not _is_internal(net):
+                continue
+            nm = getattr(net, "name", None)
+            if not nm or nm in pwr_symbol_names or id(net) in _labeled_backstop:
+                continue
+            # Deterministic anchor pin: internal pin with the smallest world coord.
+            cand = [
+                p for p in node.get_internal_pins(net)
+                if id(p) not in wired_pin_ids
+            ] or list(node.get_internal_pins(net))
+            if not cand:
+                continue
+            def _pin_world(p):
+                pp = getattr(p, "pt", Point(p.x, p.y))
+                w = pp * getattr(p.part, "tx", Tx()) * tx
+                return (_round_mm(w.x), _round_mm(w.y))
+            anchor = min(cand, key=_pin_world)
+            label = net_label_to_sexp(anchor, tx=tx, force=True, local=True)
+            if label:
+                elements.append(label)
+                _labeled_backstop.add(id(net))
 
     # No-connect flags for NCNet pins.
     for nc_x, nc_y, part_ref, pin_num in _decisions.find_no_connect_pins(node, _backend, tx):
@@ -1670,8 +1762,10 @@ def write_top_schematic(circuit, node, filepath, top_name, title, version=202304
     # Top node is never flattened because it has no parent to accept its contents, so it must always generate a sheet.
     node.flattened = False
 
-    # Generate a deterministic UUID for the top node based on its name.
-    node.uuid = _gen_uuid(node.name)
+    # Generate a deterministic UUID for the top node based on its name. A top
+    # node built from a circuit whose parts carry no hierarchy level never had
+    # .name assigned by add_part; fall back to top_name.
+    node.uuid = _gen_uuid(getattr(node, "name", None) or top_name)
 
     # UUID paths start from this root node. Used for hierarchical sheet references.
     uuid_path = f"/{node.uuid}"

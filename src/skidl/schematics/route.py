@@ -408,6 +408,7 @@ class Router:
         node._stub_ends = {}
         node._stub_wire_nets = defaultdict(list)
         node._stub_terminal_pins = set()  # NetTerminal pins (own label already)
+        node._deconflict_stubs = True  # signals the emitter's closure labeller
 
         internal_ids = {id(n) for n in internal_nets}
 
@@ -520,6 +521,12 @@ class Router:
             end_w = Point(round(end_x), round(end_y))
             occupied[cell(end_w.x, end_w.y)] = net
             node._stub_ends[id(pin)] = end_w
+            # Protect the stub END from cleanup's trim_stubs: when A* routes
+            # collinearly with a stub, split_segments cuts at the pin and the
+            # outer piece (pin->end) becomes a leaf. Only pin_pts endpoints are
+            # spared, so register the end too — else the deconfliction is undone
+            # and the closure label at the end would dangle.
+            pin_pts.append(end_w)
 
             # route_pt (local) maps back to the world end so the A* router wires
             # the deconflicted end. The emitted stub segment uses exact world
@@ -538,6 +545,14 @@ class Router:
 
     def cleanup_wires(node):
         """Try to make wire segments look prettier."""
+
+        # Deconflict-stub mode (stage 25): the A* output is already a clean,
+        # connected, axis-aligned tree, and every pin has an intentional stub to
+        # a deconflicted on-grid end (registered in pin_pts so trim_stubs spares
+        # it). remove_jogs (cosmetic, and nondeterministic via random.shuffle)
+        # reshapes routing OFF those ends -> lost pin connections, so it is
+        # skipped in this mode; the other passes run normally.
+        _deconflict = getattr(node, "_deconflict_stubs", False)
 
         def order_seg_points(segments):
             """Order endpoints in a horizontal or vertical segment."""
@@ -940,13 +955,17 @@ class Router:
             # Keep only non zero-length segments.
             segments = [seg for seg in segments if seg.p1 != seg.p2]
 
-            # Trim wire stubs.
+            # Trim genuinely-dangling wire stubs. In deconflict mode the
+            # intended pin->end stubs are spared because their ends are
+            # registered in pin_pts (is_pin_pt), so only true A*/merge artifacts
+            # are removed.
             segments = trim_stubs(segments)
 
             node.wires[net] = segments
 
-        # Remove jogs in the wire segments of each net.
-        keep_cleaning = True
+        # Remove jogs in the wire segments of each net (skipped in deconflict
+        # mode -- cosmetic + nondeterministic, and it disconnects stub ends).
+        keep_cleaning = not _deconflict
         while keep_cleaning:
             keep_cleaning = False
 

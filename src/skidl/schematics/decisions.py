@@ -154,6 +154,72 @@ def _seg_crosses_box(a, b, bmin, bmax, inset=0.5):
     return t0 <= t1
 
 
+def _on_segment(px, py, x0, y0, x1, y1, tol):
+    """True if point (px,py) lies on the axis-aligned segment (x0,y0)-(x1,y1)."""
+    if abs(y0 - y1) <= tol:  # horizontal
+        return abs(py - y0) <= tol and min(x0, x1) - tol <= px <= max(x0, x1) + tol
+    if abs(x0 - x1) <= tol:  # vertical
+        return abs(px - x0) <= tol and min(y0, y1) - tol <= py <= max(y0, y1) + tol
+    return False
+
+
+def net_islands(pin_points, segments, tol=1.0):
+    """Partition a net's pins into connected components (union-find).
+
+    Space-agnostic pure geometry (the deconflicted-stub closure labeller, stage
+    25, calls it in placement-mil space). A net whose wires fully connect its
+    pins yields ONE island -> one closure label; a partially-wired net yields
+    one island PER connected group -> one label each, closing the net by shared
+    name without a false merge (labels sit on deconflicted, net-unique cells).
+
+    Args:
+        pin_points: list of ``(key, x, y)`` -- each pin's STUB-END coordinate.
+        segments:   list of ``(x0, y0, x1, y1)`` -- the net's wire segments
+                    (pin->end stubs plus any routed segments).
+        tol:        coincidence tolerance (same units as the coords).
+
+    Returns:
+        list of lists of ``key`` -- one inner list per connected component,
+        each in the input order of ``pin_points``. Over-splitting is safe
+        (redundant same-name labels still merge); it never under-splits.
+    """
+    parent = {}
+
+    def find(a):
+        root = a
+        while parent[root] != root:
+            root = parent[root]
+        while parent[a] != root:
+            parent[a], a = root, parent[a]
+        return root
+
+    def union(a, b):
+        parent.setdefault(a, a)
+        parent.setdefault(b, b)
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    def cell(x, y):
+        return (round(x / max(tol, 1e-9)), round(y / max(tol, 1e-9)))
+
+    for key, x, y in pin_points:
+        parent.setdefault(cell(x, y), cell(x, y))
+    for x0, y0, x1, y1 in segments:
+        union(cell(x0, y0), cell(x1, y1))
+    # Fold in T-joins: a pin end that sits on a segment interior (e.g. after
+    # cleanup merged a stub into a collinear routed run) is still connected.
+    for key, x, y in pin_points:
+        for x0, y0, x1, y1 in segments:
+            if _on_segment(x, y, x0, y0, x1, y1, tol):
+                union(cell(x, y), cell(x0, y0))
+
+    groups = defaultdict(list)
+    for key, x, y in pin_points:
+        groups[find(cell(x, y))].append(key)
+    return list(groups.values())
+
+
 def _part_render_bbox(part, backend, sheet_tx):
     """Axis-aligned (min, max) of a part's body in render-mm, or None.
 
