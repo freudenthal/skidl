@@ -441,8 +441,11 @@ def _handle_fallback(circuit, tool_module, filepath, top_name, title, flatness,
     preprocess_circuit(circuit, **options)
     node = SchNode(circuit, tool_module, filepath, top_name, title, flatness)
     node.place(expansion_factor=1.0, **options)
+    if options.get("snap_before_route", False):
+        _snap_two_pin_parts(node, stub=False)
     node.route(**options)
-    _snap_two_pin_parts(node)
+    if not options.get("snap_before_route", False):
+        _snap_two_pin_parts(node)
     output_file = write_top_schematic(
         circuit, node, filepath, top_name, title, version=20230409
     )
@@ -759,6 +762,11 @@ def gen_schematic(
                 _place_and_classify(
                     node, circuit, expansion_factor, classify=False, **options
                 )
+            # Stage-24 wired mode: snap BEFORE route (parts positioned, NOT
+            # stubbed) so the per-net A* router wires every net on the final
+            # geometry. Classic order (route then snap) stays the default.
+            if options.get("snap_before_route", False) and options.get("auto_stub", False):
+                _snap_two_pin_parts(node, stub=False)
             node.route(**options)
 
         except PlacementFailure as e:
@@ -778,7 +786,7 @@ def gen_schematic(
             )
             continue
 
-        if options.get("auto_stub", False):
+        if options.get("auto_stub", False) and not options.get("snap_before_route", False):
             _snap_two_pin_parts(node)
 
         # Generate S-expression schematic using shared module.
@@ -829,8 +837,10 @@ def gen_schematic(
                             flatness,
                         )
                         _place_and_classify(node, circuit, erc_expansion, **options)
+                        if options.get("snap_before_route", False) and options.get("auto_stub", False):
+                            _snap_two_pin_parts(node, stub=False)
                         node.route(**options)
-                        if options.get("auto_stub", False):
+                        if options.get("auto_stub", False) and not options.get("snap_before_route", False):
                             _snap_two_pin_parts(node)
                         output_file = write_top_schematic(
                             circuit, node, filepath, top_name, title, version=20230409

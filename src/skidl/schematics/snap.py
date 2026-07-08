@@ -325,7 +325,7 @@ def _resolve_cluster(decl, part, node):
     return my_pin, target_pin, target_part
 
 
-def snap_two_pin_parts(node):
+def snap_two_pin_parts(node, stub=True):
     """Snap 2-pin parts onto their connected IC or already-snapped part pins.
 
     Pass 1: Snap onto IC pins (parts with >2 pins). Each IC pin only accepts
@@ -339,9 +339,17 @@ def snap_two_pin_parts(node):
     between multiple 2-pin parts (e.g. switch + pull-down on the same IC input).
 
     Recurses into child nodes first.
+
+    Args:
+        stub: When True (default, the classic route->snap order) a snapped
+            part's nets are stubbed to labels because snapping moves parts
+            AFTER routing, invalidating the routed wires. When False (the
+            stage-24 snap->route order) snap only MOVES parts; the per-net A*
+            router then wires every net on the final geometry, so pin-touched
+            pairs route to nothing (coincident) and spread nets get real wires.
     """
     for child in node.children.values():
-        snap_two_pin_parts(child)
+        snap_two_pin_parts(child, stub=stub)
 
     node_part_ids = {id(p) for p in node.parts}
     # Remember every part's placement before any snap runs, so the final
@@ -475,7 +483,8 @@ def snap_two_pin_parts(node):
                 else:
                     continue  # skip the snap entirely; part keeps labels (safe)
             part.tx = cand
-        _stub_snapped_part(part)
+        if stub:
+            _stub_snapped_part(part)
         snapped.add(id(part))
         # Decoupling caps fan out off a shared +supply pin, so don't mark it
         # occupied — let later caps cluster on the same pin. Single-target snaps
@@ -560,7 +569,8 @@ def snap_two_pin_parts(node):
                 else:
                     continue  # skip the snap entirely; part keeps labels (safe)
             part.tx = cand
-            _stub_snapped_part(part)
+            if stub:
+                _stub_snapped_part(part)
             newly_snapped.add(id(part))
             occupied_pins.add(id(target_pin))
 
@@ -618,10 +628,11 @@ def snap_two_pin_parts(node):
             else:
                 continue  # skip the snap entirely; part keeps labels (safe)
         part.tx = cand
-        _stub_snapped_part(part)
+        if stub:
+            _stub_snapped_part(part)
         snapped.add(id(part))
 
-    _stagger_tjunctions(node, node_part_ids, snapped, occupied_pins)
+    _stagger_tjunctions(node, node_part_ids, snapped, occupied_pins, stub=stub)
 
     # Guarantee: no snapped 2-pin part may leave a pin coincident with a
     # foreign-net pin. Any veto above is best-effort per-site; this sweep is the
@@ -630,7 +641,7 @@ def snap_two_pin_parts(node):
     _revert_cross_net_snaps(node, snapped, presnap_tx)
 
 
-def _stagger_tjunctions(node, node_part_ids, snapped, occupied_pins, min_group=2):
+def _stagger_tjunctions(node, node_part_ids, snapped, occupied_pins, min_group=2, stub=True):
     """Detect repeating T-junction patterns and stagger parts outward from IC.
 
     Phase 1: identify stagger groups, compute how much space each needs,
@@ -814,7 +825,8 @@ def _stagger_tjunctions(node, node_part_ids, snapped, occupied_pins, min_group=2
 
             for part, my_pin, tx in cands:
                 part.tx = tx
-                _stub_snapped_part(part)
+                if stub:
+                    _stub_snapped_part(part)
                 snapped.add(id(part))
                 suppressed_pins.add(id(my_pin))
             junction_wires.append(
