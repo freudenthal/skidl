@@ -164,12 +164,13 @@ class SchNode(Placer, Router):
                 if len(net.pins) == 1:
                     # Single pin on net and not stubbed, so add a terminal to it below.
                     pass
-                elif not net.is_implicit():
-                    # The net has a user-assigned name, so add a terminal to it below.
-                    pass
                 else:
-                    # No need for net terminal because there are multiple pins
-                    # and they are all in the same node.
+                    # Multiple pins, all in the same node: no NetTerminal — the
+                    # routed wires carry connectivity, and an edge-placed terminal
+                    # label for a fully-internal net forces the router to route
+                    # across the whole sheet (measured: BST3/PGOOD nets fail global
+                    # routing because of exactly this). This drops the redundant
+                    # name label for named internal nets too. (stage 19 router robustness)
                     continue
 
             # Add a single terminal to each node that contains one or more pins of the net.
