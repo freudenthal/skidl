@@ -804,6 +804,13 @@ def _kicad_pin_pos(pin, part_tx, sheet_tx):
     KiCad's pin transform order: Y-flip, rotate(-angle), then mirror.
     The angle from analyze_transform() is the visual angle in SKiDL's Y-up
     space; KiCad uses its negative because the sheet Y-flip reverses rotation.
+
+    NOTE (stage 19): two coordinate formulas coexist. Emission elsewhere uses
+    ``pin.pt * part.tx * sheet_tx`` (Point.__mul__); this path re-derives the
+    rotation via ``analyze_transform``. They were verified to agree for every
+    dihedral ``part.tx`` (all rotations/mirrors snap produces), but would
+    silently diverge if a non-dihedral (shear/non-uniform) tx ever appeared. The
+    connectivity audit (_audit_sheet_connectivity) would catch any real desync.
     """
     import math
 
@@ -1050,6 +1057,86 @@ def _power_lib_ids_in_elements(elements):
             ):
                 found.add(sub[1])
     return found
+
+
+# When True, audit each finished sheet for cross-net pin/label/power-symbol
+# coincidences and log a loud WARNING for any it finds. This is a DIAGNOSTIC
+# tripwire (stage 19) — the equivalence gate + native fallback downstream remain
+# the enforcement; the audit just localizes a fusion to sheet/nets/coords. Cheap
+# at these sheet sizes; flip off if it is ever noisy.
+_EMIT_CONNECTIVITY_AUDIT = True
+
+
+def _audit_sheet_connectivity(node, elements, backend, sheet_tx):
+    """Log a WARNING for any coordinate owned by more than one net name.
+
+    Builds ``{rounded (x,y) -> set(net names)}`` over every emitted connection
+    anchor with a known net — component pins (via ``backend.pin_render_pos``),
+    ``global_label`` / ``hierarchical_label`` / ``label`` text, and ``power:``
+    symbol instances. A cell owned by >1 net is exactly the fusion mechanism
+    Blocker B fixed and the phases-3/4 hardening must keep closed. Render-space
+    version of snap's occupancy checker; catches all coincidence-class fusers.
+    """
+    if not _EMIT_CONNECTIVITY_AUDIT:
+        return
+
+    from collections import defaultdict
+
+    def _key(x, y):
+        return (round(float(x), 2), round(float(y), 2))
+
+    cell_nets = defaultdict(set)
+
+    # Component pins -> net name.
+    for part in node.parts:
+        if isinstance(part, NetTerminal):
+            continue
+        for pin in part:
+            net = getattr(pin, "net", None)
+            name = getattr(net, "name", None)
+            if not name:
+                continue
+            try:
+                x, y = backend.pin_render_pos(pin, sheet_tx)
+            except Exception:  # noqa: BLE001 - audit must never break emission
+                continue
+            cell_nets[_key(x, y)].add(name)
+
+    # Emitted labels + power symbols -> net name.
+    for elem in elements:
+        if not (hasattr(elem, "__getitem__") and len(elem) >= 1):
+            continue
+        tag = elem[0]
+        if tag in ("global_label", "hierarchical_label", "label"):
+            at = next(
+                (s for s in elem if hasattr(s, "__getitem__") and len(s) >= 3 and s[0] == "at"),
+                None,
+            )
+            if at and isinstance(elem[1], str):
+                cell_nets[_key(at[1], at[2])].add(elem[1])
+        elif tag == "symbol":
+            lib_id = next(
+                (s for s in elem if hasattr(s, "__getitem__") and len(s) >= 2 and s[0] == "lib_id"),
+                None,
+            )
+            if lib_id and str(lib_id[1]).startswith("power:"):
+                at = next(
+                    (s for s in elem if hasattr(s, "__getitem__") and len(s) >= 3 and s[0] == "at"),
+                    None,
+                )
+                if at:
+                    cell_nets[_key(at[1], at[2])].add(str(lib_id[1])[len("power:"):])
+
+    from skidl.logger import active_logger
+
+    sheet = getattr(node, "sheet_filename", None) or getattr(node, "name", "?")
+    for (x, y), names in sorted(cell_nets.items()):
+        if len(names) > 1:
+            active_logger.warning(
+                "connectivity audit: sheet %s cell (%s, %s) shared by nets %s "
+                "(cross-net coincidence -> KiCad would fuse them)",
+                sheet, x, y, sorted(names),
+            )
 
 
 @export_to_all
@@ -1457,6 +1544,11 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
     # Decision (overlap + nudge target) lives in schematics/decisions.py; the
     # backend reads/mutates the label Sexps and appends connecting wires.
     _backend.apply_label_deconfliction(elements, node, tx)
+
+    # Diagnostic: warn if any coordinate ended up shared by two nets (the
+    # fusion mechanism Blocker B fixed). Enforcement is the downstream
+    # equivalence gate + native fallback; this just localizes a regression.
+    _audit_sheet_connectivity(node, elements, _backend, tx)
 
     # Add all the collected elements of the schematic.
     for elem in elements:

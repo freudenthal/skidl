@@ -164,6 +164,33 @@ class Kicad9Backend:
                     for xy in pts[1:]:
                         if hasattr(xy, "__getitem__") and len(xy) >= 3 and xy[0] == "xy":
                             occupied_seed.append((_cell(float(xy[1]), float(xy[2])), None))
+            elif elem[0] == "symbol":
+                # Power symbols occupy their pin cell (= the symbol `at`) on a
+                # power net. Seed it keyed by that net so a signal label can't be
+                # nudged onto it and fused into the rail (stage 19, Blocker B
+                # hardening). Its lib_id is "power:<net>".
+                lib_id = next(
+                    (s for s in elem if hasattr(s, "__getitem__") and len(s) >= 2 and s[0] == "lib_id"),
+                    None,
+                )
+                if lib_id and str(lib_id[1]).startswith("power:"):
+                    at = next(
+                        (s for s in elem if hasattr(s, "__getitem__") and len(s) >= 3 and s[0] == "at"),
+                        None,
+                    )
+                    if at:
+                        occupied_seed.append(
+                            (_cell(float(at[1]), float(at[2])), str(lib_id[1])[len("power:"):])
+                        )
+            elif elem[0] == "junction":
+                # A junction is a real connection point; block its cell so a label
+                # is never nudged onto it (net unknown -> never reuse).
+                at = next(
+                    (s for s in elem if hasattr(s, "__getitem__") and len(s) >= 3 and s[0] == "at"),
+                    None,
+                )
+                if at:
+                    occupied_seed.append((_cell(float(at[1]), float(at[2])), None))
 
         # Extract label records to move (in element order), with their `at` sexp.
         labels = []
