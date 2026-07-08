@@ -724,17 +724,26 @@ def calc_pin_dir(pin):
     }[pin_vector]
 
 
-def net_label_to_sexp(pin, tx=Tx(), force=False):
+def net_label_to_sexp(pin, tx=Tx(), force=False, local=False):
     """Create S-expression for a net label at a pin stub.
 
     Generates a power symbol if the net name matches a known KiCad power
-    symbol, otherwise generates a global_label.
+    symbol; otherwise a local ``label`` (``local=True``) or a ``global_label``.
 
     Args:
         pin: Pin with net connection.
         tx: Transformation matrix.
         force: If True, skip the stub check (used for NetTerminal pins
             which always need a label regardless of stub state).
+        local: If True, emit a SHEET-LOCAL ``label`` instead of a project-wide
+            ``global_label``. Use for sheet-INTERNAL nets (stage 24 scoping
+            fix): a ``global_label`` connects by name across every sheet in the
+            project, so an internal net named e.g. ``SW3`` on two sheets would
+            silently merge -- a Blocker-B-class leak. A local ``label`` is
+            confined to its sheet. Verified ERC-clean on KiCad 10 whether it
+            sits on a pin or a wire end (only the benign isolated_pin_label
+            warning, identical to global_label). Cross-sheet nets must stay
+            ``global_label`` (or use the hierarchical_label machinery).
 
     Returns:
         Sexp or None: Label/power symbol S-expression, or None if no label needed.
@@ -746,19 +755,18 @@ def net_label_to_sexp(pin, tx=Tx(), force=False):
         return None
 
     # Check if this net matches a known KiCad power symbol.
-    # If so, emit a power symbol instance instead of a global_label.
+    # If so, emit a power symbol instance instead of a label.
     # This eliminates power_pin_not_driven ERC errors.
     if pin.is_connected() and pin.net.name in pwr_symbol_names:
         pwr = _power_symbol_to_sexp(pin, pin.net.name, tx)
         if pwr:
             return pwr
 
-    # Use global_label for reliable connectivity.  KiCad 9's ERC treats
-    # plain labels as dangling unless they sit in the interior of a wire
-    # segment between two connection points.  global_label connects at
-    # any pin or wire endpoint, producing only an informational "not
-    # connected elsewhere" warning on single-sheet designs.
-    label_type = "global_label"
+    # Sheet-INTERNAL nets get a local ``label`` (sheet-scoped); everything else
+    # (cross-sheet / boundary nets) keeps ``global_label`` for project-wide,
+    # name-based connectivity. A local label is a global_label Sexp minus the
+    # ``shape`` field.
+    label_type = "label" if local else "global_label"
 
     # Position at pin location (Y-flip is already in sheet_tx).
     pin_pt = getattr(pin, "pt", Point(pin.x, pin.y))
@@ -779,18 +787,16 @@ def net_label_to_sexp(pin, tx=Tx(), force=False):
     angle = _PIN_LABEL_ANGLE[calc_pin_dir(pin)]
     justify = "left" if angle in (0, 90) else "right"
 
-    label = Sexp(
-        [
-            label_type,
-            pin.net.name,
-            ["shape", "bidirectional"],
-            ["at", _round_mm(pt.x), _round_mm(pt.y), angle],
-            ["effects", ["font", ["size", 1.27, 1.27]], ["justify", justify]],
-            ["uuid", _gen_uuid(f"label:{pin.net.name}:{pt.x}:{pt.y}")],
-        ]
-    )
-
-    return label
+    fields = [label_type, pin.net.name]
+    if not local:
+        # global_label carries a shape; a plain label does not.
+        fields.append(["shape", "bidirectional"])
+    fields.extend([
+        ["at", _round_mm(pt.x), _round_mm(pt.y), angle],
+        ["effects", ["font", ["size", 1.27, 1.27]], ["justify", justify]],
+        ["uuid", _gen_uuid(f"label:{pin.net.name}:{pt.x}:{pt.y}")],
+    ])
+    return Sexp(fields)
 
 
 # ---------------------------------------------------------------------------
@@ -1066,6 +1072,16 @@ def _power_lib_ids_in_elements(elements):
 # at these sheet sizes; flip off if it is ever noisy.
 _EMIT_CONNECTIVITY_AUDIT = True
 
+# When strict, a shared-coordinate fusion RAISES instead of only warning, so the
+# skidl render aborts and the equivalence gate installs the native render
+# instead (correctness stays safe). Off by default (warn-only); the circuit-synth
+# skidl-render path sets SKIDL_AUDIT_STRICT=1. (stage 24)
+_AUDIT_STRICT = os.environ.get("SKIDL_AUDIT_STRICT", "0") not in ("0", "", "false", "False")
+
+
+class SheetConnectivityError(Exception):
+    """A rendered sheet has a coordinate owned by more than one net (a fusion)."""
+
 
 def _audit_sheet_connectivity(node, elements, backend, sheet_tx):
     """Log a WARNING for any coordinate owned by more than one net name.
@@ -1130,6 +1146,7 @@ def _audit_sheet_connectivity(node, elements, backend, sheet_tx):
     from skidl.logger import active_logger
 
     sheet = getattr(node, "sheet_filename", None) or getattr(node, "name", "?")
+    fusions = []
     for (x, y), names in sorted(cell_nets.items()):
         if len(names) > 1:
             active_logger.warning(
@@ -1137,6 +1154,14 @@ def _audit_sheet_connectivity(node, elements, backend, sheet_tx):
                 "(cross-net coincidence -> KiCad would fuse them)",
                 sheet, x, y, sorted(names),
             )
+            fusions.append(((x, y), sorted(names)))
+    if fusions and _AUDIT_STRICT:
+        # Hard-fail so the caller (equivalence gate) falls back to the native
+        # render rather than installing a schematic with a silent net fusion.
+        raise SheetConnectivityError(
+            f"sheet {sheet}: {len(fusions)} cross-net coordinate collision(s); "
+            f"first: cell {fusions[0][0]} shared by {fusions[0][1]}"
+        )
 
 
 @export_to_all
@@ -1234,6 +1259,19 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
     node_part_ids = {id(p) for p in node.parts}
     _onpin_enabled = os.environ.get("SKIDL_ONPIN_LABELS", "1") != "0"
 
+    # Sheet-INTERNAL vs cross-sheet classification for label scoping (stage 24).
+    # A net with a pin on a part OUTSIDE this node is a boundary/cross-sheet net
+    # and keeps its project-wide global_label; everything else is sheet-internal
+    # and gets a sheet-local ``label`` so two sheets can reuse a net name (SW3,
+    # FB3, ...) without a silent project-wide merge (the latent Blocker-B leak).
+    if hasattr(node, "get_boundary_nets"):
+        _boundary_net_ids = {id(n) for n in node.get_boundary_nets()}
+    else:
+        _boundary_net_ids = set()
+
+    def _is_internal(net):
+        return net is not None and id(net) not in _boundary_net_ids
+
     def _onpin_real_pin(nt_net):
         """Return the lone on-sheet real pin for an on-pin-eligible net, else None.
 
@@ -1270,12 +1308,16 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
             if real_pin is not None:
                 # Emit the label at the real component pin, suppress the
                 # NetTerminal (channel-edge) label + route wire for this net.
-                label = net_label_to_sexp(real_pin, tx=tx, force=True)
+                label = net_label_to_sexp(
+                    real_pin, tx=tx, force=True, local=_is_internal(pin.net)
+                )
                 if label:
                     elements.append(label)
                     onpin_net_ids.add(id(pin.net))
                 continue
-            label = net_label_to_sexp(pin, tx=tx, force=True)
+            label = net_label_to_sexp(
+                pin, tx=tx, force=True, local=_is_internal(pin.net)
+            )
             if label:
                 elements.append(label)
         else:
@@ -1411,7 +1453,9 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
         for pin in part:
             if id(pin) in wired_pin_ids:
                 continue
-            label = net_label_to_sexp(pin, tx=tx)
+            label = net_label_to_sexp(
+                pin, tx=tx, local=_is_internal(getattr(pin, "net", None))
+            )
             if label:
                 elements.append(label)
             elif (
@@ -1423,6 +1467,40 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
                 label = net_label_to_sexp(pin, tx=tx, force=True)
                 if label:
                     elements.append(label)
+
+    # Backstop label on every ROUTED sheet-internal net (stage 24): a wired net
+    # otherwise carries no on-sheet name. Emit exactly ONE local ``label`` at a
+    # deterministic pin so (a) the net name is visible, (b) if any wire segment
+    # is imperfect the shared local name still closes the net, and (c) the ERC
+    # gate has an anchor. Power nets (power symbols) and cross-sheet nets
+    # (global/hierarchical labels) are excluded; stubbed nets already self-label
+    # above; on-pin-relocated nets keep their single label. Deconfliction
+    # (apply_label_deconfliction, below) resolves any coordinate collision.
+    _labeled_backstop = set()
+    for net, wire in node.wires.items():
+        if not wire or getattr(net, "_stub", False) or id(net) in onpin_net_ids:
+            continue
+        if not _is_internal(net):
+            continue
+        nm = getattr(net, "name", None)
+        if not nm or nm in pwr_symbol_names or id(net) in _labeled_backstop:
+            continue
+        # Deterministic anchor pin: internal pin with the smallest world coord.
+        cand = [
+            p for p in node.get_internal_pins(net)
+            if id(p) not in wired_pin_ids
+        ] or list(node.get_internal_pins(net))
+        if not cand:
+            continue
+        def _pin_world(p):
+            pp = getattr(p, "pt", Point(p.x, p.y))
+            w = pp * getattr(p.part, "tx", Tx()) * tx
+            return (_round_mm(w.x), _round_mm(w.y))
+        anchor = min(cand, key=_pin_world)
+        label = net_label_to_sexp(anchor, tx=tx, force=True, local=True)
+        if label:
+            elements.append(label)
+            _labeled_backstop.add(id(net))
 
     # No-connect flags for NCNet pins.
     for nc_x, nc_y, part_ref, pin_num in _decisions.find_no_connect_pins(node, _backend, tx):
