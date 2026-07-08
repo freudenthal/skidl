@@ -151,7 +151,11 @@ def test_no_dangling_wire_endpoints():
         )
         with open(rpt, encoding="utf-8") as f:
             erc = f.read()
+        # No bare wire leaf (the NetTerminal pin-side case) ...
         assert "[unconnected_wire_endpoint]" not in erc, erc
+        # ... and no orphaned label: suppressing a redundant stub-net terminal
+        # must not leave its label floating (label_dangling).
+        assert "[label_dangling]" not in erc, erc
     finally:
         shutil.rmtree(d, ignore_errors=True)
 

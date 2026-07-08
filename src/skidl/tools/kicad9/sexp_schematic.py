@@ -1312,6 +1312,24 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
     stub_ends = getattr(node, "_stub_ends", {})
     terminal_pin_ids = getattr(node, "_stub_terminal_pins", set())
 
+    # Deconflict mode: net ids that have a real (non-terminal) pin on THIS sheet
+    # which the closure labeller will name. For a STUB (label-only) net such a
+    # net's NetTerminal is redundant -- its stub wire is not drawn (bare pin
+    # would dangle), so its label has nothing to attach to and would report
+    # label_dangling. The real pin's same-named global_label already exports the
+    # net, so suppress the terminal entirely. Routed nets keep their terminal
+    # (its label sits on the A*-routed wire at route_pt, so it does not dangle).
+    deconflict_real_pin_net_ids = set()
+    if deconflict:
+        for part in node.parts:
+            if isinstance(part, NetTerminal):
+                continue
+            for pin in part:
+                if id(pin) in stub_ends:
+                    net = getattr(pin, "net", None)
+                    if net is not None:
+                        deconflict_real_pin_net_ids.add(id(net))
+
     # Generate part S-expressions.
     for part in node.parts:
         if isinstance(part, NetTerminal):
@@ -1319,9 +1337,13 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
             pin = part.pins[0]
             if not pin.is_connected():
                 continue
-            # In deconflict mode the terminal ALWAYS emits its label (at its
-            # stub end): real pins no longer self-label on-pin, so the terminal
-            # is the label for its island; closure labels cover the others.
+            # In deconflict mode the terminal emits its label at its stub end,
+            # EXCEPT for a stub net whose net a real on-sheet pin already labels
+            # (see deconflict_real_pin_net_ids) -- there the terminal is
+            # redundant and its label would dangle, so skip it.
+            if (deconflict and getattr(pin.net, "_stub", False)
+                    and id(pin.net) in deconflict_real_pin_net_ids):
+                continue
             if not deconflict and pin.net.name in nets_with_real_pins:
                 continue
             real_pin = None if deconflict else _onpin_real_pin(pin.net)
@@ -1526,9 +1548,15 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
             is_stub_net = getattr(net, "_stub", False) or id(net) in onpin_net_ids
             if is_stub_net:
                 # Draw the pin->end stub wires (the wire block skipped this net)
-                # and use them as the island geometry.
+                # and use them as the island geometry. NetTerminal pins have no
+                # emitted symbol, so drawing their pin->end stub would leave the
+                # bare terminal pin dangling; skip it -- the net is closed by
+                # name via the real pins' closure labels (or, if the net has no
+                # real on-sheet pin, the terminal's own label above).
                 segs = []
                 for pin in pins:
+                    if id(pin) in terminal_pin_ids:
+                        continue
                     end = stub_ends[id(pin)]
                     pin_w = (pin.pt * pin.part.tx).round()
                     if (pin_w.x, pin_w.y) != (end.x, end.y):
