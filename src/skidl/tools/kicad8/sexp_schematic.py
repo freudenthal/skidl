@@ -111,13 +111,19 @@ def _power_symbol_pin_angle(net_name):
     return 270
 
 
-def _power_symbol_to_sexp(pin, net_name, tx):
+def _power_symbol_to_sexp(pin, net_name, tx, uuid_path=None):
     """Generate a power symbol instance S-expression.
 
     Args:
         pin: The pin where the power symbol should be placed.
         net_name: The power net name (e.g., "GND", "+3V3").
         tx: Sheet-level transformation matrix.
+        uuid_path: Hierarchical UUID path of the sheet this symbol is placed on
+            (the SAME path ordinary parts on the sheet use). When None, falls
+            back to a constant root path for backward compatibility; passing the
+            real path keeps auto power symbols on the correct sheet (across
+            hierarchical sheets a constant would collapse them all onto one
+            nonexistent sheet).
 
     Returns:
         Sexp: Power symbol instance, or None on failure.
@@ -230,7 +236,7 @@ def _power_symbol_to_sexp(pin, net_name, tx):
                     "SKiDL-Generated",
                     [
                         "path",
-                        f"/{_gen_uuid('root_schematic')}",
+                        uuid_path if uuid_path is not None else f"/{_gen_uuid('root_schematic')}",
                         ["reference", pwr_ref],
                         ["unit", 1],
                     ],
@@ -715,7 +721,7 @@ def calc_pin_dir(pin):
     }[pin_vector]
 
 
-def net_label_to_sexp(pin, tx=Tx(), force=False):
+def net_label_to_sexp(pin, tx=Tx(), force=False, uuid_path=None):
     """Create S-expression for a net label at a pin stub.
 
     Generates a power symbol if the net name matches a known KiCad power
@@ -726,6 +732,9 @@ def net_label_to_sexp(pin, tx=Tx(), force=False):
         tx: Transformation matrix.
         force: If True, skip the stub check (used for NetTerminal pins
             which always need a label regardless of stub state).
+        uuid_path: Hierarchical UUID path of the sheet, threaded to any power
+            symbol emitted so its instance path matches the sheet (see
+            _power_symbol_to_sexp).
 
     Returns:
         Sexp or None: Label/power symbol S-expression, or None if no label needed.
@@ -740,7 +749,7 @@ def net_label_to_sexp(pin, tx=Tx(), force=False):
     # If so, emit a power symbol instance instead of a global_label.
     # This eliminates power_pin_not_driven ERC errors.
     if pin.is_connected() and pin.net.name in pwr_symbol_names:
-        pwr = _power_symbol_to_sexp(pin, pin.net.name, tx)
+        pwr = _power_symbol_to_sexp(pin, pin.net.name, tx, uuid_path=uuid_path)
         if pwr:
             return pwr
 
@@ -1174,12 +1183,12 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
             if real_pin is not None:
                 # Emit the label at the real component pin, suppress the
                 # NetTerminal (channel-edge) label + route wire for this net.
-                label = net_label_to_sexp(real_pin, tx=tx, force=True)
+                label = net_label_to_sexp(real_pin, tx=tx, force=True, uuid_path=uuid_path)
                 if label:
                     elements.append(label)
                     onpin_net_ids.add(id(pin.net))
                 continue
-            label = net_label_to_sexp(pin, tx=tx, force=True)
+            label = net_label_to_sexp(pin, tx=tx, force=True, uuid_path=uuid_path)
             if label:
                 elements.append(label)
         else:
@@ -1315,7 +1324,7 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
         for pin in part:
             if id(pin) in wired_pin_ids:
                 continue
-            label = net_label_to_sexp(pin, tx=tx)
+            label = net_label_to_sexp(pin, tx=tx, uuid_path=uuid_path)
             if label:
                 elements.append(label)
             elif (
@@ -1324,7 +1333,7 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
                 and pin.is_connected()
                 and pin.net.name in pwr_symbol_names
             ):
-                label = net_label_to_sexp(pin, tx=tx, force=True)
+                label = net_label_to_sexp(pin, tx=tx, force=True, uuid_path=uuid_path)
                 if label:
                     elements.append(label)
 

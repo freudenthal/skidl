@@ -128,6 +128,26 @@ def test_multi_unit_shares_root_instance_path(tmp_path):
     assert all(p == f"/{sheet_uuid}" for p in lm358_paths), lm358_paths
 
 
+def test_auto_power_symbols_use_sheet_root_path(tmp_path):
+    """Auto-generated power symbols must use the sheet's real root UUID, not a
+    hardcoded constant. Regression for finding 2.2.1 (a hierarchy fidelity bug:
+    across sheets a constant path collapses every auto power symbol onto one
+    nonexistent sheet). Every placed symbol -- ordinary parts AND power symbols
+    -- must share the sheet's own ``(uuid ...)``."""
+    sch_files = _generate(tmp_path, "power", _build_power_design)
+    txt = sch_files[0].read_text(encoding="utf-8")
+    sheet_uuid = re.search(r"\(uuid\s+([0-9a-f-]+)\)", txt).group(1)
+    paths = [
+        m.group(2)
+        for m in re.finditer(
+            r'\(symbol\b.*?\(lib_id "([^"]+)".*?\(path "([^"]+)"', txt, re.S
+        )
+    ]
+    assert paths, "no placed symbols found"
+    # No path may be the old constant, and all must equal the sheet root path.
+    assert all(p == f"/{sheet_uuid}" for p in paths), paths
+
+
 # ---- Live save gate (requires a real KiCad 10 install) ----
 
 
