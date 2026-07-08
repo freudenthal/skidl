@@ -121,6 +121,25 @@ class SwitchboxRoutingFailure(RoutingFailure):
     pass
 
 
+def _stub_node_subtree_nets(node):
+    """Stub every non-explicit net owned by *node* and its descendants to labels.
+
+    Used by the per-sheet routing-failure isolation in ``Router.route``: when one
+    sheet can't be routed, its nets become labels (no wires) so the sheet still
+    emits and the rest of the design keeps its routed wires. Backend-agnostic —
+    touches only skidl core ``net._stub`` / ``pin.stub`` flags. Explicit user
+    stubs are left as-is. (stage 19 router robustness)
+    """
+    for net in node.get_internal_nets():
+        if getattr(net, "_stub_explicit", False):
+            continue
+        net._stub = True
+        for pin in net.get_pins():
+            pin.stub = True
+    for child in node.children.values():
+        _stub_node_subtree_nets(child)
+
+
 class Boundary:
     """Class for indicating a boundary.
 
@@ -3171,8 +3190,32 @@ class Router:
 
         # First, recursively route any children of this node.
         # TODO: Child nodes are independent so could they be processed in parallel?
+        #
+        # Per-sheet routing-failure ISOLATION (stage 19 router robustness): child
+        # sheets are independent, so a routing failure on ONE dense sheet should
+        # NOT collapse the whole design to labels-only. If a child fails to route,
+        # stub just that child's (subtree's) nets to labels and re-route it (which
+        # then trivially succeeds with no wires), keeping every other sheet wired.
+        # Opt out with isolate_sheet_routing_failure=False. This is only reached
+        # under auto_stub (labels are the intended fallback there).
+        isolate = options.get("isolate_sheet_routing_failure", True) and options.get(
+            "auto_stub", False
+        )
         for child in node.children.values():
-            child.route(tool=tool, **options)
+            try:
+                child.route(tool=tool, **options)
+            except RoutingFailure as e:
+                if not isolate:
+                    raise
+                from skidl.logger import active_logger
+
+                active_logger.warning(
+                    f"routing failed on sheet {getattr(child, 'name', '?')!r} "
+                    f"({type(e).__name__}: {e}); stubbing that sheet's nets to "
+                    f"labels and keeping the other sheets wired"
+                )
+                _stub_node_subtree_nets(child)
+                child.route(tool=tool, **options)
 
         # Exit if no parts to route in this node.
         if not node.parts:
@@ -3267,4 +3310,7 @@ class Router:
         except RoutingFailure:
             # Remove any stuff leftover from this place & route run.
             node.rmv_routing_stuff()
-            raise RoutingFailure
+            # Re-raise the ORIGINAL failure (bare `raise`) so its message and the
+            # underlying GlobalRoutingFailure/SwitchboxRoutingFailure survive for
+            # diagnosis and per-sheet isolation. (stage 19 router robustness)
+            raise
