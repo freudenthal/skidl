@@ -286,6 +286,89 @@ c.generate_schematic(filepath=out, top_name="det", auto_stub=True,
 '''
 
 
+# --------------------------------------------------------------------------
+# Stage-25b: stub DIRECTION follows the pin's world orientation
+# --------------------------------------------------------------------------
+def test_world_outward_dir_all_dihedral_orientations():
+    """Pure-math (no KiCad libs): the stub outward direction is the pin's
+    local orientation folded through the part's rotation/mirror and negated.
+    Hand-computed expectations for every orientation x dihedral transform."""
+    from types import SimpleNamespace
+    from skidl.geometry import (
+        tx_rot_0, tx_rot_90, tx_rot_180, tx_rot_270, tx_flip_x, tx_flip_y,
+    )
+    from skidl.schematics.route import _world_outward_dir
+
+    # expected[tx_name][orientation] = (dx, dy)
+    expected = {
+        "I":   {"U": (0, -1), "D": (0, 1), "L": (1, 0), "R": (-1, 0)},
+        "R90": {"U": (1, 0), "D": (-1, 0), "L": (0, 1), "R": (0, -1)},
+        "R180": {"U": (0, 1), "D": (0, -1), "L": (-1, 0), "R": (1, 0)},
+        "R270": {"U": (-1, 0), "D": (1, 0), "L": (0, -1), "R": (0, 1)},
+        "Fx":  {"U": (0, -1), "D": (0, 1), "L": (-1, 0), "R": (1, 0)},
+        "Fy":  {"U": (0, 1), "D": (0, -1), "L": (1, 0), "R": (-1, 0)},
+    }
+    txs = {
+        "I": tx_rot_0, "R90": tx_rot_90, "R180": tx_rot_180,
+        "R270": tx_rot_270, "Fx": tx_flip_x, "Fy": tx_flip_y,
+    }
+    for tx_name, tx in txs.items():
+        for orient, want in expected[tx_name].items():
+            pin = SimpleNamespace(orientation=orient, part=SimpleNamespace(tx=tx))
+            got = _world_outward_dir(pin)
+            assert got == want, f"{tx_name}+{orient}: got {got}, want {want}"
+            # always axial + unit
+            assert abs(got[0]) + abs(got[1]) == 1
+
+
+@requires_libs
+def test_stub_direction_follows_pin_orientation():
+    """Pipeline invariant: every stub vector points along the pin's true world
+    outward direction (covers whatever rotations the placer emits)."""
+    from skidl import Circuit
+    from skidl.net import NCNet
+    from skidl.schematics.route import _world_outward_dir
+
+    c = Circuit(name="tia_dir")
+    _build_tia(c)
+    node = _routed_node(c)
+
+    checked = 0
+    vertical = 0
+    for n in _iter_nodes(node):
+        stub_ends = getattr(n, "_stub_ends", {})
+        pin_by_id = {}
+        for part in n.parts:
+            for pin in part:
+                pin_by_id[id(pin)] = (part, pin)
+        for pid, end in stub_ends.items():
+            part, pin = pin_by_id[pid]
+            net = pin.net
+            if isinstance(net, NCNet) or getattr(net, "_is_power_net", False):
+                continue
+            pin_w = (pin.pt * part.tx).round()
+            vx, vy = end.x - pin_w.x, end.y - pin_w.y
+            if vx == 0 and vy == 0:
+                continue  # fallback no-stub pin (deconflict exhaustion)
+            assert (vx == 0) != (vy == 0), (
+                f"{getattr(part, 'ref', '?')}.{pin.num} stub not axial: ({vx},{vy})"
+            )
+            dx, dy = _world_outward_dir(pin)
+            svx = 1 if vx > 0 else -1 if vx < 0 else 0
+            svy = 1 if vy > 0 else -1 if vy < 0 else 0
+            assert (svx, svy) == (dx, dy), (
+                f"{getattr(part, 'ref', '?')}.{pin.num} stub ({vx},{vy}) "
+                f"!= world outward ({dx},{dy})"
+            )
+            if svy != 0:
+                vertical += 1
+            checked += 1
+    assert checked >= 6
+    # Regression canary: before the fix every stub read left/right; a TIA has
+    # U/D pins (caps/resistors) so at least one stub must run vertically.
+    assert vertical >= 1, "no vertical stubs — direction fix regressed"
+
+
 @requires_libs
 @pytest.mark.xfail(
     reason="stage-19 placement residual: the force-directed placer still iterates "

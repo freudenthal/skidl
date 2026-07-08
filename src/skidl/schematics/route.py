@@ -322,6 +322,31 @@ def _snap_away(v, ref, grid):
     return math.floor(v / grid + 1e-9) * grid
 
 
+# Direction a pin POINTS (toward the part body), local frame. The stub extends
+# the OPPOSITE way (outward, away from the body).
+_ORIENT_VEC = {
+    "U": Point(0, 1),
+    "D": Point(0, -1),
+    "L": Point(-1, 0),
+    "R": Point(1, 0),
+}
+
+
+def _world_outward_dir(pin):
+    """Unit world-outward direction of a pin's stub as an integer ``(dx, dy)``.
+
+    The pin's local ``orientation`` folded through the rotation/mirror part of
+    ``pin.part.tx`` (translation dropped) and NEGATED — outward means away from
+    the part body. This is the same source the emitters' ``calc_pin_dir`` uses
+    (so stub geometry and its closure label agree under any rotation/mirror),
+    just negated. Dihedral transforms only, so the result is exactly axial.
+    """
+    tx = pin.part.tx
+    rot = Tx(a=tx.a, b=tx.b, c=tx.c, d=tx.d)  # rotation/mirror only, no shift
+    ov = _ORIENT_VEC[pin.orientation] * rot
+    return -int(round(ov.x)), -int(round(ov.y))
+
+
 @export_to_all
 class Router:
     """Mixin to add routing function to Node class."""
@@ -468,25 +493,31 @@ class Router:
                 raise RoutingFailure("Unknown pin orientation.")
             edge_w = (edge * part.tx).round()
 
-            # The world stub is axial: it differs from the pin in exactly one
-            # world axis. Determine that axis + outward direction.
-            if abs(edge_w.x - pin_w.x) >= abs(edge_w.y - pin_w.y):
+            # The world stub is axial and points along the pin's TRUE world
+            # outward direction (orientation folded through part.tx), NOT
+            # inferred from lbl_bbox deltas: when the bbox edge coincides with
+            # the pin (common -- pins sit on the body edge) those deltas are
+            # zero and a magnitude compare mis-picks the axis, flattening every
+            # stub to left/right. The bbox edge is kept only to set the stub
+            # LENGTH along that direction.
+            dx, dy = _world_outward_dir(pin)
+            if abs(dx) + abs(dy) != 1:
+                raise RoutingFailure(
+                    "Non-dihedral part transform for pin %s of %s"
+                    % (getattr(pin, "num", "?"), getattr(part, "ref", "?"))
+                )
+            if dx != 0:
                 axis = "x"
-                fixed = pin_w.y
-                moving_pin = pin_w.x
-                moving_edge = edge_w.x
+                sign = float(dx)
+                fixed, moving_pin, moving_edge = pin_w.y, pin_w.x, edge_w.x
             else:
                 axis = "y"
-                fixed = pin_w.x
-                moving_pin = pin_w.y
-                moving_edge = edge_w.y
-
-            if moving_edge == moving_pin:
-                # Edge pin (bbox edge coincides with the pin): still project a
-                # real stub. Default outward = +grid (sign from pin orientation).
-                sign = 1.0 if pin.orientation in ("D", "R") else -1.0
+                sign = float(dy)
+                fixed, moving_pin, moving_edge = pin_w.x, pin_w.y, edge_w.y
+            if (moving_edge - moving_pin) * sign <= 0:
+                # bbox edge coincides with the pin (or lies on the wrong side):
+                # still project a real stub, one grid out along the outward dir.
                 moving_edge = moving_pin + sign * grid
-            sign = 1.0 if moving_edge >= moving_pin else -1.0
 
             # Snap outward to grid and guarantee >= 1 grid of stub.
             end_v = _snap_away(moving_edge, moving_pin, grid)
