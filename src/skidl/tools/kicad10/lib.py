@@ -7,6 +7,8 @@ Parsing of Kicad libraries.
 """
 
 import os
+import re
+from pathlib import Path
 from collections import defaultdict, OrderedDict
 from simp_sexp import Sexp
 
@@ -31,6 +33,72 @@ __all__ = ["lib_suffix"]
 lib_suffix = [".kicad_sym"]
 
 
+def _sorted_kicad_version_dirs(kicad_root):
+    """Return versioned KiCad dirs under ``kicad_root``, newest first.
+
+    Matches children named like ``8.0``, ``9.0``, ``10.0`` and sorts numerically
+    descending, so ``10.0`` beats ``9.0`` without hardcoding version numbers
+    (ported from circuit-synth ``core/power_net_registry._sorted_kicad_version_dirs``).
+    """
+    kicad_root = Path(kicad_root)
+    if not kicad_root.is_dir():
+        return []
+    versioned = []
+    for child in kicad_root.iterdir():
+        if child.is_dir() and re.fullmatch(r"\d+(?:\.\d+)*", child.name):
+            key = tuple(int(p) for p in child.name.split("."))
+            versioned.append((key, child))
+    versioned.sort(key=lambda t: t[0], reverse=True)
+    return [path for _, path in versioned]
+
+
+def _discover_default_symbol_dirs(kicad_version):
+    """Discover stock-install symbol dirs when ``KICAD{n}_SYMBOL_DIR`` is unset.
+
+    Ported from circuit-synth (``core/symbol_cache._versioned_symbol_dirs`` +
+    ``_sorted_kicad_version_dirs``). Globs version-numbered install roots on
+    every platform, newest version first, and prefers the install whose version
+    matches this tool (e.g. ``kicad10`` -> ``10.0``). Version numbers are never
+    hardcoded, so a future KiCad release is discovered automatically.
+    """
+    program_files = os.environ.get("PROGRAMFILES", r"C:\Program Files")
+    program_files_x86 = os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")
+    roots = [
+        Path(program_files) / "KiCad",
+        Path(program_files_x86) / "KiCad",
+        Path.home() / ".local" / "share" / "kicad",
+        Path.home() / "Library" / "Application Support" / "kicad",
+    ]
+
+    candidates = []
+    for root in roots:
+        for versioned in _sorted_kicad_version_dirs(root):
+            candidates.append(versioned / "share" / "kicad" / "symbols")  # Windows layout
+            candidates.append(versioned / "symbols")  # Linux/macOS layout
+
+    # Unversioned fallbacks (older installs / distro packages).
+    candidates += [
+        Path("/usr/share/kicad/symbols"),
+        Path("/usr/local/share/kicad/symbols"),
+        Path("/Applications/KiCad/KiCad.app/Contents/SharedSupport/symbols"),
+        Path(program_files) / "KiCad" / "share" / "kicad" / "symbols",
+    ]
+
+    existing = []
+    seen = set()
+    for cand in candidates:
+        s = str(cand)
+        if s not in seen and cand.is_dir():
+            seen.add(s)
+            existing.append(s)
+
+    # Prefer the install whose version matches this tool. Stable sort keeps the
+    # newest-first order among the remaining entries.
+    tag = f"{os.sep}{kicad_version}.0{os.sep}"
+    existing.sort(key=lambda s: 0 if tag in s else 1)
+    return existing
+
+
 @export_to_all
 def default_lib_paths():
     """Return default list of directories to search for part libraries."""
@@ -43,9 +111,15 @@ def default_lib_paths():
     try:
         paths.append(os.environ[f"KICAD{kicad_version}_SYMBOL_DIR"])
     except KeyError:
-        active_logger.warning(
-            f"KICAD{kicad_version}_SYMBOL_DIR environment variable is missing, so the default KiCad symbol libraries won't be searched."
-        )
+        # Env var unset: fall back to discovering a stock KiCad install instead
+        # of silently skipping the default libraries (ported from circuit-synth).
+        discovered = _discover_default_symbol_dirs(kicad_version)
+        if discovered:
+            paths.extend(discovered)
+        else:
+            active_logger.warning(
+                f"KICAD{kicad_version}_SYMBOL_DIR environment variable is missing and no default KiCad install was found, so the default KiCad symbol libraries won't be searched."
+            )
 
     return paths
 
