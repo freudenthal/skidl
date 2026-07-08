@@ -1302,12 +1302,21 @@ class Router:
         # Get all the nets that have one or more pins within this node.
         internal_nets = node.get_internal_nets()
 
-        # Exit if no nets to route.
-        if not internal_nets:
+        deconflict = options.get("deconflict_stubs", False)
+
+        # Exit if no nets to route. In deconflict mode, a sheet whose only nets
+        # are cross-sheet / label-only still needs its pins stubbed out to
+        # deconflicted labelled ends -- get_internal_nets() skips stub pins, so
+        # such a sheet reports no internal nets, but bailing here would leave its
+        # pins rendered as bare labels ON the part body (a connector/decoupling
+        # sheet reads as "unstubbed"). Only bail in the classic path; let the
+        # deconflict stub pass run so those pins get proper stubs (the A* router
+        # then has nothing to route, which is fine).
+        if not internal_nets and not deconflict:
             return
 
         try:
-            if options.get("deconflict_stubs", False):
+            if deconflict:
                 # Stage-25: on-grid, world-unique stub end per non-power pin
                 # (snap retired). Publishes node._deconflict_occupied for the
                 # router and node._stub_ends for the phase-2 closure labeller.
