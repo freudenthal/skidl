@@ -98,6 +98,9 @@ def auto_stub_nets(circuit, **options):
         if net.name.startswith("+") or _POWER_NET_RE.match(net.name):
             net._stub = True
             net._stub_explicit = False
+            # Mark so the stage-25 deconflict-stub pass can EXCLUDE power nets
+            # (they render as power symbols, not stub-wire + label).
+            net._is_power_net = True
             for pin in net.get_pins():
                 pin.stub = True
             stubbed_power.append(f"{net.name}({len(net.pins)})")
@@ -441,10 +444,11 @@ def _handle_fallback(circuit, tool_module, filepath, top_name, title, flatness,
     preprocess_circuit(circuit, **options)
     node = SchNode(circuit, tool_module, filepath, top_name, title, flatness)
     node.place(expansion_factor=1.0, **options)
-    if options.get("snap_before_route", False):
+    deconflict = options.get("deconflict_stubs", False)
+    if options.get("snap_before_route", False) and not deconflict:
         _snap_two_pin_parts(node, stub=False)
     node.route(**options)
-    if not options.get("snap_before_route", False):
+    if not options.get("snap_before_route", False) and not deconflict:
         _snap_two_pin_parts(node)
     output_file = write_top_schematic(
         circuit, node, filepath, top_name, title, version=20230409
@@ -726,6 +730,15 @@ def gen_schematic(
     options["pt_to_pt_mult"] = 5
     options["pin_normalize"] = True
 
+    # Stage-25 deconflict-stub mode is mutually exclusive with snap: it retires
+    # snap entirely (every pin gets a deconflicted on-grid stub wire instead of
+    # being crammed onto an IC pin). Refuse the ambiguous combination loudly.
+    if options.get("deconflict_stubs", False) and options.get("snap_before_route", False):
+        raise ValueError(
+            "deconflict_stubs and snap_before_route are mutually exclusive: "
+            "deconflict_stubs retires snap. Pass exactly one."
+        )
+
     # Phase 1: Heuristic auto-stubbing before first generation pass.
     if options.get("auto_stub", False):
         auto_stub_nets(circuit, **options)
@@ -765,7 +778,12 @@ def gen_schematic(
             # Stage-24 wired mode: snap BEFORE route (parts positioned, NOT
             # stubbed) so the per-net A* router wires every net on the final
             # geometry. Classic order (route then snap) stays the default.
-            if options.get("snap_before_route", False) and options.get("auto_stub", False):
+            # Stage-25 deconflict mode runs NEITHER snap pass.
+            if (
+                options.get("snap_before_route", False)
+                and options.get("auto_stub", False)
+                and not options.get("deconflict_stubs", False)
+            ):
                 _snap_two_pin_parts(node, stub=False)
             node.route(**options)
 
@@ -786,7 +804,11 @@ def gen_schematic(
             )
             continue
 
-        if options.get("auto_stub", False) and not options.get("snap_before_route", False):
+        if (
+            options.get("auto_stub", False)
+            and not options.get("snap_before_route", False)
+            and not options.get("deconflict_stubs", False)
+        ):
             _snap_two_pin_parts(node)
 
         # Generate S-expression schematic using shared module.
@@ -800,7 +822,17 @@ def gen_schematic(
         finalize_parts_and_nets(circuit, **options)
 
         # Phase 2: ERC correction loop (only when auto_stub is enabled).
-        if options.get("auto_stub", False) and shutil.which("kicad-cli"):
+        # Skipped in deconflict-stub mode (stage 25): the loop "fixes" a
+        # pin_not_connected / wire_not_connected by STUBBING the net, which
+        # discards the deconflicted routed wires. In that mode connectivity is
+        # guaranteed by the per-connected-component closure labels + the strict
+        # connectivity audit, not by iterative re-stubbing, so the loop is both
+        # unnecessary and destructive. The caller's own ERC gate still runs.
+        if (
+            options.get("auto_stub", False)
+            and not options.get("deconflict_stubs", False)
+            and shutil.which("kicad-cli")
+        ):
             max_erc_iterations = options.get("erc_max_iterations", 3)
             for erc_attempt in range(max_erc_iterations):
                 erc_report = _run_erc(output_file)
@@ -837,10 +869,19 @@ def gen_schematic(
                             flatness,
                         )
                         _place_and_classify(node, circuit, erc_expansion, **options)
-                        if options.get("snap_before_route", False) and options.get("auto_stub", False):
+                        _deconflict = options.get("deconflict_stubs", False)
+                        if (
+                            options.get("snap_before_route", False)
+                            and options.get("auto_stub", False)
+                            and not _deconflict
+                        ):
                             _snap_two_pin_parts(node, stub=False)
                         node.route(**options)
-                        if options.get("auto_stub", False) and not options.get("snap_before_route", False):
+                        if (
+                            options.get("auto_stub", False)
+                            and not options.get("snap_before_route", False)
+                            and not _deconflict
+                        ):
                             _snap_two_pin_parts(node)
                         output_file = write_top_schematic(
                             circuit, node, filepath, top_name, title, version=20230409

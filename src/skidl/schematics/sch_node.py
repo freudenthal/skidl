@@ -53,6 +53,14 @@ class SchNode(Placer, Router):
         self.tool_module = tool_module  # Backend tool.
         self.wires = defaultdict(list)
         self.junctions = defaultdict(list)
+        # Deconflict-stub mode (stage 25) side-channels, populated by
+        # Router.add_deconflicted_stubs and read by the emitter's closure
+        # labeller. _stub_ends: id(pin) -> world Point at the pin's stub end
+        # (the deconflicted, on-grid label anchor). _stub_wire_nets: id(net) ->
+        # list of that net's pin->end stub Segments, so the per-net A* fallback
+        # can drop only the ROUTED segments and keep the stubs.
+        self._stub_ends = {}
+        self._stub_wire_nets = defaultdict(list)
         self.tx = Tx()
         self.bbox = BBox()
 

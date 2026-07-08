@@ -279,6 +279,49 @@ def _astar_pair(a, b, obstacles, occupied, foreign_h, foreign_v, net,
     return None
 
 
+# ---------------------------------------------------------------------------
+# Deconflicted-stub geometry (stage 25).
+#
+# Retires snap: instead of cramming 2-pin parts onto IC pins (which caused both
+# the off-grid warnings and the cross-net false-merges), every non-power pin
+# gets a short, on-grid, world-unique stub wire projecting straight out of the
+# part body. The A* router then wires the stub ENDS. Because no two nets ever
+# share a stub-end cell, the connectivity audit is silent by construction and
+# closure labels (stage 25 phase 2) can sit on the ends without fusing nets.
+# ---------------------------------------------------------------------------
+
+
+def _invert_dihedral(pt, tx):
+    """Map a WORLD point back to a part's LOCAL frame for a dihedral ``tx``.
+
+    ``Point * Tx`` computes ``wx = lx*a + ly*c + dx`` and
+    ``wy = lx*b + ly*d + dy``. Part transforms are dihedral (90-degree rotation
+    and/or mirror + translation) so ``det = a*d - b*c = +/-1`` and the inverse is
+    exact. Returns the local ``Point`` (so ``local * tx == pt``).
+    """
+    det = tx.a * tx.d - tx.b * tx.c
+    if det == 0:
+        return Point(pt.x, pt.y)  # degenerate (shouldn't happen for a placed part)
+    ux = pt.x - tx.dx
+    uy = pt.y - tx.dy
+    lx = (ux * tx.d - uy * tx.c) / det
+    ly = (uy * tx.a - ux * tx.b) / det
+    return Point(lx, ly)
+
+
+def _snap_away(v, ref, grid):
+    """Snap ``v`` to the ``grid``, rounding AWAY from ``ref`` (never toward it).
+
+    Used to push a stub end out to a grid line without ever pulling it back
+    inside the part body.
+    """
+    import math
+
+    if v >= ref:
+        return math.ceil(v / grid - 1e-9) * grid
+    return math.floor(v / grid + 1e-9) * grid
+
+
 @export_to_all
 class Router:
     """Mixin to add routing function to Node class."""
@@ -326,6 +369,172 @@ class Router:
                 if pin.route_pt != pin.pt:
                     seg = Segment(pin.pt, pin.route_pt) * pin.part.tx
                     node.wires[pin.net].append(seg)
+
+    def add_deconflicted_stubs(node, internal_nets, **options):
+        """Stage-25: give every non-power, non-NC pin an on-grid, world-unique
+        stub wire projecting out of the part body, then route between the ends.
+
+        Replaces ``add_routing_points`` when ``deconflict_stubs`` is set. For
+        EVERY connected non-power, non-NC pin on a real part in this node
+        (routed nets AND label-only stubbed nets) it:
+
+          * pushes the pin out to its labeled-bbox edge (same outward
+            axis/direction as ``add_routing_points``),
+          * snaps that end OUTWARD to the 50-mil grid and guarantees it is at
+            least one grid unit past the pin,
+          * DECONFLICTS the end against every other pin and every stub end on
+            the node (stepping one grid further out until the cell is free), so
+            no two different nets ever share a cell -> the connectivity audit is
+            silent by construction and off-grid endpoints are impossible,
+          * records the world end in ``node._stub_ends[id(pin)]`` (the closure
+            labeller's anchor in phase 2).
+
+        For ROUTED (non-stub) nets it also appends the pin->end stub ``Segment``
+        to ``node.wires`` (as ``add_routing_points`` does) and sets ``route_pt``
+        so the A* router wires the ends. For label-only (stubbed) nets it only
+        records the end (they carry no wire until the phase-2 emitter draws the
+        stub from the recorded end). The full occupancy is published on
+        ``node._deconflict_occupied`` so the A* router avoids every pin and stub
+        end of every net, not just the routed ones.
+
+        Deterministic: pins processed in ``(part.ref, str(pin.num))`` order.
+        """
+        from skidl.net import NCNet
+        from skidl.schematics.net_terminal import NetTerminal
+
+        grid = float(GRID)
+
+        del pin_pts[:]  # world pin coords protect stub roots during trimming
+        node._stub_ends = {}
+        node._stub_wire_nets = defaultdict(list)
+        node._stub_terminal_pins = set()  # NetTerminal pins (own label already)
+
+        internal_ids = {id(n) for n in internal_nets}
+
+        # Collect every stub-able pin in a deterministic order. NetTerminal pins
+        # ARE included (they need a routing point so A* wires the net to the
+        # terminal), but they carry their own label so phase 2 must not add a
+        # closure label at their end -- flag them.
+        pin_recs = []  # (sort_key, pin, net, is_routed)
+        for part in node.parts:
+            is_terminal = isinstance(part, NetTerminal)
+            for pin in part:
+                if not pin.is_connected():
+                    continue
+                net = pin.net
+                if isinstance(net, NCNet):
+                    continue
+                if getattr(net, "_is_power_net", False):
+                    continue
+                if is_terminal:
+                    node._stub_terminal_pins.add(id(pin))
+                ref = str(getattr(part, "ref", "") or "")
+                sort_key = (ref, str(pin.num), id(pin))
+                pin_recs.append((sort_key, pin, net, id(net) in internal_ids))
+        pin_recs.sort(key=lambda r: r[0])
+
+        # Occupancy: grid cell -> owning net. Seed with EVERY part pin (world,
+        # grid-rounded) of EVERY net so a stub end never lands on a pin.
+        def cell(x, y):
+            return (round(x / grid) * grid, round(y / grid) * grid)
+
+        occupied = {}
+        for part in node.parts:
+            for pin in part:
+                wp = (pin.pt * part.tx).round()
+                occupied.setdefault(cell(wp.x, wp.y), getattr(pin, "net", None))
+
+        from skidl.logger import active_logger
+
+        for _key, pin, net, is_routed in pin_recs:
+            part = pin.part
+            pin_w = (pin.pt * part.tx).round()
+            pin_pts.append(pin_w)
+
+            # Outward point at the labeled-bbox edge (local frame), same
+            # axis/direction rule as add_routing_points.
+            bbox = part.lbl_bbox
+            edge = copy.copy(pin.pt)
+            if pin.orientation == "U":
+                edge.y = bbox.min.y
+            elif pin.orientation == "D":
+                edge.y = bbox.max.y
+            elif pin.orientation == "L":
+                edge.x = bbox.max.x
+            elif pin.orientation == "R":
+                edge.x = bbox.min.x
+            else:
+                raise RoutingFailure("Unknown pin orientation.")
+            edge_w = (edge * part.tx).round()
+
+            # The world stub is axial: it differs from the pin in exactly one
+            # world axis. Determine that axis + outward direction.
+            if abs(edge_w.x - pin_w.x) >= abs(edge_w.y - pin_w.y):
+                axis = "x"
+                fixed = pin_w.y
+                moving_pin = pin_w.x
+                moving_edge = edge_w.x
+            else:
+                axis = "y"
+                fixed = pin_w.x
+                moving_pin = pin_w.y
+                moving_edge = edge_w.y
+
+            if moving_edge == moving_pin:
+                # Edge pin (bbox edge coincides with the pin): still project a
+                # real stub. Default outward = +grid (sign from pin orientation).
+                sign = 1.0 if pin.orientation in ("D", "R") else -1.0
+                moving_edge = moving_pin + sign * grid
+            sign = 1.0 if moving_edge >= moving_pin else -1.0
+
+            # Snap outward to grid and guarantee >= 1 grid of stub.
+            end_v = _snap_away(moving_edge, moving_pin, grid)
+            if abs(end_v - moving_pin) < grid:
+                end_v = moving_pin + sign * grid
+
+            # Deconflict: step one grid further out until the cell is free (or
+            # already owned by this same net). Bounded; on exhaustion fall back
+            # to the pin (no stub) with a warning -- the audit remains the net.
+            end_x = fixed if axis == "y" else end_v
+            end_y = fixed if axis == "x" else end_v
+            tries = 0
+            while tries < 8:
+                c = cell(end_x, end_y)
+                owner = occupied.get(c)
+                if owner is None or owner is net:
+                    break
+                end_v += sign * grid
+                end_x = fixed if axis == "y" else end_v
+                end_y = fixed if axis == "x" else end_v
+                tries += 1
+            else:
+                active_logger.warning(
+                    "deconflict_stubs: could not place a clear stub end for "
+                    "pin %s of net %r; labelling on the pin instead",
+                    getattr(pin, "num", "?"), getattr(net, "name", "?"),
+                )
+                node._stub_ends[id(pin)] = Point(pin_w.x, pin_w.y)
+                pin.route_pt = copy.copy(pin.pt)
+                continue
+
+            end_w = Point(round(end_x), round(end_y))
+            occupied[cell(end_w.x, end_w.y)] = net
+            node._stub_ends[id(pin)] = end_w
+
+            # route_pt (local) maps back to the world end so the A* router wires
+            # the deconflicted end. The emitted stub segment uses exact world
+            # coords so its endpoints are guaranteed on-grid.
+            pin.route_pt = _invert_dihedral(end_w, part.tx)
+            if is_routed:
+                seg = Segment(Point(pin_w.x, pin_w.y), Point(end_w.x, end_w.y))
+                node.wires[net].append(seg)
+                node._stub_wire_nets[id(net)].append(seg)
+
+        # Publish the full occupancy so the A* router avoids every pin + stub
+        # end of every net (routed and label-only alike).
+        node._deconflict_occupied = {
+            k: v for k, v in occupied.items() if v is not None
+        }
 
     def cleanup_wires(node):
         """Try to make wire segments look prettier."""
@@ -866,6 +1075,7 @@ class Router:
 
         MARGIN = 2 * GRID  # extra Hanan lines for detour clearance around corners
         TURN = float(GRID)  # bend penalty (favors straighter routes)
+        deconflict = options.get("deconflict_stubs", False)
 
         # Process nets in a stable name order for determinism.
         def _net_key(net):
@@ -875,15 +1085,32 @@ class Router:
 
         # World obstacles: each part's labeled bbox. Route-points sit ON these
         # edges, so a STRICT-interior test keeps them (and boundary-hugging
-        # wires) legal.
+        # wires) legal. In deconflict mode grow each obstacle OUTWARD to the
+        # grid so every Hanan line is on-grid -> every routed corner is on-grid
+        # (kills endpoint_off_grid).
         obstacles = []
         for part in node.parts:
             b = (part.lbl_bbox * part.tx).round()
-            obstacles.append((b.min.x, b.min.y, b.max.x, b.max.y))
+            if deconflict:
+                g = float(GRID)
+                import math
+                lo_x = math.floor(b.min.x / g) * g
+                lo_y = math.floor(b.min.y / g) * g
+                hi_x = math.ceil(b.max.x / g) * g
+                hi_y = math.ceil(b.max.y / g) * g
+                obstacles.append((lo_x, lo_y, hi_x, hi_y))
+            else:
+                obstacles.append((b.min.x, b.min.y, b.max.x, b.max.y))
 
         # Route-points (world) per net + an occupancy map so no wire routes
-        # through / ends on ANOTHER net's pin route-point.
+        # through / ends on ANOTHER net's pin route-point. In deconflict mode
+        # seed it with EVERY pin + stub end of EVERY net (published by
+        # add_deconflicted_stubs) so routed wires also avoid label-only nets'
+        # stub ends.
         occupied = {}  # (x, y) -> the net that owns this pin route-point
+        if deconflict:
+            for (x, y), onet in getattr(node, "_deconflict_occupied", {}).items():
+                occupied[(round(x), round(y))] = onet
         net_points = {}
         for net in nets:
             pts = []
@@ -943,7 +1170,13 @@ class Router:
                 net._stub = True
                 for pin in net.get_pins():
                     pin.stub = True
-                node.wires[net] = []  # drop its pin->edge stub wires too
+                if deconflict:
+                    # Keep the deconflicted pin->end stubs (and node._stub_ends)
+                    # so the phase-2 closure labeller still anchors a label per
+                    # pin island; only the ROUTED segments are discarded.
+                    node.wires[net] = list(node._stub_wire_nets.get(id(net), []))
+                else:
+                    node.wires[net] = []  # drop its pin->edge stub wires too
                 continue
             for (x0, y0, x1, y1) in new_segs:
                 node.wires[net].append(Segment(Point(x0, y0), Point(x1, y1)))
@@ -1019,9 +1252,15 @@ class Router:
             return
 
         try:
-            # Extend routing points of part pins to the edges of their bounding
-            # boxes (adds the pin->edge stub wires to node.wires).
-            node.add_routing_points(internal_nets)
+            if options.get("deconflict_stubs", False):
+                # Stage-25: on-grid, world-unique stub end per non-power pin
+                # (snap retired). Publishes node._deconflict_occupied for the
+                # router and node._stub_ends for the phase-2 closure labeller.
+                node.add_deconflicted_stubs(internal_nets, **options)
+            else:
+                # Extend routing points of part pins to the edges of their
+                # bounding boxes (adds the pin->edge stub wires to node.wires).
+                node.add_routing_points(internal_nets)
 
             # Route every internal net with the per-net Hanan-grid A* router.
             node.route_internal_nets_astar(internal_nets, **options)
