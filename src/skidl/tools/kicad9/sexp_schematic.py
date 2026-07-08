@@ -20,7 +20,7 @@ import copy
 import datetime
 import os
 import uuid
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 
 from simp_sexp import Sexp
 
@@ -1544,6 +1544,15 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
                        for pin in pins]
             islands = _decisions.net_islands(pin_pts, segs, tol=_CLOSE_TOL)
             local = _is_internal(net)
+            # Endpoint degree over this net's segments: a stub end that is a
+            # degree-1 leaf and carries no label reads as an
+            # ``unconnected_wire_endpoint`` in KiCad. trim_stubs already spared
+            # only pin/stub-end leaves, so every surviving leaf is a real stub
+            # end -- label the ones the single island anchor doesn't cover.
+            deg = Counter()
+            for (x1, y1, x2, y2) in segs:
+                deg[(round(x1), round(y1))] += 1
+                deg[(round(x2), round(y2))] += 1
             for island in islands:
                 # Prefer a real (non-terminal) pin as the anchor; skip an island
                 # that is only a NetTerminal (it already carries the label).
@@ -1559,6 +1568,27 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
                 )
                 if label:
                     elements.append(label)
+                # Label every OTHER leaf stub end in this island so no wire end
+                # dangles. Deterministic (ref, pin.num, id) order; skip the
+                # anchor, terminals (already labelled), and fallback no-stub
+                # pins (end on the pin -> the pin itself terminates the wire).
+                for pid in sorted(real, key=lambda p: (
+                        str(getattr(pin_by_id[p].part, "ref", "") or ""),
+                        str(pin_by_id[p].num), p)):
+                    if pid == anchor_pid:
+                        continue
+                    end = stub_ends[pid]
+                    pin = pin_by_id[pid]
+                    pin_w = (pin.pt * pin.part.tx).round()
+                    if (round(pin_w.x), round(pin_w.y)) == (round(end.x), round(end.y)):
+                        continue  # no stub -> the pin ends the wire, not a bare end
+                    if deg[(round(end.x), round(end.y))] != 1:
+                        continue  # interior of the routing tree, already connected
+                    leaf_label = net_label_to_sexp(
+                        pin, tx=tx, force=True, local=local, at_world=end,
+                    )
+                    if leaf_label:
+                        elements.append(leaf_label)
     else:
         # Backstop label on every ROUTED sheet-internal net (stage 24): a wired
         # net otherwise carries no on-sheet name. Emit exactly ONE local

@@ -563,7 +563,12 @@ class Router:
             # the deconflicted end. The emitted stub segment uses exact world
             # coords so its endpoints are guaranteed on-grid.
             pin.route_pt = _invert_dihedral(end_w, part.tx)
-            if is_routed:
+            # NetTerminal pins have no emitted symbol (channel-edge markers), so
+            # a pin->end stub would leave the pin-side endpoint bare -> a
+            # dangling wire end. Skip the stub: A* still routes to route_pt (the
+            # deconflicted end), which carries the terminal's label, so the wire
+            # ends cleanly at the labelled end.
+            if is_routed and not isinstance(part, NetTerminal):
                 seg = Segment(Point(pin_w.x, pin_w.y), Point(end_w.x, end_w.y))
                 node.wires[net].append(seg)
                 node._stub_wire_nets[id(net)].append(seg)

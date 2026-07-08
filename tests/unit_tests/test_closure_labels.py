@@ -135,6 +135,28 @@ def test_closure_no_pin_not_connected_and_power_symbols():
 
 
 @requires_e2e
+def test_no_dangling_wire_endpoints():
+    """Stage-25b: no wire leaf-end is left bare. Every degree-1 wire endpoint
+    is either a component pin, a closure label, or (for NetTerminals) not drawn
+    at all -- so KiCad ERC reports zero unconnected_wire_endpoint warnings.
+    Before the fix the TIA's NetTerminal stub left one dangling end."""
+    d = tempfile.mkdtemp(prefix="skidl_dangle_")
+    try:
+        r, path = _subprocess_gen(d)
+        assert os.path.exists(path), r.stderr[-2000:]
+        rpt = path + ".sevall.rpt"
+        subprocess.run(
+            ["kicad-cli", "sch", "erc", "--severity-all", path, "-o", rpt],
+            capture_output=True,
+        )
+        with open(rpt, encoding="utf-8") as f:
+            erc = f.read()
+        assert "[unconnected_wire_endpoint]" not in erc, erc
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+@requires_e2e
 def test_closure_strict_audit_no_fusion():
     """Two distinct nets must never share a coordinate: generation completing
     under SKIDL_AUDIT_STRICT (which raises SheetConnectivityError on a fusion)
