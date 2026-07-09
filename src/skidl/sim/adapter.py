@@ -104,6 +104,39 @@ def _extra_fields(part):
     return extra
 
 
+def _symbol_data_for(part):
+    """Build the multi-unit symbol map the converter's ``_amp_units`` reads.
+
+    circuit-synth reads this from its ``SymbolLibCache``; skidl already has it on
+    the parsed Part (each Pin carries ``.unit`` and a ``pin_types`` ``.func``), so
+    the adapter supplies it directly -- the one place the sim layer needs
+    symbol-level data, not just connectivity. Shape:
+    ``{"unit_count": N, "pins": [{"number","unit","function","name"}, ...]}``.
+    Returns None for a single-unit part (converter then keeps the whole-component
+    path).
+    """
+    pins = list(getattr(part, "pins", []) or [])
+    units = {getattr(p, "unit", None) for p in pins}
+    units.discard(None)
+    if len(units) <= 1:
+        return None
+    out_pins = []
+    for p in pins:
+        func = getattr(p, "func", None)
+        # skidl pin.func is a pin_types enum; its .name ("OUTPUT"/"INPUT"/...) is
+        # what the converter substring-matches ("output"/"input").
+        func_str = getattr(func, "name", str(func) if func is not None else "").lower()
+        out_pins.append(
+            {
+                "number": getattr(p, "num", None),
+                "unit": getattr(p, "unit", 0),
+                "function": func_str,
+                "name": getattr(p, "name", "") or "",
+            }
+        )
+    return {"unit_count": len(units), "pins": out_pins}
+
+
 class AdaptedNet:
     """Minimal net view: the converter reads only ``.name``."""
 
@@ -127,14 +160,17 @@ class AdaptedPin:
 class AdaptedComponent:
     """Minimal component view matching the converter's duck-typed contract."""
 
-    __slots__ = ("ref", "value", "symbol", "_pins", "_extra_fields")
+    __slots__ = ("ref", "value", "symbol", "_pins", "_extra_fields", "_symbol_data")
 
-    def __init__(self, ref, value, symbol, pins, extra_fields):
+    def __init__(self, ref, value, symbol, pins, extra_fields, symbol_data=None):
         self.ref = ref
         self.value = value
         self.symbol = symbol
         self._pins = pins
         self._extra_fields = extra_fields
+        # Multi-unit pin->unit map for op-amp section resolution (None if single
+        # unit); read by SpiceConverter._amp_units.
+        self._symbol_data = symbol_data
 
 
 class SkidlFlatView:
@@ -202,6 +238,7 @@ def skidl_flat_view(circuit=None):
             symbol=_part_symbol(part),
             pins=pins,
             extra_fields=_extra_fields(part),
+            symbol_data=_symbol_data_for(part),
         )
 
     # Register every skidl net (even ones with no pins reached above) by name.
