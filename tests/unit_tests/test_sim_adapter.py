@@ -214,6 +214,67 @@ def test_diode_polarity_resolved_by_pin_name():
     assert parts[1] == "ANODE" and parts[2] == "CATH", diode_lines[0]
 
 
+@requires_sim
+def test_negative_dc_source_keeps_sign():
+    """A negative VDC ``value`` must reach the netlist with its sign intact --
+    the run-B4 silent sign-drop turned "-1" into +1 V (the DiffAmp repro)."""
+    _setup()
+    v1 = Part("Simulation_SPICE", "VDC", value="-1")
+    r1 = Part("Device", "R", value="1k")
+    Net("N").connect(v1[1], r1[1])
+    Net("0").connect(v1[2], r1[2])
+
+    netlist = str(SpiceConverter(skidl_flat_view()).convert(strict=True))
+    assert "VV1 N 0 -1" in netlist, netlist
+
+
+@requires_sim
+@pytest.mark.parametrize(
+    "value,expected",
+    [("-2.5", "-2.5"), ("+1", "1"), ("1.0", "1"), ("3.3V", "3.3"), ("-1.0", "-1")],
+)
+def test_dc_source_value_forms(value, expected):
+    """Signed / decimal / suffixed DC source values all parse to the right float."""
+    _setup()
+    v1 = Part("Simulation_SPICE", "VDC", value=value)
+    r1 = Part("Device", "R", value="1k")
+    Net("N").connect(v1[1], r1[1])
+    Net("0").connect(v1[2], r1[2])
+    netlist = str(SpiceConverter(skidl_flat_view()).convert(strict=True))
+    vline = next(ln for ln in netlist.splitlines() if ln.startswith("VV1"))
+    assert float(vline.split()[-1]) == float(expected), vline
+
+
+@requires_sim
+def test_vpulse_negative_levels_survive():
+    """A VPULSE swinging negative keeps its negative level in the spec (the
+    waveform parsers must not drop signs either)."""
+    _setup()
+    v1 = Part("Simulation_SPICE", "VPULSE", value="1")
+    v1.Sim_Params = "v1=-2 v2=2"
+    r1 = Part("Device", "R", value="1k")
+    Net("N").connect(v1[1], r1[1])
+    Net("0").connect(v1[2], r1[2])
+    netlist = str(SpiceConverter(skidl_flat_view()).convert(strict=True))
+    pulse = next(ln for ln in netlist.splitlines() if "PULSE(" in ln.upper())
+    assert "-2" in pulse and "2" in pulse, pulse
+
+
+@requires_sim
+def test_unparseable_source_value_raises():
+    """An unparseable *source* value is a correctness trap -- it must raise, not
+    silently substitute 1.0 (same defect class as the sign drop)."""
+    from skidl.sim.converter import SimulationValidationError
+
+    _setup()
+    v1 = Part("Simulation_SPICE", "VDC", value="garbage")
+    r1 = Part("Device", "R", value="1k")
+    Net("N").connect(v1[1], r1[1])
+    Net("0").connect(v1[2], r1[2])
+    with pytest.raises(SimulationValidationError):
+        SpiceConverter(skidl_flat_view()).convert(strict=True)
+
+
 # --- live simulation (ngspice) --------------------------------------------
 
 
@@ -238,6 +299,36 @@ def test_divider_simulates_dc_operating_point():
         pytest.skip(f"ngspice not available: {type(e).__name__}: {str(e)[:80]}")
     mid = float(an["MID"][0])
     assert abs(mid - 5.0 * 20.0 / 30.0) < 0.01, f"V(MID)={mid}"
+
+
+@requires_sim
+def test_negative_dc_source_simulates_negative():
+    """Live: a VDC value="-1" across a resistor to GND holds the node at -1.0 V
+    (the exact DiffAmp B4 repro), and get_current resolves the source branch by
+    plain ref despite PySpice's v-prefixed lowercased branch name (R2)."""
+    _setup()
+    v1 = Part("Simulation_SPICE", "VDC", value="-1", ref="V1")
+    r1 = Part("Device", "R", value="1k")
+    Net("N").connect(v1[1], r1[1])
+    Net("0").connect(v1[2], r1[2])
+
+    spice = SpiceConverter(skidl_flat_view()).convert(strict=True)
+    try:
+        import skidl.sim.simulator  # noqa: F401
+        from skidl.sim.simulator import SimulationResult
+
+        sim = spice.simulator()
+        an = sim.operating_point()
+    except Exception as e:
+        pytest.skip(f"ngspice not available: {type(e).__name__}: {str(e)[:80]}")
+    n = float(an["N"][0])
+    assert abs(n - (-1.0)) < 0.01, f"V(N)={n}"
+    # R2: get_current by plain ref must resolve the source's branch current even
+    # though PySpice names the branch "vv1" (lowercased, v-prefixed).
+    result = SimulationResult(an, "dc_op")
+    i = result.get_current("V1")
+    i = i[0] if hasattr(i, "__len__") else i
+    assert abs(abs(float(i)) - 1.0 / 1000.0) < 1e-6, f"I(V1)={i}"
 
 
 @requires_sim

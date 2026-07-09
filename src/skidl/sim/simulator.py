@@ -145,7 +145,15 @@ class SimulationResult:
                 raise KeyError(f"Node '{node}' not found in simulation results")
 
     def get_current(self, component: str) -> Union[float, List[float]]:
-        """Get current through a specific component."""
+        """Get current through a specific component (source ref, e.g. ``"V1"``).
+
+        Tries PySpice's ``I(<ref>)`` accessor first, then falls back to the
+        analysis ``branches`` table, whose keys PySpice lowercases and prefixes
+        with the element letter (a voltage source ``V1`` becomes branch ``vv1``,
+        ``VSIGP`` becomes ``vvsigp``) -- so a caller passing the plain schematic
+        ref still resolves (R2). Raises ``KeyError`` listing the available branch
+        names when nothing matches, so the next failure is self-explaining.
+        """
         # PySpice current notation: I(Vcomponent) for voltage sources
         current_name = f"I({component})"
         try:
@@ -156,8 +164,30 @@ class SimulationResult:
                 return [float(i) for i in current]
             else:
                 return float(current)
-        except:
-            raise KeyError(f"Current for component '{component}' not found")
+        except Exception:
+            pass
+
+        # Fallback: match against the branch-current table.
+        branches = getattr(self.analysis, "branches", None) or {}
+        low = component.lower()
+        # <ref>, <ref>.lower(), then PySpice's v-prefixed voltage-source branch
+        # name; finally any branch key ending with the ref (defensive).
+        candidates = [component, low, "v" + low]
+        key = next((c for c in candidates if c in branches), None)
+        if key is None:
+            key = next((k for k in branches if k.endswith(low)), None)
+        if key is None:
+            raise KeyError(
+                f"Current for component '{component}' not found "
+                f"(available branches: {sorted(branches)})"
+            )
+        current = branches[key]
+        if hasattr(current, "__len__") and len(current) == 1:
+            return float(current[0])
+        elif hasattr(current, "__len__"):
+            return [float(i) for i in current]
+        else:
+            return float(current)
 
     def _frequency_array(self):
         """The AC sweep frequency axis as a real float ndarray.

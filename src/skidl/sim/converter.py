@@ -2458,19 +2458,40 @@ class SpiceConverter:
         return nodes
 
     def _convert_value_to_spice(self, value: str, component_type: str) -> float:
-        """Convert circuit-synth component value to SPICE format."""
+        """Convert circuit-synth component value to SPICE format.
+
+        ``component_type`` is the SPICE element letter ("R"/"C"/"L" for passives,
+        "V"/"I" for sources). For a **source** an unparseable ``value`` is a
+        correctness trap -- silently substituting 1.0 changes the circuit -- so it
+        raises :class:`SimulationValidationError` rather than warning. Passives keep
+        the lenient warn-and-default behaviour (a symmetric R/C/L defaulting is far
+        less dangerous), but log at error level so it is never truly silent.
+        """
+        is_source = component_type in ("V", "I")
         if not value:
             # Default values
             defaults = {"R": 1000, "C": 1e-6, "L": 1e-3}
             return defaults.get(component_type, 1.0)
 
-        # Parse value string (e.g., "10k", "100nF", "1mH")
+        # Parse value string (e.g., "10k", "100nF", "1mH", "-1.0", "2.5e-3").
+        # The numeric group carries an optional leading sign and exponent so a
+        # negative DC source value ("-1") keeps its sign instead of failing the
+        # match and hitting the fallback -- which used to silently emit +1.0 (B4).
         value = str(value).strip().replace(" ", "")
 
         # Extract numeric part and suffix
-        match = re.match(r"^([0-9.]+)([a-zA-Z]*)$", value)
+        match = re.match(
+            r"^([-+]?[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?)([a-zA-Z]*)$", value
+        )
         if not match:
-            logger.warning(f"Could not parse value '{value}', using 1.0")
+            if is_source:
+                raise SimulationValidationError(
+                    [f"could not parse source value '{value}' (element {component_type})"]
+                )
+            logger.error(
+                f"Could not parse value '{value}' (element {component_type}); "
+                f"using 1.0 -- fix the value, this default is almost certainly wrong"
+            )
             return 1.0
 
         numeric_part = float(match.group(1))
