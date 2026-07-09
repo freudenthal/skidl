@@ -1430,6 +1430,154 @@ def _audit_sheet_connectivity(node, elements, backend, sheet_tx):
         )
 
 
+def _audit_and_force_pin_labels(node, elements, tx, uuid_path, is_internal):
+    """Guarantee every net's on-sheet pins are CONNECTED in the emitted drawing.
+
+    Per-pin "is it covered?" is not enough: the per-net A* fallback and the single
+    backstop label can leave a net SPLIT -- most pins wired into one island and a
+    boxed-in pin stranded on a dangling stub (that pin looks "covered" by its own
+    stub-wire endpoint yet the net's drawing diverges from the netlist). This runs
+    a union-find over the emitted wires AND same-name labels, finds each net whose
+    on-sheet pins fall into more than one component, and drops a name label
+    (local for a sheet-internal net, global for a boundary net) on any component
+    that lacks one -- unifying the net by name. This is the renderer-side mirror
+    of the harness ``drawing_connectivity`` gate, closing the hole before the file
+    ships. Returns the number of labels forced. Mutates ``elements`` in place.
+    """
+    from collections import OrderedDict, defaultdict
+
+    from skidl.net import NCNet
+
+    def _pt(x, y):
+        return (_round_mm(x), _round_mm(y))
+
+    # Union-find over coordinate keys (wire endpoints, pin points, label points).
+    parent = {}
+
+    def find(k):
+        parent.setdefault(k, k)
+        while parent[k] != k:
+            parent[k] = parent[parent[k]]
+            k = parent[k]
+        return k
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    # Collect wire segments; union their endpoints (multi-point wires share
+    # endpoints transitively). Collect label points keyed by name.
+    segments = []
+    label_pts = []  # (name, key)
+    for el in elements:
+        if not (hasattr(el, "__getitem__") and len(el)):
+            continue
+        tag = el[0]
+        if tag == "wire":
+            for s in el:
+                if hasattr(s, "__getitem__") and len(s) and s[0] == "pts":
+                    pts = [
+                        _pt(xy[1], xy[2])
+                        for xy in s[1:]
+                        if hasattr(xy, "__getitem__") and len(xy) >= 3 and xy[0] == "xy"
+                    ]
+                    for i in range(1, len(pts)):
+                        union(pts[0], pts[i])
+                    if len(pts) >= 2:
+                        segments.append((pts[0], pts[-1]))
+                    break
+        elif tag in ("global_label", "label", "hierarchical_label") and len(el) >= 2:
+            name = el[1]
+            for s in el:
+                if hasattr(s, "__getitem__") and len(s) >= 3 and s[0] == "at":
+                    key = _pt(s[1], s[2])
+                    label_pts.append((name, key))
+                    break
+
+    # Labels connect by NAME across the sheet: union all like-named label points,
+    # and remember which names sit at each component root.
+    by_name = defaultdict(list)
+    for name, key in label_pts:
+        by_name[name].append(key)
+    for name, keys in by_name.items():
+        for k in keys[1:]:
+            union(keys[0], k)
+
+    # Pin records (on-sheet, non-power, non-NC). A pin's key auto-shares a
+    # component with any wire ENDPOINT / coincident pin / label at the same point
+    # (same tuple -> same union node). We deliberately do NOT union a pin that
+    # merely lies on the MIDDLE of a wire: that is exactly where our geometry
+    # model and kicad-cli's netlist can disagree (rounding, or a mid-span touch
+    # KiCad won't fuse without a junction), and an over-optimistic union would
+    # hide a real split. Being conservative can only ADD a redundant same-name
+    # label (harmless), never miss a genuine disconnection.
+    pin_recs = []  # (net, pin, key)
+    for part in node.parts:
+        if isinstance(part, NetTerminal):
+            continue
+        for pin in part:
+            if not pin.is_connected():
+                continue
+            net = getattr(pin, "net", None)
+            if net is None or isinstance(net, NCNet):
+                continue
+            if _net_wants_power_symbol(net):
+                continue  # power pins are covered by their power symbol
+            pp = getattr(pin, "pt", Point(pin.x, pin.y))
+            w = pp * getattr(pin.part, "tx", Tx()) * tx
+            pin_recs.append((net, pin, _pt(w.x, w.y)))
+
+    # Names present at each component root (after unioning), to avoid a redundant
+    # label on a component that already carries the net's name.
+    root_names = defaultdict(set)
+    for name, key in label_pts:
+        root_names[find(key)].add(name)
+
+    # Group pins per net; a net split across >1 component needs unifying labels.
+    net_pins = OrderedDict()
+    for net, pin, key in pin_recs:
+        net_pins.setdefault(id(net), (net, []))[1].append((pin, key))
+
+    def _pin_key(pk):
+        p = pk[0]
+        return (str(getattr(p.part, "ref", "") or ""), str(getattr(p, "num", "")))
+
+    forced = 0
+    for _nid, (net, pins) in net_pins.items():
+        if len(pins) < 2:
+            continue  # a lone on-sheet pin is closed by its own stub/label
+        comps = defaultdict(list)
+        for pin, key in pins:
+            comps[find(key)].append((pin, key))
+        if len(comps) <= 1:
+            continue  # fully connected by wires / coincidence / shared labels
+        name = getattr(net, "name", None)
+        for root in sorted(
+            comps, key=lambda r: min(_pin_key(pk) for pk in comps[r])
+        ):
+            if name and name in root_names.get(root, ()):
+                continue  # this component already carries the net's name
+            anchor = min(comps[root], key=_pin_key)[0]
+            label = net_label_to_sexp(
+                anchor, tx=tx, force=True, local=is_internal(net), uuid_path=uuid_path
+            )
+            if label:
+                elements.append(label)
+                root_names[root].add(name)
+                forced += 1
+    if forced:
+        from skidl.logger import active_logger
+
+        active_logger.warning(
+            "emission audit: forced %d unifying label(s) on split net(s) on sheet "
+            "%s (a routed net left pins in separate islands; closed by name)",
+            forced,
+            getattr(node, "sheet_filename", None) or getattr(node, "name", "?"),
+        )
+    return forced
+
+
 @export_to_all
 def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
     """Convert a SchNode tree to S-expression schematic(s).
@@ -2028,6 +2176,17 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
         if not _drop:
             break
         elements = [_el for _i, _el in enumerate(elements) if _i not in _drop]
+
+    # Belt-and-braces emission audit (wired-render plan, Phase 3): every
+    # connected pin MUST be covered by a wire (endpoint or pass-through), a
+    # label, a power symbol, or a no-connect. The per-net A* fallback and the
+    # single backstop label do not guarantee this -- a net can route MOST of its
+    # pins yet leave one uncovered (that pin reads as pin_not_connected, and the
+    # drawing diverges from the netlist). Force a name label on any uncovered pin
+    # so it reconnects to its net by name; this is the renderer-side mirror of
+    # the harness drawing_connectivity gate, catching the hole before the file
+    # ships. Power/NC pins are covered by their symbol; NetTerminals self-label.
+    _forced = _audit_and_force_pin_labels(node, elements, tx, uuid_path, _is_internal)
 
     if node.flattened:
         # This node is flattened, so return elements for inclusion in the parent sheet.
