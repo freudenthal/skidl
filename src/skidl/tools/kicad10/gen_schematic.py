@@ -75,6 +75,78 @@ FIXABLE_ERROR_TYPES = frozenset(
 )
 
 
+def _net_is_power(net):
+    """Classify a net as a power net on ANY render path (not just auto_stub).
+
+    A net is a power net iff its ``drive`` is the POWER level (the standard
+    ``Net("VBIAS").drive = POWER`` idiom, which covers non-stock rail names) OR
+    its name matches a common power-net pattern (``+3V3``, ``GND``, ``VCC`` ...).
+    Power nets never enter the A* router: they render as KiCad ``power:*``
+    symbols (one per pin), connecting globally by name across every sheet.
+    """
+    name = getattr(net, "name", "") or ""
+    if name.startswith("+") or _POWER_NET_RE.match(name):
+        return True
+    drive = getattr(net, "drive", None)
+    return getattr(drive, "name", None) == "POWER"
+
+
+def _net_is_driven(net):
+    """True if a power net carries its own source (a ``power_output`` pin).
+
+    KiCad's ``power_pin_not_driven`` ERC fires on a rail whose only pins are
+    power *inputs* (IC VCC/GND pins + the power symbols themselves). A rail fed
+    by a regulator/reference ``PWROUT`` pin is already driven; a header/connector-
+    fed rail is NOT, and needs one ``PWR_FLAG`` to tell ERC the power comes from
+    off-board. Emitting a flag on an already-driven rail would create a
+    two-driver (``PWROUT`` vs ``PWROUT``) ERROR, so gate strictly on PWROUT.
+    """
+    try:
+        from skidl.pin import pin_types
+
+        pwrout = pin_types.PWROUT
+    except Exception:  # pragma: no cover - defensive
+        return False
+    for pin in getattr(net, "pins", []):
+        if getattr(pin, "func", None) == pwrout:
+            return True
+    return False
+
+
+def mark_power_nets(circuit, **options):
+    """Classify + stub power nets on EVERY render path (not only auto_stub).
+
+    This is the keystone of power-symbol-first rendering: power nets are stubbed
+    (``pin.stub`` / ``net._stub``) so ``get_internal_nets`` excludes them from
+    the A* router entirely, and the emitter renders a ``power:<name>`` symbol at
+    every power pin (the standard KiCad idiom). Removing the high-fanout power
+    nets from the router is also the main cure for the router boxing signal pins
+    in on the wired path.
+
+    Each undriven rail is marked ``_needs_pwr_flag`` so the emitter drops exactly
+    one project-wide ``PWR_FLAG`` on it (power symbols connect by name across
+    sheets, so one flag suffices) -- this kills ``power_pin_not_driven``
+    structurally, including across a hierarchy where the post-hoc ERC autofix's
+    revert guard would otherwise trip.
+
+    Idempotent (safe across gen_schematic's retry loop). Respects a user's
+    explicit stub choice (``_stub_explicit``).
+    """
+    for net in circuit.nets:
+        if getattr(net, "_stub_explicit", False):
+            continue
+        if not net.valid or len(net.pins) == 0:
+            continue
+        if not _net_is_power(net):
+            continue
+        net._is_power_net = True
+        net._stub = True
+        net._stub_explicit = False
+        net._needs_pwr_flag = not _net_is_driven(net)
+        for pin in net.get_pins():
+            pin.stub = True
+
+
 def auto_stub_nets(circuit, **options):
     """Auto-stub power nets and high-fanout nets before generation.
 
@@ -765,6 +837,12 @@ def gen_schematic(
             "deconflict_stubs and snap_before_route are mutually exclusive: "
             "deconflict_stubs retires snap. Pass exactly one."
         )
+
+    # Power-symbol-first rendering: classify + stub power nets on EVERY path so
+    # they never enter the A* router and render as KiCad power symbols (one per
+    # pin), with a PWR_FLAG per undriven rail. This runs BEFORE auto_stub_nets so
+    # the two agree on power nets (auto_stub_nets then only handles fanout).
+    mark_power_nets(circuit, **options)
 
     # Phase 1: Heuristic auto-stubbing before first generation pass.
     if options.get("auto_stub", False):

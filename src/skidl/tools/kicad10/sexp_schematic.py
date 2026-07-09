@@ -71,9 +71,20 @@ def init_power_symbol_data():
     """Initialize power symbol state at the start of schematic generation."""
 
     global pwr_symbol_sexp_dict, pwr_symbol_names, _used_power_symbols, _pwr_counter
+    global _pwr_flag_net_names, _pwr_flagged, _flg_counter, _custom_power_symbols
 
     _used_power_symbols = set()
     _pwr_counter = [0]
+    _flg_counter = [0]
+    # Net names that need exactly one project-wide PWR_FLAG (undriven rails);
+    # populated by write_top_schematic from the circuit. _pwr_flagged tracks the
+    # names already flagged so only ONE flag is emitted per rail across all
+    # sheets (power symbols connect globally by name).
+    _pwr_flag_net_names = set()
+    _pwr_flagged = set()
+    # Custom in-file (power) symbol definitions cloned for non-stock rail names
+    # (e.g. VBIAS_28V): lib_id "power:<name>" -> Sexp definition.
+    _custom_power_symbols = {}
 
     # Just read in the power symbols at the start.
     pwr_lib = SchLib("power")
@@ -85,24 +96,90 @@ def init_power_symbol_data():
     pwr_symbol_names = set([p.name for p in pwr_lib])
 
 
+def _net_wants_power_symbol(net):
+    """True if *net* should render as a KiCad ``power:*`` symbol at each pin.
+
+    Either the name is a stock power-lib symbol (``GND``, ``VCC``, ``+3V3`` ...)
+    OR the net was classified as a power net upstream (``_is_power_net``, set by
+    ``mark_power_nets`` for ``drive == POWER`` / pattern-matched rails). The
+    second arm is what lets a non-stock rail name like ``VBIAS_28V`` get a
+    (cloned, in-file) power symbol instead of a plain global label.
+    """
+    if net is None:
+        return False
+    name = getattr(net, "name", None)
+    if name in pwr_symbol_names:
+        return True
+    return bool(getattr(net, "_is_power_net", False))
+
+
+def _gnd_style_name(name):
+    """True if a rail name reads as a ground (bar-down GND-style symbol)."""
+    n = (name or "").upper()
+    return n == "GND" or n.endswith("GND") or "VSS" in n or "VEE" in n
+
+
+def _power_template_name(name):
+    """Pick a stock power symbol to clone for a non-stock rail *name*.
+
+    GND-like names clone ``GND`` (bar points down); everything else clones
+    ``VCC`` (rail bar points up). Both are ``(power global)`` symbols, so the
+    clone connects globally by name exactly like a stock rail.
+    """
+    if _gnd_style_name(name) and "GND" in pwr_symbol_sexp_dict:
+        return "GND"
+    return "VCC" if "VCC" in pwr_symbol_sexp_dict else "GND"
+
+
 def _extract_power_lib_symbol(name):
     """Extract and parse the lib_symbol definition for a power symbol.
 
     The returned Sexp has its top-level symbol name changed to "power:NAME"
     so it matches the lib_id used in symbol instances.
 
+    For a NON-stock rail name (no ``power`` lib symbol, e.g. ``VBIAS_28V``) a
+    template (``VCC`` for rails, ``GND`` for grounds) is cloned: the symbol +
+    inner unit-symbol names are renamed and the ``Value`` property is set to the
+    rail name. KiCad treats any ``(power global)`` in-file symbol as a power
+    symbol connecting globally by name, so no library install is needed. Returns
+    None only if even the template is unavailable (caller falls back to a label).
+
     Args:
-        name: Power symbol name (e.g., "GND", "+3V3").
+        name: Power symbol / rail name (e.g., "GND", "+3V3", "VBIAS_28V").
 
     Returns:
-        Sexp: Parsed symbol definition, or None if not found.
+        Sexp: Parsed symbol definition, or None if not clonable.
     """
     from copy import deepcopy
 
-    pwr_sym_sexp = deepcopy(pwr_symbol_sexp_dict.get(name, None))
-    # Change the symbol name from "NAME" to "power:NAME" for lib_id matching.
-    pwr_sym_sexp[1] = f"power:{name}"
-    return pwr_sym_sexp
+    src = pwr_symbol_sexp_dict.get(name, None)
+    if src is not None:
+        pwr_sym_sexp = deepcopy(src)
+        # Change the symbol name from "NAME" to "power:NAME" for lib_id matching.
+        pwr_sym_sexp[1] = f"power:{name}"
+        return pwr_sym_sexp
+
+    # Non-stock rail name: clone a template and rename it to the rail name.
+    template = _power_template_name(name)
+    src = pwr_symbol_sexp_dict.get(template, None)
+    if src is None:
+        return None
+    clone = deepcopy(src)
+    clone[1] = f"power:{name}"
+    prefix = template + "_"  # inner unit symbols are "<template>_<unit>_<style>"
+    for sub in clone:
+        if not (hasattr(sub, "__getitem__") and len(sub) >= 2):
+            continue
+        tag = sub[0]
+        # Rename inner unit sub-symbols so they carry the rail name, not the
+        # template's (keeps two clones of the same template from colliding).
+        if tag == "symbol" and isinstance(sub[1], str) and sub[1].startswith(prefix):
+            sub[1] = name + "_" + sub[1][len(prefix):]
+        # Set the visible Value to the rail name (this is what KiCad shows and
+        # what the global-by-name connection keys on).
+        elif tag == "property" and len(sub) >= 3 and sub[1] == "Value":
+            sub[2] = name
+    return clone
 
 
 def _power_symbol_pin_angle(net_name):
@@ -119,7 +196,9 @@ def _power_symbol_pin_angle(net_name):
     try:
         sym = pwr_symbol_sexp_dict.get(net_name)
         if sym is None:
-            return 270
+            # Non-stock rail: use the template we would clone (VCC rails point
+            # up -> pin angle 90; GND-style point down -> 270).
+            return 90 if not _gnd_style_name(net_name) else 270
         pins = sym.search("/symbol/symbol/pin") or sym.search("/symbol/pin")
         for p in pins:
             at = p.search("/pin/at")
@@ -270,6 +349,134 @@ def _power_symbol_to_sexp(pin, net_name, tx, uuid_path=None):
     )
 
     return symbol
+
+
+def _pwr_flag_to_sexp(x, y, net_name, uuid_path=None):
+    """Generate a ``power:PWR_FLAG`` instance coincident with (x, y).
+
+    PWR_FLAG is a special power symbol whose single pin is ``power_out``; placed
+    coincident with a rail's power-symbol pin it tells ERC the rail is driven
+    (from off-board), clearing ``power_pin_not_driven`` WITHOUT a real source.
+    It connects by physical coincidence (not by name -- every PWR_FLAG shares the
+    value "PWR_FLAG"), so it must sit exactly on a point already on the net.
+
+    Emitted at instance-angle 0 so its pin lands at (x, y); one flag per rail is
+    enough because the coincident point is on the globally-named power net.
+    """
+    _flg_counter[0] += 1
+    flg_ref = f"#FLG{_flg_counter[0]:03d}"
+    x = _round_mm(x)
+    y = _round_mm(y)
+    inst_uuid = _gen_uuid(f"flg:{net_name}:{x}:{y}:{_flg_counter[0]}")
+
+    symbol = Sexp(
+        [
+            "symbol",
+            ["lib_id", "power:PWR_FLAG"],
+            ["at", x, y, 0],
+            ["unit", 1],
+            ["exclude_from_sim", "yes"],
+            ["in_bom", "no"],
+            ["on_board", "yes"],
+            ["dnp", "no"],
+            ["fields_autoplaced", "yes"],
+            ["uuid", inst_uuid],
+        ]
+    )
+    symbol.append(
+        Sexp(
+            [
+                "property",
+                "Reference",
+                flg_ref,
+                ["at", x, y + 3.81, 0],
+                ["effects", ["font", ["size", 1.27, 1.27]], ["hide", "yes"]],
+            ]
+        )
+    )
+    symbol.append(
+        Sexp(
+            [
+                "property",
+                "Value",
+                "PWR_FLAG",
+                ["at", x, y + 2.54, 0],
+                ["effects", ["font", ["size", 1.27, 1.27]]],
+            ]
+        )
+    )
+    for prop in ("Footprint", "Datasheet"):
+        symbol.append(
+            Sexp(
+                [
+                    "property",
+                    prop,
+                    "",
+                    ["at", x, y, 0],
+                    ["effects", ["font", ["size", 1.27, 1.27]], ["hide", "yes"]],
+                ]
+            )
+        )
+    pin_uuid = _gen_uuid(f"flg_pin:{net_name}:{x}:{y}:{_flg_counter[0]}")
+    symbol.append(Sexp(["pin", '"1"', ["uuid", pin_uuid]]))
+    symbol.append(
+        Sexp(
+            [
+                "instances",
+                [
+                    "project",
+                    "SKiDL-Generated",
+                    [
+                        "path",
+                        (
+                            uuid_path
+                            if uuid_path is not None
+                            else f"/{_gen_uuid('root_schematic')}"
+                        ),
+                        ["reference", flg_ref],
+                        ["unit", 1],
+                    ],
+                ],
+            ]
+        )
+    )
+    return symbol
+
+
+def _append_pwr_flags(elements, uuid_path):
+    """Append one ``power:PWR_FLAG`` per undriven rail that has a power-symbol
+    instance in *elements* (and has not been flagged on an earlier sheet).
+
+    Scans the already-built ``elements`` for ``power:<name>`` instances (skipping
+    PWR_FLAG itself), and for each name in ``_pwr_flag_net_names`` not yet in
+    ``_pwr_flagged`` drops a coincident flag on the first such instance's pin.
+    ``_pwr_flagged`` is module-global so exactly ONE flag ships per rail across
+    every sheet.
+    """
+    if not _pwr_flag_net_names:
+        return
+    # Deterministic: first instance in element order per rail name.
+    seen = OrderedDict()
+    for el in elements:
+        if not (hasattr(el, "__getitem__") and len(el) and el[0] == "symbol"):
+            continue
+        lib_id = None
+        at = None
+        for sub in el:
+            if not (hasattr(sub, "__getitem__") and len(sub) >= 2):
+                continue
+            if sub[0] == "lib_id" and isinstance(sub[1], str):
+                lib_id = sub[1]
+            elif sub[0] == "at" and len(sub) >= 3:
+                at = (sub[1], sub[2])
+        if not lib_id or not lib_id.startswith("power:") or lib_id == "power:PWR_FLAG":
+            continue
+        name = lib_id.split(":", 1)[1]
+        if name in _pwr_flag_net_names and name not in _pwr_flagged and at is not None:
+            seen.setdefault(name, at)
+    for name, (x, y) in seen.items():
+        elements.append(_pwr_flag_to_sexp(x, y, name, uuid_path=uuid_path))
+        _pwr_flagged.add(name)
 
 
 def _gen_uuid(name=""):
@@ -777,10 +984,11 @@ def net_label_to_sexp(
     if isinstance(getattr(pin, "net", None), NCNet):
         return None
 
-    # Check if this net matches a known KiCad power symbol.
-    # If so, emit a power symbol instance instead of a label.
-    # This eliminates power_pin_not_driven ERC errors.
-    if pin.is_connected() and pin.net.name in pwr_symbol_names:
+    # Check if this net is a power net (stock power-lib name OR classified via
+    # drive==POWER / pattern). If so, emit a power symbol instance instead of a
+    # label -- the standard KiCad idiom, and what removes power nets from the
+    # A* router. Non-stock rail names get a cloned in-file (power) symbol.
+    if pin.is_connected() and _net_wants_power_symbol(pin.net):
         pwr = _power_symbol_to_sexp(pin, pin.net.name, tx, uuid_path=uuid_path)
         if pwr:
             return pwr
@@ -974,7 +1182,7 @@ def create_hierarchical_sheet_sexp(node, sheet_uuid, sheet_tx):
         pin_y = by + pin_spacing
         for net in boundary_nets:
             # Skip power nets that become power symbols (they don't need sheet pins).
-            if net.name in pwr_symbol_names:
+            if _net_wants_power_symbol(net):
                 continue
             # Skip stubbed nets (they use global labels).
             if getattr(net, "stub", False) or getattr(net, "_stub", False):
@@ -1178,7 +1386,15 @@ def _audit_sheet_connectivity(node, elements, backend, sheet_tx):
                 ),
                 None,
             )
-            if lib_id and str(lib_id[1]).startswith("power:"):
+            # PWR_FLAG is deliberately placed COINCIDENT with a rail's power
+            # symbol (that is how it drives the net); its value "PWR_FLAG" is not
+            # a net name, so excluding it keeps the audit from false-flagging the
+            # intended coincidence as a cross-net fusion.
+            if (
+                lib_id
+                and str(lib_id[1]).startswith("power:")
+                and str(lib_id[1]) != "power:PWR_FLAG"
+            ):
                 at = next(
                     (
                         s
@@ -1563,11 +1779,7 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
             if id(pin) in wired_pin_ids:
                 continue
             net = getattr(pin, "net", None)
-            is_power = (
-                pin.is_connected()
-                and net is not None
-                and getattr(net, "name", None) in pwr_symbol_names
-            )
+            is_power = pin.is_connected() and _net_wants_power_symbol(net)
             if deconflict and not is_power:
                 continue  # closure labeller handles non-power pins in this mode
             label = net_label_to_sexp(
@@ -1579,7 +1791,7 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
                 len(part.pins) == 2
                 and not pin.stub
                 and pin.is_connected()
-                and pin.net.name in pwr_symbol_names
+                and _net_wants_power_symbol(pin.net)
             ):
                 label = net_label_to_sexp(pin, tx=tx, force=True, uuid_path=uuid_path)
                 if label:
@@ -1607,7 +1819,7 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
                 net_pins.setdefault(id(net), (net, []))[1].append(pin)
         for _nid, (net, pins) in net_pins.items():
             nm = getattr(net, "name", None)
-            if not nm or nm in pwr_symbol_names:
+            if not nm or _net_wants_power_symbol(net):
                 continue
             is_stub_net = getattr(net, "_stub", False) or id(net) in onpin_net_ids
             if is_stub_net:
@@ -1722,7 +1934,7 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
             if not _is_internal(net):
                 continue
             nm = getattr(net, "name", None)
-            if not nm or nm in pwr_symbol_names or id(net) in _labeled_backstop:
+            if not nm or _net_wants_power_symbol(net) or id(net) in _labeled_backstop:
                 continue
             # Deterministic anchor pin: internal pin with the smallest world coord.
             cand = [
@@ -1755,6 +1967,12 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
                 uuid_seed=f"nc:{part_ref}:{pin_num}:{nc_x}:{nc_y}",
             )
         )
+
+    # One PWR_FLAG per undriven rail present on this sheet (coincident with a
+    # power-symbol pin). Done before the dangling-wire purge so the flag's point
+    # counts as an anchor. Module-global bookkeeping keeps it to ONE flag/rail
+    # across the whole project (power symbols connect globally by name).
+    _append_pwr_flags(elements, uuid_path)
 
     # Purge dangling wire remnants. Snap moves parts by reassigning part.tx,
     # but a router wire to the old position can survive as a short stub whose
@@ -1858,7 +2076,7 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
         hlabel_y = 10.0  # Starting Y position in mm for labels along the left edge.
         for net in boundary_nets:
             # Skip power nets and stubbed nets.
-            if net.name in pwr_symbol_names:
+            if _net_wants_power_symbol(net):
                 continue
             if getattr(net, "stub", False) or getattr(net, "_stub", False):
                 continue
@@ -1918,6 +2136,17 @@ def write_top_schematic(circuit, node, filepath, top_name, title, version=202304
     """
 
     init_power_symbol_data()
+
+    # Undriven power rails (marked by mark_power_nets) each get exactly one
+    # project-wide PWR_FLAG. Collect their names now; the per-sheet emitter drops
+    # the flag on the first sheet carrying that rail's power symbol.
+    for net in getattr(circuit, "nets", []):
+        if getattr(net, "_is_power_net", False) and getattr(
+            net, "_needs_pwr_flag", False
+        ):
+            nm = getattr(net, "name", None)
+            if nm:
+                _pwr_flag_net_names.add(nm)
 
     node.title = title
     node.sheet_filename = top_name or "schematic"

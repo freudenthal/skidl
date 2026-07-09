@@ -114,14 +114,20 @@ def find_overlapping_pins(node, backend, sheet_tx, max_dist_mm=80.0):
 
                 pins_outside_cluster = len(pins_in_node) - len(members)
 
-                if not has_pins_outside and pins_outside_cluster == 0:
-                    # All net pins are in this cluster — fully connected by
-                    # overlap, no labels needed at all.
+                if not is_power and not has_pins_outside and pins_outside_cluster == 0:
+                    # Non-power net whose every pin coincides — fully connected
+                    # by overlap, no label needed at all.
                     for idx in members:
                         wired_pin_ids.add(id(positions[idx][2]))
                 else:
-                    # Net has pins elsewhere — keep one label for cross-sheet
-                    # connectivity, suppress the rest.
+                    # Keep ONE representative and suppress the coincident rest.
+                    # For a POWER net this retained pin is the rail's power
+                    # symbol (and PWR_FLAG anchor): suppressing ALL of them —
+                    # which the old fully-coincident branch did — left the rail
+                    # with no symbol at all (bare pins -> undriven/floating) when
+                    # identical floating parts stacked exactly. One survivor keeps
+                    # the rail represented and driven; the coincident pins are
+                    # connected to it by position.
                     for idx in members[1:]:
                         wired_pin_ids.add(id(positions[idx][2]))
 
