@@ -28,14 +28,10 @@ from skidl.schematics.route import (
     _seg_hits_interior,
 )
 
-REPRO = (
-    Path(__file__).resolve().parents[3]
-    / "workingdocs"
-    / "plans"
-    / "stage-24-wired-render"
-    / "repro"
-    / "buck5v_geom.json"
-)
+# Optional geometry-regression asset. Drop ``buck5v_geom.json`` (a real placed
+# board geometry dumped from the schematic placer) next to this test to enable
+# the regression below; it is skipped when the asset is absent.
+REPRO = Path(__file__).resolve().parent / "data" / "buck5v_geom.json"
 
 
 def _is_axis_aligned(path):
