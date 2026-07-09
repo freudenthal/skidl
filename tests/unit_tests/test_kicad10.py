@@ -216,6 +216,56 @@ def test_kicad10_netlist_generation(tmp_path):
 
 
 @requires_kicad10
+def test_kicad10_multiunit_shares_base_reference(tmp_path):
+    """A multi-unit part (incl. its dedicated power unit) renders as ONE reference
+    with distinct (unit N), not the compound "U1.uA"/"U1.uE" per unit -- KiCad reads
+    a compound ref as separate components, which lost each amp its shared power unit
+    (missing_power_pin) and diverged the schematic from the netlist (B1/B2)."""
+    from skidl import Net, Part, generate_schematic
+
+    set_default_tool(KICAD10)
+    lib_search_paths["kicad10"] = ["."] + __import__(
+        "skidl.tools.kicad10.lib", fromlist=["default_lib_paths"]
+    ).default_lib_paths()
+    import builtins
+
+    builtins.default_circuit.mini_reset()
+    # Pick a real multi-unit op-amp with a dedicated power unit.
+    part = None
+    for name in ("ADA4807-4ARUZ", "LM2902", "LM324", "TL074"):
+        try:
+            part = Part("Amplifier_Operational", name, ref="U1")
+            break
+        except Exception:
+            builtins.default_circuit.mini_reset()
+    if part is None:
+        pytest.skip("no multi-unit op-amp with a power unit in the installed libs")
+    if len(part.unit) < 2:
+        pytest.skip(f"{part.name} did not resolve as multi-unit")
+
+    vp, vn = Net("V+"), Net("V-")
+    # Connect the dedicated power unit's pins (V+/V-) so it is placed.
+    for pin in part.pins:
+        nm = (getattr(pin, "name", "") or "").upper()
+        if nm in ("V+", "VCC", "VDD"):
+            pin += vp
+        elif nm in ("V-", "VEE", "VSS"):
+            pin += vn
+
+    out = tmp_path / "mu"
+    out.mkdir()
+    generate_schematic(tool=KICAD10, filepath=str(out), top_name="mu")
+    text = sorted(out.glob("*.kicad_sch"))[0].read_text(encoding="utf-8")
+    # No compound unit ref leaked into the schematic.
+    assert "U1.u" not in text, "compound PartUnit reference leaked into the schematic"
+    # Every unit instance references the base "U1".
+    assert '(reference "U1")' in text
+    # More than one distinct (unit N) present (multi-unit really rendered).
+    units = set(re.findall(r"\(unit (\d+)\)", text))
+    assert len(units) >= 2, units
+
+
+@requires_kicad10
 def test_kicad10_schematic_passes_save_gate(tmp_path):
     """A KICAD10-generated schematic (stamp 20230409) passes the hardened save
     gate — KiCad 10 upgrades the file on load without a save-crash."""

@@ -357,6 +357,14 @@ def part_to_sexp(part, uuid_path, tx=Tx()):
     part_name = part.name or "Unknown"
     lib_id = f"{lib_name}:{part_name}"
 
+    # KiCad reference for the symbol instance. All units of a multi-unit part share
+    # ONE reference ("U1") and are distinguished only by (unit N); skidl's PartUnit
+    # ref is the compound "U1.uA", which KiCad reads as a DISTINCT component -- so
+    # each amp unit lost its shared power unit's pins (missing_power_pin), the
+    # netlist-from-schematic diverged from the logical netlist, and the compound ref
+    # tripped kicad-sch-api's validator (B1/B2). Emit the parent's base ref instead.
+    base_ref = getattr(getattr(part, "parent", None), "ref", None) or part.ref
+
     symbol_list = [
         "symbol",
         ["lib_id", lib_id],
@@ -380,7 +388,7 @@ def part_to_sexp(part, uuid_path, tx=Tx()):
             [
                 "property",
                 "Reference",
-                part.ref,
+                base_ref,
                 ["at", origin.x, origin.y - 2.54, angle],
                 ["effects", ["font", ["size", 1.27, 1.27]], ["justify", "left"]],
             ]
@@ -486,7 +494,7 @@ def part_to_sexp(part, uuid_path, tx=Tx()):
                     [
                         "path",
                         f"{uuid_path}",
-                        ["reference", part.ref],
+                        ["reference", base_ref],
                         ["unit", unit_num],
                     ],
                 ],
