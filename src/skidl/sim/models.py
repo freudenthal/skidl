@@ -371,9 +371,51 @@ class ModelLibrary:
             description="Generic P-channel MOSFET",
         )
 
+    # Package/reel-suffix aliases: map an MPN variant onto the datasheet-fit die
+    # model already in the library. These share the die with their base part and
+    # differ only in package/reel (e.g. 1N4148W is the SOD-123 build of the
+    # 1N4148, MMBT3904 the SOT-23 build of the 2N3904), so keying the SPICE model
+    # on the exact ordering suffix would fail resolution for a part that is
+    # electrically identical to one we have (B5). Conservative: only entries whose
+    # base already exists below and shares the die closely enough for a
+    # datasheet-fit model.
+    ALIASES = {
+        # 1N4148 signal-diode family (SOD-123 / mini-MELF / SOT builds)
+        "1N4148W": "1N4148",
+        "1N4148WS": "1N4148",
+        "1N4148WT": "1N4148",
+        "LL4148": "1N4148",
+        # 1N400x rectifier family
+        "1N4007G": "1N4007",
+        # 2N3904 / 2N3906 SMD (MMBT) builds
+        "MMBT3904": "2N3904",
+        "MMBT3906": "2N3906",
+        # BC547 grade suffixes (hFE bin; same die)
+        "BC547A": "BC547",
+        "BC547B": "BC547",
+        "BC547C": "BC547",
+    }
+
     def get_model(self, name: str) -> Optional[SpiceModel]:
-        """Get a SPICE model by name."""
+        """Get a SPICE model by exact name (no alias resolution -- see ALIASES)."""
         return self.models.get(name)
+
+    def resolve_model(self, name: str):
+        """Resolve ``name`` to ``(SpiceModel, canonical_name)`` or ``(None, name)``.
+
+        Tries an exact match, then the explicit :attr:`ALIASES` table. The generic
+        package-suffix strip lives in the converter (kind-restricted) so this stays
+        a pure, conservative name map.
+        """
+        model = self.models.get(name)
+        if model is not None:
+            return model, name
+        alias = self.ALIASES.get(name) or self.ALIASES.get(str(name).upper())
+        if alias:
+            model = self.models.get(alias)
+            if model is not None:
+                return model, alias
+        return None, name
 
     def add_model(self, model: SpiceModel):
         """Add a custom SPICE model to the library."""

@@ -275,6 +275,72 @@ def test_unparseable_source_value_raises():
         SpiceConverter(skidl_flat_view()).convert(strict=True)
 
 
+# --- model aliasing across package suffixes (B5) --------------------------
+
+
+@requires_sim
+def test_alias_table_resolves_die_model():
+    """ModelLibrary.resolve_model maps a package variant to its die model."""
+    from skidl.sim.models import get_model_library
+
+    lib = get_model_library()
+    model, canonical = lib.resolve_model("MMBT3904")
+    assert canonical == "2N3904" and model is not None
+    model, canonical = lib.resolve_model("1N4148W")
+    assert canonical == "1N4148" and model is not None
+    # An exact hit is unchanged; a truly unknown part does not resolve.
+    assert lib.resolve_model("1N4148") == (lib.get_model("1N4148"), "1N4148")
+    assert lib.resolve_model("XYZ999") == (None, "XYZ999")
+
+
+@requires_sim
+def test_lookup_model_spec_alias_and_suffix_strip():
+    """_lookup_model_spec resolves via the alias table and the diode/BJT-only
+    package-suffix strip, and reports the canonical name; unknown stays
+    unresolved; MOSFETs are not suffix-stripped."""
+    _setup()
+    conv = SpiceConverter(skidl_flat_view())
+    # explicit alias
+    spec, tier, resolved = conv._lookup_model_spec("1N4148W", "diode")
+    assert spec is not None and tier == "datasheet_fit" and resolved == "1N4148"
+    # generic suffix strip (not in ALIASES): 1N4007W -> 1N4007
+    spec, tier, resolved = conv._lookup_model_spec("1N4007W", "diode")
+    assert spec is not None and resolved == "1N4007"
+    # truly unknown stays unresolved
+    assert conv._lookup_model_spec("XYZ999", "diode") == (None, "unresolved", "XYZ999")
+    # MOSFETs are not suffix-stripped (avoid guessing across FET families)
+    assert conv._lookup_model_spec("2N7000W", "mosfet")[0] is None
+
+
+@requires_sim
+def test_aliased_diode_records_provenance():
+    """A diode with value='1N4148W' converts with datasheet_fit provenance whose
+    name records the alias mapping '1N4148W->1N4148' (never silent)."""
+    _setup()
+    d = Part("Device", "D", value="1N4148W", ref="D1")
+    Net("A").connect(d["A"])
+    Net("K").connect(d["K"])
+    conv = SpiceConverter(skidl_flat_view())
+    conv.convert(strict=False)
+    prov = conv.model_provenance["D1"]
+    assert prov.tier == "datasheet_fit"
+    assert prov.name == "1N4148W->1N4148", prov.name
+
+
+@requires_sim
+def test_alias_sim_params_override_still_wins():
+    """Sim.Params on an aliased part still produces a per-device derived card."""
+    _setup()
+    d = Part("Device", "D", value="1N4148W", ref="D1")
+    d.Sim_Params = "IS=2e-9"
+    Net("A").connect(d["A"])
+    Net("K").connect(d["K"])
+    conv = SpiceConverter(skidl_flat_view())
+    conv.convert(strict=False)
+    assert conv.model_provenance["D1"].overridden
+    assert any(name.startswith("1N4148W_") for name in conv.derived_models)
+
+
 # --- live simulation (ngspice) --------------------------------------------
 
 

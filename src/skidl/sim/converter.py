@@ -578,28 +578,57 @@ class SpiceConverter:
         "PMOS": "mosfet",
     }
 
+    # Trailing package/reel tokens stripped (case-insensitive) when a model name
+    # doesn't resolve, to retry against its bare die name -- only for diodes/BJTs,
+    # and only if the stripped base actually exists in the library (never a guess).
+    _PKG_SUFFIX_RE = re.compile(
+        r"(?:-7-F|T/R|WS|WT|TR|W|S|A|B)$", re.IGNORECASE
+    )
+
     def _lookup_model_spec(self, name, kind):
-        """Resolve a model name through the ladder -> ((device_type, params), tier).
+        """Resolve a model name through the ladder -> ((device_type, params), tier,
+        resolved_name).
 
         Tier is ``generic`` (built-in ``Default*``), ``datasheet_fit`` (a matching
-        entry in the built-in ``ModelLibrary``), or ``unresolved`` (unknown, or a
-        library entry whose device type is wrong for ``kind``). Returns
-        ``(None, "unresolved")`` in the last case so validate() can report it.
+        entry in the built-in ``ModelLibrary``, possibly via a package-suffix alias
+        -- ``1N4148W`` -> ``1N4148``), or ``unresolved`` (unknown, or a library
+        entry whose device type is wrong for ``kind``). ``resolved_name`` is the
+        canonical library name actually matched (== ``name`` on an exact hit), so
+        the caller can record an ``asked->base`` provenance for an alias. Returns
+        ``(None, "unresolved", name)`` when nothing resolves.
         """
         if name in self.GENERIC_MODELS:
             device_type, params = self.GENERIC_MODELS[name]
-            return (device_type, dict(params)), "generic"
-        try:
-            from .models import get_model_library
-
-            entry = get_model_library().get_model(name)
-        except Exception:  # pragma: no cover - library import/init failure
-            entry = None
+            return (device_type, dict(params)), "generic", name
+        entry, resolved = self._resolve_library_model(name, kind)
         if entry is not None:
             mtype = str(entry.model_type).upper()
             if self._MODEL_TYPE_TO_KIND.get(mtype) == kind:
-                return (entry.model_type, dict(entry.parameters)), "datasheet_fit"
-        return None, "unresolved"
+                return (entry.model_type, dict(entry.parameters)), "datasheet_fit", resolved
+        return None, "unresolved", name
+
+    def _resolve_library_model(self, name, kind):
+        """Find a ModelLibrary entry for ``name`` -> ``(SpiceModel|None, canonical)``.
+
+        Exact match, then the explicit ALIASES table (``models.resolve_model``),
+        then -- for diodes/BJTs only -- a conservative package-suffix strip that is
+        accepted only when the stripped base already exists in the library.
+        """
+        try:
+            from .models import get_model_library
+        except Exception:  # pragma: no cover - library import/init failure
+            return None, name
+        lib = get_model_library()
+        entry, resolved = lib.resolve_model(name)
+        if entry is not None:
+            return entry, resolved
+        if kind in ("diode", "bjt") and name:
+            base = self._PKG_SUFFIX_RE.sub("", str(name))
+            if base and base != name:
+                stripped = lib.get_model(base)
+                if stripped is not None:
+                    return stripped, base
+        return None, name
 
     def _resolve_device_model(self, component, ref) -> Optional[str]:
         """Model name a device instance should reference; resolve tier + Sim.Params.
@@ -615,7 +644,11 @@ class SpiceConverter:
         if kind not in ("diode", "bjt", "mosfet"):
             return None
         base = self._device_model_name(component)
-        spec, tier = self._lookup_model_spec(base, kind)
+        spec, tier, resolved = self._lookup_model_spec(base, kind)
+        # Provenance name records a package-suffix alias as "asked->die" so an
+        # aliased model is never silent (e.g. "1N4148W->1N4148"); an exact hit
+        # keeps the plain name.
+        prov_name = base if resolved == base else f"{base}->{resolved}"
         overrides = self._parse_sim_params(self._sim_props(component).get("params"))
 
         if spec is None:
@@ -644,10 +677,15 @@ class SpiceConverter:
 
         device_type, params = spec
         self.model_provenance[ref] = ResolvedModel(
-            ref, kind, tier, base, overridden=bool(overrides)
+            ref, kind, tier, prov_name, overridden=bool(overrides)
         )
+        if resolved != base:
+            logger.info(
+                f"{ref}: model '{base}' aliased to library die '{resolved}' "
+                f"(package-suffix), tier={tier}"
+            )
         logger.info(
-            f"{ref} ({base}): model tier={tier}"
+            f"{ref} ({prov_name}): model tier={tier}"
             + (" (+Sim.Params override)" if overrides else "")
         )
 
@@ -2924,7 +2962,7 @@ class SpiceConverter:
             if model is None:
                 continue
             kind = self._kind(component)
-            spec, _tier = self._lookup_model_spec(model, kind)
+            spec, _tier, _resolved = self._lookup_model_spec(model, kind)
             if spec is not None:
                 continue
             # An unresolved base carrying Sim.Params degrades to the kind's generic
