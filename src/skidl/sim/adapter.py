@@ -59,6 +59,23 @@ def _part_symbol(part):
     return f"{nickname}:{name}" if nickname else str(name)
 
 
+def _pin_func_str(pin):
+    """Lowercased electrical-type string for a skidl pin (``"output"``, ``"input"``,
+    ``"power_in"``, ...), or ``""`` if unknown.
+
+    skidl ``Pin.func`` is a ``pin_types`` enum whose ``.name`` is ``OUTPUT`` /
+    ``INPUT`` / ``PWRIN`` / ``PASSIVE`` / ... The converter's op-amp terminal
+    resolver (:meth:`SpiceConverter._opamp_terminals`) substring-matches
+    ``"output"`` / ``"input"`` on this string to classify signal pins, so it MUST
+    be threaded through -- without it every op-amp falls back to the positional
+    guess and scrambles its (out, in+, in-) nodes (singular matrix, hard fail).
+    """
+    func = getattr(pin, "func", None)
+    if func is None:
+        return ""
+    return str(getattr(func, "name", func)).lower()
+
+
 def _pin_net(pin):
     """Return the skidl net a pin is on, or None if unconnected.
 
@@ -147,14 +164,19 @@ class AdaptedNet:
 
 
 class AdaptedPin:
-    """Minimal pin view: ``.net`` (AdaptedNet|None), ``.num``, ``.name``."""
+    """Minimal pin view: ``.net`` (AdaptedNet|None), ``.num``, ``.name``, ``.func``.
 
-    __slots__ = ("net", "num", "name")
+    ``.func`` is the lowercased electrical-type string (``"output"``/``"input"``/
+    ``"power_in"``/...) the converter reads to resolve op-amp signal terminals.
+    """
 
-    def __init__(self, net, num, name):
+    __slots__ = ("net", "num", "name", "func")
+
+    def __init__(self, net, num, name, func=""):
         self.net = net
         self.num = num
         self.name = name
+        self.func = func
 
 
 class AdaptedComponent:
@@ -231,6 +253,7 @@ def skidl_flat_view(circuit=None):
                 net=net_view(_pin_net(pin)),
                 num=num,
                 name=getattr(pin, "name", "") or "",
+                func=_pin_func_str(pin),
             )
         components[ref] = AdaptedComponent(
             ref=ref,

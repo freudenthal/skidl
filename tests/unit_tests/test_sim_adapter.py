@@ -2,7 +2,7 @@
 
 # The MIT License (MIT) - Copyright (c) Dave Vandenbout.
 
-"""Phase 3 tests: skidl -> SPICE sim via the ``skidl.sim`` adapter.
+"""Tests: skidl -> SPICE sim via the ``skidl.sim`` adapter.
 
 Exercises the VENDORED, standalone ``skidl.sim`` stack (no circuit_synth
 dependency). Layered so most run with no extra deps:
@@ -50,6 +50,31 @@ def _setup():
     lib_search_paths["kicad10"] = ["."] + default_lib_paths()
     import builtins
 
+    builtins.default_circuit.mini_reset()
+
+
+def _setup_real_libs():
+    """Setup that binds to the REAL KiCad-10 symbol dirs only (no ``"."``, so the
+    bundled ``test_data/kicad6`` libs don't shadow KiCad-10-only parts like
+    ADA4817). Skips the test if a real KiCad-10 install isn't present."""
+    set_default_tool(KICAD10)
+    from skidl.tools.kicad10.lib import default_lib_paths
+
+    real = [
+        p
+        for p in default_lib_paths()
+        if p not in (".", "") and "test_data" not in str(p).replace("\\", "/")
+    ]
+    if not real:
+        pytest.skip("no real KiCad-10 symbol library on this host")
+    lib_search_paths["kicad10"] = real
+    import builtins
+
+    builtins.default_circuit.mini_reset()
+    try:
+        Part("Amplifier_Operational", "ADA4817-1ACP")
+    except Exception:
+        pytest.skip("ADA4817-1ACP not in the installed KiCad-10 libraries")
     builtins.default_circuit.mini_reset()
 
 
@@ -110,7 +135,48 @@ def test_adapter_supplies_multi_unit_symbol_data():
     assert skidl_flat_view().components["R1"]._symbol_data is None
 
 
-# --- conversion through the real cs converter (PySpice) --------------------
+def test_adapter_pins_carry_electrical_func():
+    """Every AdaptedPin exposes its electrical type as ``.func`` (lowercased
+    ``"output"``/``"input"``/``"power_in"``/...). Without it a single-unit op-amp's
+    output pin is invisible to the converter's terminal resolver, which then falls
+    back to a positional guess and scrambles (out, in+, in-) -> singular matrix."""
+    _setup_real_libs()
+    op = Part("Amplifier_Operational", "ADA4817-1ACP")
+    Net("VOUT").connect(op[7], op[2])  # OUT + FB
+    Net("INN").connect(op[3])  # "-"
+    Net("INP").connect(op[4])  # "+"
+    pins = skidl_flat_view().components["U1"]._pins
+    assert pins["7"].func == "output"
+    assert pins["3"].func == "input" and pins["4"].func == "input"
+    assert "output" not in pins["3"].func
+
+
+@requires_sim
+def test_single_unit_opamp_terminals_resolve_by_func():
+    """A single-unit op-amp (ADA4817) resolves (out, in+, in-) from pin func/name,
+    NOT position -- the SiPM-TIA canary regression. Before the ``.func`` fix the
+    VCVS drove the wrong node (a supply rail), shorting two voltage sources."""
+    _setup_real_libs()
+    op = Part("Amplifier_Operational", "ADA4817-1ACP", ref="U1")
+    op.Sim_Gbw = "1.4G"
+    r = Part("Device", "R", value="100k")
+    vout, ninv, gnd = Net("VOUT"), Net("NINV"), Net("GND")
+    op[7] += vout  # OUT
+    op[2] += vout  # FB
+    op[3] += ninv  # -
+    op[4] += gnd  # +
+    op[8] += Net("VP")
+    op[5] += Net("VN")
+    r[1] += ninv
+    r[2] += vout
+
+    # Resolve directly off the view component (node_map empty pre-convert is fine).
+    view = skidl_flat_view()
+    out, inp, inn = SpiceConverter(view)._opamp_terminals(view.components["U1"])
+    assert (out, inp, inn) == ("VOUT", "GND", "NINV"), (out, inp, inn)
+
+
+# --- conversion through the SPICE converter (PySpice) --------------------
 
 
 @requires_sim
