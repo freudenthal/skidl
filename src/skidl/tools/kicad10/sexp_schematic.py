@@ -1175,38 +1175,12 @@ def create_hierarchical_sheet_sexp(node, sheet_uuid, sheet_tx):
         ]
     )
 
-    # Add sheet pins for boundary nets.
-    if hasattr(node, "get_boundary_nets"):
-        boundary_nets = node.get_boundary_nets()
-        pin_spacing = 2.54  # mm between pins
-        pin_y = by + pin_spacing
-        for net in boundary_nets:
-            # Skip power nets that become power symbols (they don't need sheet pins).
-            if _net_wants_power_symbol(net):
-                continue
-            # Skip stubbed nets (they use global labels).
-            if getattr(net, "stub", False) or getattr(net, "_stub", False):
-                continue
-
-            pin_uuid = _gen_uuid(f"sheet_pin:{node.sheet_filename}:{net.name}")
-            # Place pins along the left edge of the sheet.
-            sheet.append(
-                Sexp(
-                    [
-                        "pin",
-                        net.name,
-                        "bidirectional",
-                        ["at", bx, _round_mm(pin_y), 180],
-                        [
-                            "effects",
-                            ["font", ["size", 1.27, 1.27]],
-                            ["justify", "left"],
-                        ],
-                        ["uuid", pin_uuid],
-                    ]
-                )
-            )
-            pin_y += pin_spacing
+    # No sheet pins: boundary nets connect across sheets by NAME through the
+    # ``global_label`` on each of their pins (see node_to_sexp_schematic). A sheet
+    # pin here would need a matching hierarchical_label wired inside the child AND
+    # a wire to it on the parent; emitting the pin alone (the old behavior) left it
+    # dangling -> ``pin_not_connected`` on the sheet symbol. The empty sheet box
+    # plus name-based global labels is ERC-clean and keeps the hierarchy readable.
 
     return sheet
 
@@ -2229,20 +2203,15 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
     # Add lib_symbols section to schematic.
     schematic.append(lib_symbols_sexp)
 
-    # Collect hierarchical labels for boundary nets (nets that cross the sheet boundary).
-    if hasattr(node, "get_boundary_nets"):
-        boundary_nets = node.get_boundary_nets()
-        hlabel_y = 10.0  # Starting Y position in mm for labels along the left edge.
-        for net in boundary_nets:
-            # Skip power nets and stubbed nets.
-            if _net_wants_power_symbol(net):
-                continue
-            if getattr(net, "stub", False) or getattr(net, "_stub", False):
-                continue
-            elements.append(
-                hierarchical_label_to_sexp(net.name, 5.0, hlabel_y, angle=180)
-            )
-            hlabel_y += 2.54
+    # NOTE: boundary (cross-sheet) nets connect by NAME via the ``global_label``
+    # each of their pins already carries (net_label_to_sexp with local=False),
+    # exactly like power nets connect by their power-symbol name. The old
+    # fixed-position ``hierarchical_label`` emitted here sat at the sheet edge on
+    # nothing -> ``label_dangling`` (and, on the ROOT sheet, the invalid
+    # "hierarchical label in root sheet cannot be connected to a parent" error),
+    # while adding no connectivity the global label didn't. It is therefore NOT
+    # emitted; cross-sheet connectivity is verified by the drawing_connectivity
+    # gate. (Sheet pins are likewise omitted -- see create_hierarchical_sheet_sexp.)
 
     # Spread net labels off component bodies (connectivity-preserving).
     # Decision (overlap + nudge target) lives in schematics/decisions.py; the
