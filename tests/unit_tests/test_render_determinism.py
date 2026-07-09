@@ -1,162 +1,140 @@
 # -*- coding: utf-8 -*-
 
-"""Committed determinism harness for the render pipeline (stage 19).
+"""Committed determinism harness for the render pipeline.
 
-These render the same circuit twice, in one process, with an explicit RNG
-``seed`` and compare the PART-PLACEMENT fingerprint.
+The render pipeline must be REPRODUCIBLE: rendering the same circuit twice must
+produce byte-identical ``.kicad_sch`` files (modulo the title-block date), even
+across processes with a different ``PYTHONHASHSEED``. Two nondeterminism sources
+were closed for this (wired-render-default plan, Phase 2):
 
-STATUS (stage 19, measured 2026-07-07): the render pipeline is NOT yet
-reproducible even with ``seed=1``. Threading the seed removed the OS-entropy
-source (``random.seed(None)``), and stage-19 added stable part/pin/Face sort
-keys, but the force-directed placer AND the switchbox maze router still iterate
-Python sets of *objects* in ``id()`` order at many sites — so which object
-receives which random draw varies per build. A trivial 2-part divider happens to
-be stable, but a realistic ~13-part circuit diverges essentially every run
-(large layout shifts). Making the whole pipeline reproducible is a substantial
-follow-up (systematically replacing id-ordered iteration with stable keys across
-place.py + route.py); it is NOT required for Blocker B correctness, whose snap
-fix guarantees no cross-net coincidence via a post-snap invariant sweep
-regardless of layout.
+* the ``seed`` now defaults to 42 (was ``random.seed(None)`` = wall-clock);
+* the two surviving order-dependent RNG/object-set sources — ``overlap_force``'s
+  symmetry-breaker (now a deterministic per-part-pair jitter) and the cosmetic
+  ``remove_jogs`` wire pass (``random.shuffle`` + ``list(set(...))`` → sorted on
+  stable geometric keys). The latter reshaped wires per process AND, via the
+  sheet bbox that centers the page, shifted every part.
 
-These tests are therefore marked ``xfail(strict=False)``: they document the
-target and serve as the committed measurement that will flip to passing once the
-placer/router are made deterministic. Do NOT "fix" them by weakening the
-fingerprint — fix the pipeline.
-
-Like test_seed_integration, these need real KiCad symbol libraries and skip
-otherwise.
+These tests render in SEPARATE subprocesses with DIFFERENT ``PYTHONHASHSEED``s
+and assert byte-identity (date excluded). Do NOT "fix" a regression here by
+weakening the comparison — fix the pipeline.
 """
 
-import glob
 import os
 import re
-import shutil
+import subprocess
+import sys
 import tempfile
+from pathlib import Path
 
 import pytest
 
-_HAS_LIBS = (
-    bool(os.environ.get("KICAD9_SYMBOL_DIR"))
-    or os.path.exists("/usr/share/kicad/symbols")
-    or os.path.exists(os.path.expanduser("~/.local/share/kicad/9.0/symbols"))
-)
-requires_libs = pytest.mark.skipif(
-    not _HAS_LIBS, reason="KiCad symbol libraries not available"
-)
-
-pytestmark = requires_libs
+# --- real-KiCad-10 discovery (mirrors test_kicad10.py) ---------------------
+_KICAD_CLI_CANDIDATES = [
+    r"C:\Program Files\KiCad\10.0\bin\kicad-cli.exe",
+    "/usr/bin/kicad-cli",
+    "/usr/local/bin/kicad-cli",
+]
 
 
-def _symbol_placements(text):
-    """Sorted multiset of the SYMBOL ``(at ...)`` tokens = deterministic part placement."""
-    return sorted(
-        re.findall(r"\(symbol\b[^\n]*\n\s*\(lib_id[^\n]*\n\s*\(at ([-\d. ]+)\)", text)
+def _kicad10_symbols_available():
+    import skidl.tools.kicad10.lib as k10
+
+    return bool(k10._discover_default_symbol_dirs("10")) or bool(
+        os.environ.get("KICAD10_SYMBOL_DIR") or os.environ.get("KICAD_SYMBOL_DIR")
     )
 
 
-def _read(path):
-    with open(path, "r", encoding="utf-8") as f:
-        return f.read()
-
-
-def _build_tia(circuit):
-    """~13-part flat TIA (op-amp + passives), matching the seed smoke fixture."""
-    from skidl import Net, Part
-
-    with circuit:
-        u1 = Part("Amplifier_Operational", "OPA340NA")
-        rf = Part("Device", "R", value="1M")
-        cf = Part("Device", "C", value="2p")
-        rin = Part("Device", "R", value="50")
-        rl = Part("Device", "R", value="1k")
-        rb1 = Part("Device", "R", value="10k")
-        rb2 = Part("Device", "R", value="10k")
-        cb = Part("Device", "C", value="100n")
-        gnd, vplus, sig = Net("GND"), Net("+5V"), Net("SIG")
-        bias = Net("BIAS")
-        u1["4"] += rf[1], cf[1], rin[2]
-        u1["1"] += rf[2], cf[2], rl[1]
-        u1["3"] += bias
-        u1["2"] += gnd
-        u1["5"] += vplus
-        rb1[1] += vplus
-        rb1[2] += bias
-        rb2[1] += bias
-        rb2[2] += gnd
-        cb[1] += bias
-        cb[2] += gnd
-        rin[1] += sig
-        rl[2] += gnd
-
-
-def _build_hier(circuit):
-    """Top with one @subcircuit child owning an internal wireable net."""
-    from skidl import Net, Part, subcircuit
-
-    @subcircuit
-    def rc(vin, gnd):
-        mid = Net()
-        r1 = Part("Device", "R", value="10k")
-        c1 = Part("Device", "C", value="100n")
-        vin += r1[1]
-        r1[2] += mid
-        mid += c1[1]
-        c1[2] += gnd
-
-    with circuit:
-        vin, gnd = Net("VIN"), Net("GND")
-        rc(vin, gnd, tag="b1")
-
-
-def _gen_symbol_placements(builder, top):
-    from skidl import Circuit
-
-    d = tempfile.mkdtemp(prefix="skidl_det_")
-    try:
-        c = Circuit(name=top)
-        builder(c)
-        c.generate_schematic(
-            filepath=d,
-            top_name=top,
-            auto_stub=True,
-            auto_stub_fallback="labels",
-            seed=1,
-        )
-        path = os.path.join(d, f"{top}.kicad_sch")
-        assert os.path.exists(path), f"schematic not generated at {path}"
-        # Read every generated sheet (top + hierarchical children) so the
-        # fingerprint covers child-owned parts too — each child is its own file.
-        text = "".join(
-            _read(p) for p in sorted(glob.glob(os.path.join(d, "*.kicad_sch")))
-        )
-        return _symbol_placements(text)
-    finally:
-        shutil.rmtree(d, ignore_errors=True)
-
-
-_XFAIL_DET = pytest.mark.xfail(
-    reason="stage-19 follow-up: force-directed placer + maze router still iterate "
-    "object sets in id() order, so render placement is not reproducible even with "
-    "seed=1 (see module docstring). Not required for Blocker B correctness.",
-    strict=False,
+requires_kicad10 = pytest.mark.skipif(
+    not _kicad10_symbols_available(),
+    reason="requires real KiCad 10 stock symbol libraries",
 )
 
 
-@requires_libs
-@_XFAIL_DET
-def test_flat_placement_deterministic():
-    # Two in-process renders with the same seed -> identical part placement.
-    a = _gen_symbol_placements(_build_tia, "det_tia")
-    b = _gen_symbol_placements(_build_tia, "det_tia")
-    assert a, "expected some symbol placements in the fingerprint"
-    assert a == b
+# Render script run in a child process. Prints nothing; writes <top>.kicad_sch
+# (+ child sheets) into argv[1]. Kept dependency-free of skidl_eda so it is a
+# pure-fork test.
+_RENDER = r"""
+import sys
+from skidl import (Circuit, Net, Part, POWER, KICAD10, subcircuit,
+                   lib_search_paths, set_default_tool)
+set_default_tool(KICAD10)
+lib_search_paths["kicad10"] = ["."] + __import__(
+    "skidl.tools.kicad10.lib", fromlist=["default_lib_paths"]).default_lib_paths()
+
+which, outdir = sys.argv[1], sys.argv[2]
+
+def flat(ckt):
+    with ckt:
+        u1 = Part("Amplifier_Operational", "OPA340NA")
+        rf = Part("Device", "R", value="1M"); cf = Part("Device", "C", value="2p")
+        rin = Part("Device", "R", value="50"); rl = Part("Device", "R", value="1k")
+        rb1 = Part("Device", "R", value="10k"); rb2 = Part("Device", "R", value="10k")
+        cb = Part("Device", "C", value="100n")
+        gnd, vplus, sig, bias = Net("GND"), Net("+5V"), Net("SIG"), Net("BIAS")
+        gnd.drive = POWER; vplus.drive = POWER
+        u1["4"] += rf[1], cf[1], rin[2]
+        u1["1"] += rf[2], cf[2], rl[1]
+        u1["3"] += bias; u1["2"] += gnd; u1["5"] += vplus
+        rb1[1] += vplus; rb1[2] += bias; rb2[1] += bias; rb2[2] += gnd
+        cb[1] += bias; cb[2] += gnd; rin[1] += sig; rl[2] += gnd
+
+def hier(ckt):
+    @subcircuit
+    def stage(vin, vout, vpos, gnd):
+        u = Part("Amplifier_Operational", "OPA340NA")
+        r1 = Part("Device", "R", value="1k"); r2 = Part("Device", "R", value="1k")
+        u["5"] += vpos; u["2"] += gnd; u["3"] += vin; u["4"] += vout; u["1"] += vout
+        r1[1] += vin; r1[2] += gnd; r2[1] += vout; r2[2] += gnd
+        c = Part("Device", "C", value="100n"); c[1] += vpos; c[2] += gnd
+    with ckt:
+        vpos = Net("+5V"); vpos.drive = POWER
+        gnd = Net("GND"); gnd.drive = POWER
+        a, b, c = Net("A"), Net("B"), Net("C")
+        stage(a, b, vpos, gnd, tag="s1"); stage(b, c, vpos, gnd, tag="s2")
+
+top = {"flat": "detf", "hier": "deth"}[which]
+ckt = Circuit(name=top)
+{"flat": flat, "hier": hier}[which](ckt)
+ckt.generate_schematic(tool=KICAD10, filepath=outdir, top_name=top,
+                       seed_placement=True, auto_stub=False)
+"""
 
 
-@requires_libs
-@_XFAIL_DET
-def test_hierarchical_placement_deterministic():
-    # Covers the per-node reseed path (one @subcircuit child).
-    a = _gen_symbol_placements(_build_hier, "det_hier")
-    b = _gen_symbol_placements(_build_hier, "det_hier")
-    assert a, "expected some symbol placements in the fingerprint"
-    assert a == b
+def _render_in_subprocess(which, outdir, hashseed):
+    env = dict(os.environ)
+    env["PYTHONHASHSEED"] = str(hashseed)
+    env["PYTHONUTF8"] = "1"
+    r = subprocess.run(
+        [sys.executable, "-c", _RENDER, which, str(outdir)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert r.returncode == 0, f"render failed ({which}, seed {hashseed}):\n{r.stderr}"
+
+
+def _normalized_sheets(outdir):
+    """Map {filename -> content with the title-block date neutralized}."""
+    out = {}
+    for f in sorted(Path(outdir).glob("*.kicad_sch")):
+        txt = f.read_text(encoding="utf-8")
+        txt = re.sub(r'\(date "[^"]*"\)', '(date "X")', txt)
+        out[f.name] = txt
+    return out
+
+
+@requires_kicad10
+@pytest.mark.parametrize("which", ["flat", "hier"])
+def test_render_byte_identical_across_hashseed(which):
+    """Same circuit, two processes, different PYTHONHASHSEED -> byte-identical
+    schematic (date excluded), for the wired (seed_placement) default path."""
+    a = tempfile.mkdtemp(prefix=f"skidl_det_{which}_a_")
+    b = tempfile.mkdtemp(prefix=f"skidl_det_{which}_b_")
+    _render_in_subprocess(which, a, hashseed=0)
+    _render_in_subprocess(which, b, hashseed=12345)
+    sa, sb = _normalized_sheets(a), _normalized_sheets(b)
+    assert sa, "no schematic produced"
+    assert set(sa) == set(sb), f"sheet set differs: {set(sa)} vs {set(sb)}"
+    for name in sa:
+        assert sa[name] == sb[name], f"{name} differs across PYTHONHASHSEED"

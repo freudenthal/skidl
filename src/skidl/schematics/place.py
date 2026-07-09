@@ -762,6 +762,35 @@ def _pin_order_key(pin):
     )
 
 
+# Dedicated deterministic jitter sequence for overlap_force's symmetry-breaker.
+# A single fixed per-pair offset (applied every force-directed iteration) does
+# NOT reliably separate two IDENTICAL parts/blocks -- they need the *exploration*
+# a varying perturbation gives (identical differential-amp halves otherwise stack
+# exactly, fusing their nets). But drawing from the global ``random`` module made
+# a seeded render irreproducible, because some other consumer's draw order varies
+# per process and shifts the whole sequence. So keep a private monotone counter,
+# consumed in the (deterministic, ref-sorted) overlap iteration order and hashed
+# to a sub-unit vector: varies per draw like random, but reproducible across
+# processes / PYTHONHASHSEEDs since it is isolated from every other RNG consumer.
+_JITTER_SEQ = [0]
+
+
+def _reset_jitter_seq():
+    _JITTER_SEQ[0] = 0
+
+
+def _seq_jitter():
+    """Next sub-unit ``Vector`` in [-0.5, 0.5)^2 from the private jitter sequence."""
+    import hashlib
+
+    n = _JITTER_SEQ[0]
+    _JITTER_SEQ[0] += 1
+    h = hashlib.md5(str(n).encode("ascii")).digest()
+    jx = int.from_bytes(h[0:4], "big") / 2**32 - 0.5
+    jy = int.from_bytes(h[4:8], "big") / 2**32 - 0.5
+    return Vector(jx, jy)
+
+
 @export_to_all
 def overlap_force(part, parts, **options):
     """Compute the repulsive force on a part from overlapping other parts.
@@ -788,10 +817,12 @@ def overlap_force(part, parts, **options):
         # No force unless parts overlap.
         if part_bbox.intersects(other_part_bbox):
             # Compute the movement needed to separate the bboxes in left/right/up/down directions.
-            # Add some small random offset to break symmetry when parts exactly overlay each other.
-            # Move right edge of part to the left of other part's left edge, etc...
+            # Add a small offset to break symmetry when parts exactly overlay each
+            # other. DETERMINISTIC per part-pair (not a global-RNG draw) so a
+            # seeded render is byte-reproducible regardless of iteration order /
+            # PYTHONHASHSEED -- see _stable_jitter.
             moves = []
-            rnd = Vector(random.random() - 0.5, random.random() - 0.5)
+            rnd = _seq_jitter()
             for edges, dir in (
                 (("ll", "lr"), Vector(1, 0)),
                 (("ul", "ll"), Vector(0, 1)),
@@ -2091,7 +2122,13 @@ class Placer:
         this_module = sys.modules[__name__]
         this_module.__dict__.update(tool_modules[tool].constants.__dict__)
 
-        random.seed(options.get("seed"))
+        # Default the seed so an unset seed is REPRODUCIBLE (was random.seed(None)
+        # -> wall-clock entropy -> a different layout every run). seed=None stays
+        # the explicit opt-in for randomized exploration.
+        random.seed(options.get("seed", 42))
+        # Reset the private overlap-jitter sequence so this node's placement is
+        # reproducible regardless of any prior node's consumption.
+        _reset_jitter_seq()
 
         # Store the starting attributes of the node's parts, pins, and nets.
         node.attrs = node.get_attrs()

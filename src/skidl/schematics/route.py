@@ -639,6 +639,14 @@ class Router:
         # skipped in this mode; the other passes run normally.
         _deconflict = getattr(node, "_deconflict_stubs", False)
 
+        def _pt_key(pt):
+            """Stable geometric sort key for a Point (determinism)."""
+            return (pt.x, pt.y)
+
+        def _seg_key(seg):
+            """Stable geometric sort key for a Segment (determinism)."""
+            return (seg.p1.x, seg.p1.y, seg.p2.x, seg.p2.y)
+
         def order_seg_points(segments):
             """Order endpoints in a horizontal or vertical segment."""
             for seg in segments:
@@ -955,11 +963,21 @@ class Router:
                         start_stop_pts.discard(segment.p1)
                         start_stop_pts.discard(segment.p2)
 
-                        # Send the jog that was found.
-                        yield list(jog_segs), list(start_stop_pts)
+                        # Send the jog that was found. Order the set-derived
+                        # lists on stable geometric keys: iterating a set of
+                        # Segment/Point OBJECTS is id()-ordered (varies per
+                        # process), which leaked into which jog got corrected and
+                        # made the rendered wires -- and, via the sheet bbox that
+                        # centers the page, the PART positions -- non-reproducible.
+                        yield (
+                            sorted(jog_segs, key=_seg_key),
+                            sorted(start_stop_pts, key=_pt_key),
+                        )
 
-            # Shuffle segments to vary the order of detected jogs.
-            random.shuffle(segments)
+            # Detect jogs in a stable order (was random.shuffle -> a seeded
+            # render still diverged per process). Sorting on the geometric key
+            # makes jog correction deterministic without changing its effect.
+            segments.sort(key=_seg_key)
 
             # Get iterator for jogs.
             jogs = get_jogs(segments)
@@ -979,10 +997,10 @@ class Router:
                 # These are the potential routing points for correcting the jog.
                 # Either start at p1 and move vertically and then horizontally to p3, or
                 # move horizontally from p1 and then vertically to p3.
+                # Deterministic order (was random.shuffle): the first VALID
+                # correction is applied, so a fixed order makes the reshaped wire
+                # reproducible across processes.
                 p2s = [Point(p1.x, p3.y), Point(p3.x, p1.y)]
-
-                # Shuffle the routing points so the applied correction isn't always the same orientation.
-                random.shuffle(p2s)
 
                 # Check each routing point to see if it leads to a valid routing.
                 for p2 in p2s:
@@ -1320,7 +1338,9 @@ class Router:
         this_module = sys.modules[__name__]
         this_module.__dict__.update(tool_modules[tool].constants.__dict__)
 
-        random.seed(options.get("seed"))
+        # Default the seed so an unset seed is REPRODUCIBLE across processes (see
+        # place.route). seed=None stays the explicit randomized-exploration opt-in.
+        random.seed(options.get("seed", 42))
 
         # Remove any stuff leftover from a previous place & route run.
         node.rmv_routing_stuff()
