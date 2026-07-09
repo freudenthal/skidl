@@ -1175,12 +1175,49 @@ def create_hierarchical_sheet_sexp(node, sheet_uuid, sheet_tx):
         ]
     )
 
-    # No sheet pins: boundary nets connect across sheets by NAME through the
-    # ``global_label`` on each of their pins (see node_to_sexp_schematic). A sheet
-    # pin here would need a matching hierarchical_label wired inside the child AND
-    # a wire to it on the parent; emitting the pin alone (the old behavior) left it
-    # dangling -> ``pin_not_connected`` on the sheet symbol. The empty sheet box
-    # plus name-based global labels is ERC-clean and keeps the hierarchy readable.
+    # Sheet pins for boundary nets -- the KiCad hierarchical-interconnect surface
+    # (a sheet pin on the parent's sheet symbol pairs with a hierarchical_label
+    # inside the child; see node_to_sexp_schematic). Gated on _EMIT_HIER_SHEET_PINS
+    # (the ``hierarchical_sheet_pins`` render option).
+    #
+    # DEFAULT OFF: boundary nets instead connect across sheets by NAME through the
+    # ``global_label`` on each of their pins -- ERC-clean today. The sheet-pin path
+    # is INCOMPLETE (the pin is placed at a left-edge slot but not yet wired to the
+    # parent net, and the child hierarchical_label is not yet wired to the net
+    # inside the child), so with the option ON it currently reports
+    # pin_not_connected / label_dangling until that wiring is finished upstream.
+    # It is preserved (not deleted) so the fork can complete it and re-enable it.
+    if _EMIT_HIER_SHEET_PINS and hasattr(node, "get_boundary_nets"):
+        boundary_nets = node.get_boundary_nets()
+        pin_spacing = 2.54  # mm between pins
+        pin_y = by + pin_spacing
+        for net in boundary_nets:
+            # Skip power nets that become power symbols (they don't need sheet pins).
+            if _net_wants_power_symbol(net):
+                continue
+            # Skip stubbed nets (they use global labels).
+            if getattr(net, "stub", False) or getattr(net, "_stub", False):
+                continue
+
+            pin_uuid = _gen_uuid(f"sheet_pin:{node.sheet_filename}:{net.name}")
+            # Place pins along the left edge of the sheet.
+            sheet.append(
+                Sexp(
+                    [
+                        "pin",
+                        net.name,
+                        "bidirectional",
+                        ["at", bx, _round_mm(pin_y), 180],
+                        [
+                            "effects",
+                            ["font", ["size", 1.27, 1.27]],
+                            ["justify", "left"],
+                        ],
+                        ["uuid", pin_uuid],
+                    ]
+                )
+            )
+            pin_y += pin_spacing
 
     return sheet
 
@@ -1294,6 +1331,20 @@ _AUDIT_STRICT = os.environ.get("SKIDL_AUDIT_STRICT", "0") not in (
     "false",
     "False",
 )
+
+# Hierarchical-sheet-pin interconnect mode. When True, a child sheet emits a
+# ``hierarchical_label`` per boundary net and the parent's sheet symbol gets a
+# matching ``pin`` (sheet pin) -- the KiCad hierarchical-sheet machinery the
+# upstream fork is building out. When False (the default), boundary nets connect
+# across sheets by NAME through the ``global_label`` each of their pins already
+# carries, which is ERC-clean today; the hierarchical machinery is still
+# INCOMPLETE (labels/pins are placed at sheet-edge slots, not yet wired to the
+# net inside the child nor to the parent net), so turning it on currently
+# produces label_dangling / pin_not_connected until that wiring lands. Set via
+# the ``hierarchical_sheet_pins`` render option (write_top_schematic), so the
+# feature is preserved and re-enableable without churn. See
+# create_hierarchical_sheet_sexp + node_to_sexp_schematic.
+_EMIT_HIER_SHEET_PINS = False
 
 
 class SheetConnectivityError(Exception):
@@ -2203,15 +2254,38 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
     # Add lib_symbols section to schematic.
     schematic.append(lib_symbols_sexp)
 
-    # NOTE: boundary (cross-sheet) nets connect by NAME via the ``global_label``
+    # Hierarchical labels for boundary nets -- the child-sheet half of the KiCad
+    # hierarchical interconnect (pairs with a sheet pin on the parent's sheet
+    # symbol; see create_hierarchical_sheet_sexp). Gated on _EMIT_HIER_SHEET_PINS
+    # (the ``hierarchical_sheet_pins`` render option); default OFF.
+    #
+    # DEFAULT OFF: boundary nets instead connect by NAME via the ``global_label``
     # each of their pins already carries (net_label_to_sexp with local=False),
-    # exactly like power nets connect by their power-symbol name. The old
-    # fixed-position ``hierarchical_label`` emitted here sat at the sheet edge on
-    # nothing -> ``label_dangling`` (and, on the ROOT sheet, the invalid
-    # "hierarchical label in root sheet cannot be connected to a parent" error),
-    # while adding no connectivity the global label didn't. It is therefore NOT
-    # emitted; cross-sheet connectivity is verified by the drawing_connectivity
-    # gate. (Sheet pins are likewise omitted -- see create_hierarchical_sheet_sexp.)
+    # exactly like power nets connect by their power-symbol name -- ERC-clean, and
+    # what the drawing_connectivity gate verifies. The hierarchical_label path is
+    # INCOMPLETE (the label sits at a fixed sheet-edge slot, not yet wired to the
+    # net inside this child), so with the option ON it currently reports
+    # label_dangling until that wiring lands. Kept (not deleted) so the fork can
+    # finish it and re-enable it. Never emitted on the ROOT sheet: a
+    # hierarchical_label there has no parent to connect to (KiCad errors on it).
+    _is_root_sheet = uuid_path.count("/") <= 1
+    if (
+        _EMIT_HIER_SHEET_PINS
+        and not _is_root_sheet
+        and hasattr(node, "get_boundary_nets")
+    ):
+        boundary_nets = node.get_boundary_nets()
+        hlabel_y = 10.0  # Starting Y position in mm for labels along the left edge.
+        for net in boundary_nets:
+            # Skip power nets and stubbed nets.
+            if _net_wants_power_symbol(net):
+                continue
+            if getattr(net, "stub", False) or getattr(net, "_stub", False):
+                continue
+            elements.append(
+                hierarchical_label_to_sexp(net.name, 5.0, hlabel_y, angle=180)
+            )
+            hlabel_y += 2.54
 
     # Spread net labels off component bodies (connectivity-preserving).
     # Decision (overlap + nudge target) lives in schematics/decisions.py; the
@@ -2249,7 +2323,15 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
 
 
 @export_to_all
-def write_top_schematic(circuit, node, filepath, top_name, title, version=20230409):
+def write_top_schematic(
+    circuit,
+    node,
+    filepath,
+    top_name,
+    title,
+    version=20230409,
+    hierarchical_sheet_pins=False,
+):
     """Generate and write the complete schematic from a placed+routed node tree.
 
     This is the main entry point called by each tool's gen_schematic().
@@ -2261,7 +2343,15 @@ def write_top_schematic(circuit, node, filepath, top_name, title, version=202304
         top_name: Base filename (without extension).
         title: Schematic title.
         version: S-expression version number.
+        hierarchical_sheet_pins: When True, emit KiCad hierarchical sheet pins +
+            hierarchical labels for boundary nets (the in-progress
+            hierarchical-interconnect surface). Default False -- boundary nets
+            connect by ``global_label`` name, which is ERC-clean; the sheet-pin
+            path is not yet fully wired (see _EMIT_HIER_SHEET_PINS).
     """
+
+    global _EMIT_HIER_SHEET_PINS
+    _EMIT_HIER_SHEET_PINS = bool(hierarchical_sheet_pins)
 
     init_power_symbol_data()
 

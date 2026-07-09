@@ -230,3 +230,59 @@ def test_one_pwr_flag_per_rail_project_wide(tmp_path):
     # And ERC sees both rails as driven.
     types = _erc_error_types(out, "manypin")
     assert types.get("power_pin_not_driven", 0) == 0, types
+
+
+# ---------------------------------------------------------------------------
+# hierarchical_sheet_pins option (KiCad hierarchical-interconnect surface)
+# ---------------------------------------------------------------------------
+
+
+def _hier_build(ckt):
+    from skidl import Net, Part, subcircuit
+
+    @subcircuit
+    def stage(vin, vout, vpos, gnd):
+        u = Part("Amplifier_Operational", "OPA340NA")
+        r = Part("Device", "R", value="1k",
+                 footprint="Resistor_SMD:R_0603_1608Metric")
+        u["5"] += vpos; u["2"] += gnd; u["3"] += vin; u["4"] += vout; u["1"] += vout
+        r[1] += vout; r[2] += gnd
+
+    with ckt:
+        vpos = Net("+5V"); vpos.drive = POWER
+        gnd = Net("GND"); gnd.drive = POWER
+        a, b, c = Net("A"), Net("B"), Net("C")
+        stage(a, b, vpos, gnd, tag="s1")
+        stage(b, c, vpos, gnd, tag="s2")
+
+
+@requires_kicad10
+def test_hier_sheet_pins_default_off_is_clean(tmp_path):
+    """By default boundary nets connect by global_label name -- no hierarchical
+    labels or sheet pins are emitted, and the render is ERC-clean."""
+    out, text = _render(_hier_build, "hspoff", tmp_path)
+    assert "(hierarchical_label" not in text
+    # No sheet pins (a sheet pin is `(pin NAME bidirectional ...)`; the shape of a
+    # global_label is `(shape bidirectional)`, which must NOT be mistaken for one).
+    assert re.search(r"\(pin \S+ bidirectional", text) is None
+    # Boundary net B (s1->s2) connects by global label.
+    assert 'global_label "B"' in text
+    types = _erc_error_types(out, "hspoff")
+    assert types.get("label_dangling", 0) == 0, types
+    assert types.get("pin_not_connected", 0) == 0, types
+
+
+@requires_kicad10
+def test_hier_sheet_pins_option_emits_hierarchical_interconnect(tmp_path):
+    """With hierarchical_sheet_pins=True the KiCad hierarchical machinery is
+    restored: child sheets carry hierarchical_labels and the parent's sheet
+    symbols carry sheet pins (the in-progress interconnect surface, preserved so
+    it can be completed and re-enabled)."""
+    out, text = _render(_hier_build, "hspon", tmp_path, hierarchical_sheet_pins=True)
+    assert "(hierarchical_label" in text, "child hierarchical labels not emitted"
+    # Parent sheet symbol carries sheet pins for boundary nets: `(pin NAME
+    # bidirectional (at ...))` inside a `(sheet ...)` (the net name is unquoted).
+    top = (out / "hspon.kicad_sch").read_text(encoding="utf-8")
+    assert re.search(r"\(pin \S+ bidirectional", top), "no sheet pins on parent"
+    # Root sheet must NOT carry a hierarchical_label (no parent to connect to).
+    assert "(hierarchical_label" not in top

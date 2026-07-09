@@ -548,7 +548,13 @@ def _handle_fallback(
     if not options.get("snap_before_route", False) and not deconflict:
         _snap_two_pin_parts(node)
     output_file = write_top_schematic(
-        circuit, node, filepath, top_name, title, version=20230409
+        circuit,
+        node,
+        filepath,
+        top_name,
+        title,
+        version=20230409,
+        hierarchical_sheet_pins=options.get("hierarchical_sheet_pins", False),
     )
     finalize_parts_and_nets(circuit, **options)
 
@@ -777,6 +783,18 @@ def gen_schematic(
             this alone has no effect on already-fragmented groups. Only honored
             when seed_placement=True. Default: node._ROW_PLACE_THRESHOLD.
 
+    Hierarchy options (pass as keyword arguments):
+        hierarchical_sheet_pins (bool): When True, emit the KiCad
+            hierarchical-interconnect surface — a hierarchical_label per boundary
+            net inside each child sheet and a matching sheet pin on the parent's
+            sheet symbol. Default False: boundary (cross-sheet) nets connect by
+            NAME through the global_label each of their pins already carries,
+            which is ERC-clean today. The sheet-pin path is preserved but NOT yet
+            fully wired (labels/pins sit at sheet-edge slots, not yet tied to the
+            net inside the child nor to the parent net), so turning it on
+            currently produces label_dangling / pin_not_connected until that
+            wiring lands — see sexp_schematic._EMIT_HIER_SHEET_PINS.
+
     Tips for best results with auto_stub:
         - Use @subcircuit to group related parts (e.g. power supply, MCU, amplifier).
           Each subcircuit gets placed and routed independently, producing more wired
@@ -919,7 +937,13 @@ def gen_schematic(
         # Generate S-expression schematic using shared module.
         # KiCad 8/9 use version 20230409.
         output_file = write_top_schematic(
-            circuit, node, filepath, top_name, title, version=20230409
+            circuit,
+            node,
+            filepath,
+            top_name,
+            title,
+            version=20230409,
+            hierarchical_sheet_pins=options.get("hierarchical_sheet_pins", False),
         )
 
         active_logger.info(f"Schematic written to {output_file}")
@@ -989,7 +1013,15 @@ def gen_schematic(
                         ):
                             _snap_two_pin_parts(node)
                         output_file = write_top_schematic(
-                            circuit, node, filepath, top_name, title, version=20230409
+                            circuit,
+                            node,
+                            filepath,
+                            top_name,
+                            title,
+                            version=20230409,
+                            hierarchical_sheet_pins=options.get(
+                                "hierarchical_sheet_pins", False
+                            ),
                         )
                         finalize_parts_and_nets(circuit, **options)
                         erc_regen_ok = True
