@@ -61,6 +61,7 @@ def _lib_nickname(part):
     base = str(filename).replace("\\", "/").rsplit("/", 1)[-1]
     return os.path.splitext(base)[0]
 
+
 # ---------------------------------------------------------------------------
 # Power symbol support
 # ---------------------------------------------------------------------------
@@ -80,7 +81,7 @@ def init_power_symbol_data():
         pwr_lib_text = f.read()
     pwr_lib_sexp = Sexp(pwr_lib_text)
     pwr_symbol_sexps = pwr_lib_sexp.search("/kicad_symbol_lib/symbol")
-    pwr_symbol_sexp_dict = {sym[1]:sym for sym in pwr_symbol_sexps}
+    pwr_symbol_sexp_dict = {sym[1]: sym for sym in pwr_symbol_sexps}
     pwr_symbol_names = set([p.name for p in pwr_lib])
 
 
@@ -97,6 +98,7 @@ def _extract_power_lib_symbol(name):
         Sexp: Parsed symbol definition, or None if not found.
     """
     from copy import deepcopy
+
     pwr_sym_sexp = deepcopy(pwr_symbol_sexp_dict.get(name, None))
     # Change the symbol name from "NAME" to "power:NAME" for lib_id matching.
     pwr_sym_sexp[1] = f"power:{name}"
@@ -254,7 +256,11 @@ def _power_symbol_to_sexp(pin, net_name, tx, uuid_path=None):
                     "SKiDL-Generated",
                     [
                         "path",
-                        uuid_path if uuid_path is not None else f"/{_gen_uuid('root_schematic')}",
+                        (
+                            uuid_path
+                            if uuid_path is not None
+                            else f"/{_gen_uuid('root_schematic')}"
+                        ),
                         ["reference", pwr_ref],
                         ["unit", 1],
                     ],
@@ -479,7 +485,7 @@ def part_to_sexp(part, uuid_path, tx=Tx()):
                     "SKiDL-Generated",
                     [
                         "path",
-                        f'{uuid_path}',
+                        f"{uuid_path}",
                         ["reference", part.ref],
                         ["unit", unit_num],
                     ],
@@ -731,7 +737,9 @@ def calc_pin_dir(pin):
     }[pin_vector]
 
 
-def net_label_to_sexp(pin, tx=Tx(), force=False, local=False, at_world=None, uuid_path=None):
+def net_label_to_sexp(
+    pin, tx=Tx(), force=False, local=False, at_world=None, uuid_path=None
+):
     """Create S-expression for a net label at a pin stub.
 
     Generates a power symbol if the net name matches a known KiCad power
@@ -803,11 +811,13 @@ def net_label_to_sexp(pin, tx=Tx(), force=False, local=False, at_world=None, uui
     if not local:
         # global_label carries a shape; a plain label does not.
         fields.append(["shape", "bidirectional"])
-    fields.extend([
-        ["at", _round_mm(pt.x), _round_mm(pt.y), angle],
-        ["effects", ["font", ["size", 1.27, 1.27]], ["justify", justify]],
-        ["uuid", _gen_uuid(f"label:{pin.net.name}:{pt.x}:{pt.y}")],
-    ])
+    fields.extend(
+        [
+            ["at", _round_mm(pt.x), _round_mm(pt.y), angle],
+            ["effects", ["font", ["size", 1.27, 1.27]], ["justify", justify]],
+            ["uuid", _gen_uuid(f"label:{pin.net.name}:{pt.x}:{pt.y}")],
+        ]
+    )
     return Sexp(fields)
 
 
@@ -1088,7 +1098,12 @@ _EMIT_CONNECTIVITY_AUDIT = True
 # skidl render aborts and the equivalence gate installs the native render
 # instead (correctness stays safe). Off by default (warn-only); the circuit-synth
 # skidl-render path sets SKIDL_AUDIT_STRICT=1. (stage 24)
-_AUDIT_STRICT = os.environ.get("SKIDL_AUDIT_STRICT", "0") not in ("0", "", "false", "False")
+_AUDIT_STRICT = os.environ.get("SKIDL_AUDIT_STRICT", "0") not in (
+    "0",
+    "",
+    "false",
+    "False",
+)
 
 
 class SheetConnectivityError(Exception):
@@ -1137,23 +1152,35 @@ def _audit_sheet_connectivity(node, elements, backend, sheet_tx):
         tag = elem[0]
         if tag in ("global_label", "hierarchical_label", "label"):
             at = next(
-                (s for s in elem if hasattr(s, "__getitem__") and len(s) >= 3 and s[0] == "at"),
+                (
+                    s
+                    for s in elem
+                    if hasattr(s, "__getitem__") and len(s) >= 3 and s[0] == "at"
+                ),
                 None,
             )
             if at and isinstance(elem[1], str):
                 cell_nets[_key(at[1], at[2])].add(elem[1])
         elif tag == "symbol":
             lib_id = next(
-                (s for s in elem if hasattr(s, "__getitem__") and len(s) >= 2 and s[0] == "lib_id"),
+                (
+                    s
+                    for s in elem
+                    if hasattr(s, "__getitem__") and len(s) >= 2 and s[0] == "lib_id"
+                ),
                 None,
             )
             if lib_id and str(lib_id[1]).startswith("power:"):
                 at = next(
-                    (s for s in elem if hasattr(s, "__getitem__") and len(s) >= 3 and s[0] == "at"),
+                    (
+                        s
+                        for s in elem
+                        if hasattr(s, "__getitem__") and len(s) >= 3 and s[0] == "at"
+                    ),
                     None,
                 )
                 if at:
-                    cell_nets[_key(at[1], at[2])].add(str(lib_id[1])[len("power:"):])
+                    cell_nets[_key(at[1], at[2])].add(str(lib_id[1])[len("power:") :])
 
     from skidl.logger import active_logger
 
@@ -1164,7 +1191,10 @@ def _audit_sheet_connectivity(node, elements, backend, sheet_tx):
             active_logger.warning(
                 "connectivity audit: sheet %s cell (%s, %s) shared by nets %s "
                 "(cross-net coincidence -> KiCad would fuse them)",
-                sheet, x, y, sorted(names),
+                sheet,
+                x,
+                y,
+                sorted(names),
             )
             fusions.append(((x, y), sorted(names)))
     if fusions and _AUDIT_STRICT:
@@ -1239,7 +1269,9 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
         child.uuid = _gen_uuid(f"{child.name}_{i}")
         child_uuid_path = f"{uuid_path}/{child.uuid}"
         # Get elements for child sheet (or for inclusion in this sheet if child is flattened).
-        sexp_list, part_dict, pwr_dict, _ = node_to_sexp_schematic(child, child_uuid_path, sheet_tx=tx, version=version)
+        sexp_list, part_dict, pwr_dict, _ = node_to_sexp_schematic(
+            child, child_uuid_path, sheet_tx=tx, version=version
+        )
         elements.extend(sexp_list)
         lib_symbols.update(part_dict)
         pwr_symbols.update(pwr_dict)
@@ -1348,8 +1380,11 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
             # EXCEPT for a stub net whose net a real on-sheet pin already labels
             # (see deconflict_real_pin_net_ids) -- there the terminal is
             # redundant and its label would dangle, so skip it.
-            if (deconflict and getattr(pin.net, "_stub", False)
-                    and id(pin.net) in deconflict_real_pin_net_ids):
+            if (
+                deconflict
+                and getattr(pin.net, "_stub", False)
+                and id(pin.net) in deconflict_real_pin_net_ids
+            ):
                 continue
             if not deconflict and pin.net.name in nets_with_real_pins:
                 continue
@@ -1358,7 +1393,10 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
                 # Emit the label at the real component pin, suppress the
                 # NetTerminal (channel-edge) label + route wire for this net.
                 label = net_label_to_sexp(
-                    real_pin, tx=tx, force=True, local=_is_internal(pin.net),
+                    real_pin,
+                    tx=tx,
+                    force=True,
+                    local=_is_internal(pin.net),
                     uuid_path=uuid_path,
                 )
                 if label:
@@ -1366,7 +1404,10 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
                     onpin_net_ids.add(id(pin.net))
                 continue
             label = net_label_to_sexp(
-                pin, tx=tx, force=True, local=_is_internal(pin.net),
+                pin,
+                tx=tx,
+                force=True,
+                local=_is_internal(pin.net),
                 at_world=stub_ends.get(id(pin)) if deconflict else None,
                 uuid_path=uuid_path,
             )
@@ -1407,6 +1448,7 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
     from skidl.schematics import decisions as _decisions
     from skidl.schematics.backend import RenderContext
     from .backend import Kicad9Backend
+
     _backend = RenderContext(Kicad9Backend())
 
     # Suppress labels for snap-overlapping pins (one label per connected cluster).
@@ -1417,7 +1459,10 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
     for x1, y1, x2, y2, net_name in bus_segments:
         elements.append(
             _backend.emit_wire(
-                x1, y1, x2, y2,
+                x1,
+                y1,
+                x2,
+                y2,
                 net_name=net_name,
                 uuid_seed=f"pbus:{net_name}:{x1}:{y1}:{x2}:{y2}",
             )
@@ -1517,7 +1562,9 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
             )
             if deconflict and not is_power:
                 continue  # closure labeller handles non-power pins in this mode
-            label = net_label_to_sexp(pin, tx=tx, local=_is_internal(net), uuid_path=uuid_path)
+            label = net_label_to_sexp(
+                pin, tx=tx, local=_is_internal(net), uuid_path=uuid_path
+            )
             if label:
                 elements.append(label)
             elif (
@@ -1569,16 +1616,22 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
                     end = stub_ends[id(pin)]
                     pin_w = (pin.pt * pin.part.tx).round()
                     if (pin_w.x, pin_w.y) != (end.x, end.y):
-                        elements.extend(wire_to_sexp(
-                            net, [Segment(Point(pin_w.x, pin_w.y),
-                                          Point(end.x, end.y))], tx=tx))
+                        elements.extend(
+                            wire_to_sexp(
+                                net,
+                                [Segment(Point(pin_w.x, pin_w.y), Point(end.x, end.y))],
+                                tx=tx,
+                            )
+                        )
                     segs.append((pin_w.x, pin_w.y, end.x, end.y))
             else:
-                segs = [(s.p1.x, s.p1.y, s.p2.x, s.p2.y)
-                        for s in node.wires.get(net, [])]
+                segs = [
+                    (s.p1.x, s.p1.y, s.p2.x, s.p2.y) for s in node.wires.get(net, [])
+                ]
             pin_by_id = {id(pin): pin for pin in pins}
-            pin_pts = [(id(pin), stub_ends[id(pin)].x, stub_ends[id(pin)].y)
-                       for pin in pins]
+            pin_pts = [
+                (id(pin), stub_ends[id(pin)].x, stub_ends[id(pin)].y) for pin in pins
+            ]
             islands = _decisions.net_islands(pin_pts, segs, tol=_CLOSE_TOL)
             local = _is_internal(net)
             # Endpoint degree over this net's segments: a stub end that is a
@@ -1587,7 +1640,7 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
             # only pin/stub-end leaves, so every surviving leaf is a real stub
             # end -- label the ones the single island anchor doesn't cover.
             deg = Counter()
-            for (x1, y1, x2, y2) in segs:
+            for x1, y1, x2, y2 in segs:
                 deg[(round(x1), round(y1))] += 1
                 deg[(round(x2), round(y2))] += 1
             for island in islands:
@@ -1596,12 +1649,21 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
                 real = [pid for pid in island if pid not in terminal_pin_ids]
                 if not real:
                     continue
-                anchor_pid = min(real, key=lambda pid: (
-                    str(getattr(pin_by_id[pid].part, "ref", "") or ""),
-                    str(pin_by_id[pid].num), pid))
+                anchor_pid = min(
+                    real,
+                    key=lambda pid: (
+                        str(getattr(pin_by_id[pid].part, "ref", "") or ""),
+                        str(pin_by_id[pid].num),
+                        pid,
+                    ),
+                )
                 label = net_label_to_sexp(
-                    pin_by_id[anchor_pid], tx=tx, force=True, local=local,
-                    at_world=stub_ends[anchor_pid], uuid_path=uuid_path,
+                    pin_by_id[anchor_pid],
+                    tx=tx,
+                    force=True,
+                    local=local,
+                    at_world=stub_ends[anchor_pid],
+                    uuid_path=uuid_path,
                 )
                 if label:
                     elements.append(label)
@@ -1609,9 +1671,14 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
                 # dangles. Deterministic (ref, pin.num, id) order; skip the
                 # anchor, terminals (already labelled), and fallback no-stub
                 # pins (end on the pin -> the pin itself terminates the wire).
-                for pid in sorted(real, key=lambda p: (
+                for pid in sorted(
+                    real,
+                    key=lambda p: (
                         str(getattr(pin_by_id[p].part, "ref", "") or ""),
-                        str(pin_by_id[p].num), p)):
+                        str(pin_by_id[p].num),
+                        p,
+                    ),
+                ):
                     if pid == anchor_pid:
                         continue
                     end = stub_ends[pid]
@@ -1622,7 +1689,11 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
                     if deg[(round(end.x), round(end.y))] != 1:
                         continue  # interior of the routing tree, already connected
                     leaf_label = net_label_to_sexp(
-                        pin, tx=tx, force=True, local=local, at_world=end,
+                        pin,
+                        tx=tx,
+                        force=True,
+                        local=local,
+                        at_world=end,
                         uuid_path=uuid_path,
                     )
                     if leaf_label:
@@ -1647,26 +1718,32 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
                 continue
             # Deterministic anchor pin: internal pin with the smallest world coord.
             cand = [
-                p for p in node.get_internal_pins(net)
-                if id(p) not in wired_pin_ids
+                p for p in node.get_internal_pins(net) if id(p) not in wired_pin_ids
             ] or list(node.get_internal_pins(net))
             if not cand:
                 continue
+
             def _pin_world(p):
                 pp = getattr(p, "pt", Point(p.x, p.y))
                 w = pp * getattr(p.part, "tx", Tx()) * tx
                 return (_round_mm(w.x), _round_mm(w.y))
+
             anchor = min(cand, key=_pin_world)
-            label = net_label_to_sexp(anchor, tx=tx, force=True, local=True, uuid_path=uuid_path)
+            label = net_label_to_sexp(
+                anchor, tx=tx, force=True, local=True, uuid_path=uuid_path
+            )
             if label:
                 elements.append(label)
                 _labeled_backstop.add(id(net))
 
     # No-connect flags for NCNet pins.
-    for nc_x, nc_y, part_ref, pin_num in _decisions.find_no_connect_pins(node, _backend, tx):
+    for nc_x, nc_y, part_ref, pin_num in _decisions.find_no_connect_pins(
+        node, _backend, tx
+    ):
         elements.append(
             _backend.emit_no_connect(
-                nc_x, nc_y,
+                nc_x,
+                nc_y,
                 uuid_seed=f"nc:{part_ref}:{pin_num}:{nc_x}:{nc_y}",
             )
         )
@@ -1687,8 +1764,10 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
             _w = _pp * _ptx * tx
             _anchor_pts.add((_round_mm(_w.x), _round_mm(_w.y)))
     for _el in elements:
-        if isinstance(_el, (list, Sexp)) and len(_el) and _el[0] in (
-            "global_label", "label", "junction", "no_connect"
+        if (
+            isinstance(_el, (list, Sexp))
+            and len(_el)
+            and _el[0] in ("global_label", "label", "junction", "no_connect")
         ):
             for _s in _el:
                 if isinstance(_s, (list, Sexp)) and len(_s) >= 3 and _s[0] == "at":
@@ -1701,7 +1780,9 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
                 return [
                     (_xy[1], _xy[2])
                     for _xy in _s[1:]
-                    if isinstance(_xy, (list, Sexp)) and len(_xy) >= 3 and _xy[0] == "xy"
+                    if isinstance(_xy, (list, Sexp))
+                    and len(_xy) >= 3
+                    and _xy[0] == "xy"
                 ]
         return []
 
@@ -1741,7 +1822,7 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
 
     # Add title block to schematic sheet.
     schematic.append(Sexp(create_title_block_sexp(node.title)))
-    
+
     # Build lib_symbols section for this sheet.
     lib_symbols_sexp = Sexp(["lib_symbols"])
     for part in lib_symbols.values():
@@ -1797,8 +1878,15 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
     _write_sexp_schematic(schematic, filepath)
 
     # Return a hierarchical sheet reference for this node to be included in the parent sheet.
-    sheet_uuid = uuid_path.split("/")[-1] # Use the last UUID in the path for the sheet UUID.
-    return [create_hierarchical_sheet_sexp(node, sheet_uuid, sheet_tx)], {}, {}, filepath
+    sheet_uuid = uuid_path.split("/")[
+        -1
+    ]  # Use the last UUID in the path for the sheet UUID.
+    return (
+        [create_hierarchical_sheet_sexp(node, sheet_uuid, sheet_tx)],
+        {},
+        {},
+        filepath,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1839,7 +1927,9 @@ def write_top_schematic(circuit, node, filepath, top_name, title, version=202304
     uuid_path = f"/{node.uuid}"
 
     # Write root schematic. Ignore returned items except name of top-level sheet file.
-    _, _, _, output_file = node_to_sexp_schematic(node, uuid_path=uuid_path, version=version)
+    _, _, _, output_file = node_to_sexp_schematic(
+        node, uuid_path=uuid_path, version=version
+    )
 
     # Optional: validate with kicad-cli if available.
     _validate_with_kicad_cli(output_file)
@@ -1880,7 +1970,6 @@ def _validate_with_kicad_cli(filepath):
 # ---------------------------------------------------------------------------
 # File writer
 # ---------------------------------------------------------------------------
-
 
 
 def _write_sexp_schematic(schematic, filepath):

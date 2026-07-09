@@ -187,8 +187,8 @@ def test_ldo_macromodel_regulates(tmp_path):
     vin, vout, gnd = Net("VIN"), Net("VOUT"), Net("GND")
     v1[1] += vin
     v1[2] += gnd
-    u1[3] += vin   # VI
-    u1[1] += gnd   # GND
+    u1[3] += vin  # VI
+    u1[1] += gnd  # GND
     u1[2] += vout  # VO
     rl[1] += vout
     rl[2] += gnd
@@ -215,8 +215,7 @@ def test_sim_stack_imports_without_circuit_synth():
     whole point of vendoring it for an upstream PR. Runs in a subprocess with a
     meta-path finder that hard-blocks circuit_synth, then imports the heavy
     modules (converter/simulator) and builds a view."""
-    code = textwrap.dedent(
-        """
+    code = textwrap.dedent("""
         import sys, importlib.abc
         class _Block(importlib.abc.MetaPathFinder):
             def find_spec(self, name, path, target=None):
@@ -231,11 +230,10 @@ def test_sim_stack_imports_without_circuit_synth():
         import skidl.sim.converter, skidl.sim.simulator, skidl.sim.models
         from skidl.sim import simulate, skidl_flat_view, SpiceConverter
         print("OK")
-        """
-    )
+        """)
     r = subprocess.run(
         [sys.executable, "-c", code], capture_output=True, text=True, timeout=120
     )
-    assert r.returncode == 0 and "OK" in r.stdout, (
-        f"standalone import failed:\nstdout={r.stdout}\nstderr={r.stderr[-800:]}"
-    )
+    assert (
+        r.returncode == 0 and "OK" in r.stdout
+    ), f"standalone import failed:\nstdout={r.stdout}\nstderr={r.stderr[-800:]}"

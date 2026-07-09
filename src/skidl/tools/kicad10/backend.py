@@ -150,43 +150,76 @@ class Kicad9Backend:
                 continue
             if elem[0] == "global_label":
                 at = next(
-                    (s for s in elem if hasattr(s, "__getitem__") and len(s) and s[0] == "at"),
+                    (
+                        s
+                        for s in elem
+                        if hasattr(s, "__getitem__") and len(s) and s[0] == "at"
+                    ),
                     None,
                 )
                 if at and len(at) >= 3:
                     occupied_seed.append((_cell(float(at[1]), float(at[2])), elem[1]))
             elif elem[0] == "wire":
                 pts = next(
-                    (s for s in elem if hasattr(s, "__getitem__") and len(s) and s[0] == "pts"),
+                    (
+                        s
+                        for s in elem
+                        if hasattr(s, "__getitem__") and len(s) and s[0] == "pts"
+                    ),
                     None,
                 )
                 if pts:
                     for xy in pts[1:]:
-                        if hasattr(xy, "__getitem__") and len(xy) >= 3 and xy[0] == "xy":
-                            occupied_seed.append((_cell(float(xy[1]), float(xy[2])), None))
+                        if (
+                            hasattr(xy, "__getitem__")
+                            and len(xy) >= 3
+                            and xy[0] == "xy"
+                        ):
+                            occupied_seed.append(
+                                (_cell(float(xy[1]), float(xy[2])), None)
+                            )
             elif elem[0] == "symbol":
                 # Power symbols occupy their pin cell (= the symbol `at`) on a
                 # power net. Seed it keyed by that net so a signal label can't be
                 # nudged onto it and fused into the rail (stage 19, Blocker B
                 # hardening). Its lib_id is "power:<net>".
                 lib_id = next(
-                    (s for s in elem if hasattr(s, "__getitem__") and len(s) >= 2 and s[0] == "lib_id"),
+                    (
+                        s
+                        for s in elem
+                        if hasattr(s, "__getitem__")
+                        and len(s) >= 2
+                        and s[0] == "lib_id"
+                    ),
                     None,
                 )
                 if lib_id and str(lib_id[1]).startswith("power:"):
                     at = next(
-                        (s for s in elem if hasattr(s, "__getitem__") and len(s) >= 3 and s[0] == "at"),
+                        (
+                            s
+                            for s in elem
+                            if hasattr(s, "__getitem__")
+                            and len(s) >= 3
+                            and s[0] == "at"
+                        ),
                         None,
                     )
                     if at:
                         occupied_seed.append(
-                            (_cell(float(at[1]), float(at[2])), str(lib_id[1])[len("power:"):])
+                            (
+                                _cell(float(at[1]), float(at[2])),
+                                str(lib_id[1])[len("power:") :],
+                            )
                         )
             elif elem[0] == "junction":
                 # A junction is a real connection point; block its cell so a label
                 # is never nudged onto it (net unknown -> never reuse).
                 at = next(
-                    (s for s in elem if hasattr(s, "__getitem__") and len(s) >= 3 and s[0] == "at"),
+                    (
+                        s
+                        for s in elem
+                        if hasattr(s, "__getitem__") and len(s) >= 3 and s[0] == "at"
+                    ),
                     None,
                 )
                 if at:
@@ -196,10 +229,18 @@ class Kicad9Backend:
         labels = []
         at_by_idx = {}
         for i, elem in enumerate(elements):
-            if not (hasattr(elem, "__getitem__") and len(elem) >= 1 and elem[0] == "global_label"):
+            if not (
+                hasattr(elem, "__getitem__")
+                and len(elem) >= 1
+                and elem[0] == "global_label"
+            ):
                 continue
             at = next(
-                (s for s in elem if hasattr(s, "__getitem__") and len(s) > 0 and s[0] == "at"),
+                (
+                    s
+                    for s in elem
+                    if hasattr(s, "__getitem__") and len(s) > 0 and s[0] == "at"
+                ),
                 None,
             )
             if at is None or len(at) < 4:
@@ -222,7 +263,11 @@ class Kicad9Backend:
                 Sexp(
                     [
                         "wire",
-                        ["pts", ["xy", _ksch._round_mm(ax), _ksch._round_mm(ay)], ["xy", nx, ny]],
+                        [
+                            "pts",
+                            ["xy", _ksch._round_mm(ax), _ksch._round_mm(ay)],
+                            ["xy", nx, ny],
+                        ],
                         ["stroke", ["width", 0], ["type", "default"]],
                         ["uuid", _ksch._gen_uuid(f"dcwire:{ax}:{ay}:{nx}:{ny}")],
                     ]

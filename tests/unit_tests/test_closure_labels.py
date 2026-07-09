@@ -75,7 +75,7 @@ requires_e2e = pytest.mark.skipif(
     not (_HAS_LIBS and _HAS_CLI), reason="KiCad libraries / kicad-cli not available"
 )
 
-_GEN_SCRIPT = r'''
+_GEN_SCRIPT = r"""
 import sys
 from skidl import Circuit, Net, Part
 out = sys.argv[1]
@@ -93,15 +93,19 @@ c.generate_schematic(filepath=out, top_name="tia", auto_stub=True,
     auto_stub_fallback="labels", deconflict_stubs=True,
     auto_stub_max_wire_pins=5, auto_stub_max_wire_dist=4000, seed=1)
 print("GEN_OK")
-'''
+"""
 
 
 def _subprocess_gen(out, extra_env=None):
     env = dict(os.environ)
     if extra_env:
         env.update(extra_env)
-    r = subprocess.run([sys.executable, "-c", _GEN_SCRIPT, out],
-                       capture_output=True, text=True, env=env)
+    r = subprocess.run(
+        [sys.executable, "-c", _GEN_SCRIPT, out],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
     path = os.path.join(out, "tia.kicad_sch")
     return r, path
 

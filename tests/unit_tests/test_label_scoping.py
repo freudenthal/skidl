@@ -35,11 +35,16 @@ def _render(top_name):
 @pytest.mark.xfail(raises=(PlacementFailure, RoutingFailure))
 def test_internal_signal_net_is_local_label():
     """A routed internal signal net emits a local ``label``, no ``global_label``."""
-    r = Part("Device", "R", footprint="Resistor_SMD:R_0805_2012Metric",
-             dest=TEMPLATE, value="10K")
-    vcc = Net("VCC")   # power -> power symbol (not a label)
-    gnd = Net("GND")   # power -> power symbol
-    sig = Net("SIG")   # internal 2-pin signal -> routed + local backstop label
+    r = Part(
+        "Device",
+        "R",
+        footprint="Resistor_SMD:R_0805_2012Metric",
+        dest=TEMPLATE,
+        value="10K",
+    )
+    vcc = Net("VCC")  # power -> power symbol (not a label)
+    gnd = Net("GND")  # power -> power symbol
+    sig = Net("SIG")  # internal 2-pin signal -> routed + local backstop label
     vcc & r() & sig & r() & gnd
 
     out_dir = _render("test_scope_flat")

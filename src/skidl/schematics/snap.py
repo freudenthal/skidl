@@ -209,8 +209,11 @@ def _would_collide(part, cand_tx, node, ignore_parts=()):
         for op in other.pins:
             ow = op.pt * other.tx
             onet = _net_ident(op)
-            for (mx, my, mnet) in mine:
-                if abs(mx - ow.x) <= _COLLISION_TOL and abs(my - ow.y) <= _COLLISION_TOL:
+            for mx, my, mnet in mine:
+                if (
+                    abs(mx - ow.x) <= _COLLISION_TOL
+                    and abs(my - ow.y) <= _COLLISION_TOL
+                ):
                     if onet != mnet:
                         return True
     return False
@@ -278,25 +281,31 @@ def _resolve_cluster(decl, part, node):
 
     # Target part must live on THIS node/sheet (snap works in one node's frame).
     target_part = next(
-        (p for p in node.parts
-         if not isinstance(p, NetTerminal) and getattr(p, "ref", None) == ref),
+        (
+            p
+            for p in node.parts
+            if not isinstance(p, NetTerminal) and getattr(p, "ref", None) == ref
+        ),
         None,
     )
     if target_part is None:
         logger.warning(
-            "cluster: %s target ref %r not on this sheet; using heuristic", who, ref)
+            "cluster: %s target ref %r not on this sheet; using heuristic", who, ref
+        )
         return None
 
     # Candidate target pins: the named/numbered pin, or all pins for a bare ref.
     if pin_id:
         cand_pins = [
-            tp for tp in target_part.pins
+            tp
+            for tp in target_part.pins
             if str(getattr(tp, "num", "")) == pin_id
             or getattr(tp, "name", None) == pin_id
         ]
         if not cand_pins:
             logger.warning(
-                "cluster: %s pin %r not on %r; using heuristic", who, pin_id, ref)
+                "cluster: %s pin %r not on %r; using heuristic", who, pin_id, ref
+            )
             return None
     else:
         cand_pins = list(target_part.pins)
@@ -305,7 +314,8 @@ def _resolve_cluster(decl, part, node):
     # pin on OUR side becomes my_pin).
     my_by_net = {
         id(getattr(p, "net", None)): p
-        for p in part.pins if getattr(p, "net", None) is not None
+        for p in part.pins
+        if getattr(p, "net", None) is not None
     }
     matches = [
         (my_by_net[id(tp.net)], tp)
@@ -314,12 +324,16 @@ def _resolve_cluster(decl, part, node):
     ]
     if not matches:
         logger.warning(
-            "cluster: %s shares no net with target %r; using heuristic", who, decl)
+            "cluster: %s shares no net with target %r; using heuristic", who, decl
+        )
         return None
     if len(matches) > 1 and not pin_id:
         logger.warning(
             "cluster: %s bare ref %r ambiguous (%d shared pins); using heuristic",
-            who, ref, len(matches))
+            who,
+            ref,
+            len(matches),
+        )
         return None
     my_pin, target_pin = matches[0]
     return my_pin, target_pin, target_part
@@ -641,7 +655,9 @@ def snap_two_pin_parts(node, stub=True):
     _revert_cross_net_snaps(node, snapped, presnap_tx)
 
 
-def _stagger_tjunctions(node, node_part_ids, snapped, occupied_pins, min_group=2, stub=True):
+def _stagger_tjunctions(
+    node, node_part_ids, snapped, occupied_pins, min_group=2, stub=True
+):
     """Detect repeating T-junction patterns and stagger parts outward from IC.
 
     Phase 1: identify stagger groups, compute how much space each needs,
@@ -719,8 +735,11 @@ def _stagger_tjunctions(node, node_part_ids, snapped, occupied_pins, min_group=2
 
         max_span = 0
         for _, parts_list_scan in matching:
-            for (scan_part, _, _, _, _) in parts_list_scan:
-                pts = [getattr(p, "pt", Point(p.x * MM_TO_MILS, p.y * MM_TO_MILS)) for p in scan_part.pins]
+            for scan_part, _, _, _, _ in parts_list_scan:
+                pts = [
+                    getattr(p, "pt", Point(p.x * MM_TO_MILS, p.y * MM_TO_MILS))
+                    for p in scan_part.pins
+                ]
                 if pts:
                     span = max(
                         max(p.x for p in pts) - min(p.x for p in pts),
@@ -732,16 +751,18 @@ def _stagger_tjunctions(node, node_part_ids, snapped, occupied_pins, min_group=2
         n_pins = len(matching)
         stagger_extent = step_size * n_pins + max_span
 
-        stagger_plans.append({
-            "ic_part": ic_part,
-            "matching": matching,
-            "ic_dir": ic_dir,
-            "step_dx": step_dx,
-            "step_dy": step_dy,
-            "step_size": step_size,
-            "stagger_extent": stagger_extent,
-            "dominant": dominant,
-        })
+        stagger_plans.append(
+            {
+                "ic_part": ic_part,
+                "matching": matching,
+                "ic_dir": ic_dir,
+                "step_dx": step_dx,
+                "step_dy": step_dy,
+                "step_size": step_size,
+                "stagger_extent": stagger_extent,
+                "dominant": dominant,
+            }
+        )
 
     if len(stagger_plans) > 1:
         _pre_shift_ics(stagger_plans, node, snapped)
@@ -829,9 +850,7 @@ def _stagger_tjunctions(node, node_part_ids, snapped, occupied_pins, min_group=2
                     _stub_snapped_part(part)
                 snapped.add(id(part))
                 suppressed_pins.add(id(my_pin))
-            junction_wires.append(
-                (ic_pin_world.x, ic_pin_world.y, ox, oy)
-            )
+            junction_wires.append((ic_pin_world.x, ic_pin_world.y, ox, oy))
 
             # PROPOSAL (needs real IC-fan ERC before enabling — see note below):
             # The fan's pin-to-pin geometry is already a fully-connected chain:

@@ -24,7 +24,6 @@ from skidl.utilities import export_to_all, rmv_attr
 from .sexp_schematic import write_top_schematic
 from .bboxes import calc_hier_label_bbox, calc_symbol_bbox
 
-
 __all__ = []
 
 
@@ -36,7 +35,7 @@ def _setup_kicad_env():
     """
     from skidl import get_default_tool
 
-    kicad_version = get_default_tool()[len("kicad"):]
+    kicad_version = get_default_tool()[len("kicad") :]
     if not os.environ.get(f"KICAD{kicad_version}_FOOTPRINT_DIR"):
         for path in [
             "/usr/share/kicad/footprints",
@@ -50,6 +49,7 @@ def _setup_kicad_env():
 
 # Suppress legacy fp-lib-table warnings from older KiCad tool modules.
 import warnings
+
 warnings.filterwarnings("ignore", message=".*fp-lib-table.*")
 
 
@@ -113,6 +113,7 @@ def auto_stub_nets(circuit, **options):
             deferred_fanout.append(f"{net.name}({len(net.pins)})")
 
     from skidl.logger import active_logger
+
     active_logger.info(
         f"  [auto_stub] power: {', '.join(stubbed_power[:10])}{'...' if len(stubbed_power) > 10 else ''}"
     )
@@ -319,8 +320,11 @@ def _classify_and_stub_complex_nets(circuit, node, **options):
             if getattr(net, "_stub", False):
                 continue
 
-            pins = [p for p in net.pins if p.part in target_parts
-                    and not isinstance(p.part, NetTerminal)]
+            pins = [
+                p
+                for p in net.pins
+                if p.part in target_parts and not isinstance(p.part, NetTerminal)
+            ]
 
             if len(pins) > max_wire_pins:
                 net._stub = True
@@ -342,7 +346,7 @@ def _classify_and_stub_complex_nets(circuit, node, **options):
 
                 max_dist = 0
                 for i, a in enumerate(pts):
-                    for b in pts[i + 1:]:
+                    for b in pts[i + 1 :]:
                         dist = abs(a.x - b.x) + abs(a.y - b.y)
                         if dist > max_dist:
                             max_dist = dist
@@ -364,13 +368,15 @@ def _classify_and_stub_complex_nets(circuit, node, **options):
     for child in node.children.values():
         child_parts = set(child.parts)
         child_internal = child.get_internal_nets()
-        non_stubbed = [n for n in child_internal
-                       if not getattr(n, "_stub", False)]
+        non_stubbed = [n for n in child_internal if not getattr(n, "_stub", False)]
 
         # Stub single-real-pin nets (cross-sheet labels, not wireable).
         for net in non_stubbed:
-            real_pins = [p for p in net.pins if p.part in child_parts
-                         and not isinstance(p.part, NetTerminal)]
+            real_pins = [
+                p
+                for p in net.pins
+                if p.part in child_parts and not isinstance(p.part, NetTerminal)
+            ]
             if len(real_pins) < 2:
                 net._stub = True
                 net._stub_explicit = False
@@ -379,8 +385,7 @@ def _classify_and_stub_complex_nets(circuit, node, **options):
                 total_stubbed += 1
 
         # Re-count after single-pin removal.
-        non_stubbed = [n for n in child_internal
-                       if not getattr(n, "_stub", False)]
+        non_stubbed = [n for n in child_internal if not getattr(n, "_stub", False)]
 
         # Stub all remaining nets in small subcircuits (<=N routeable nets).
         # Only large chain structures (switch->R->IC grids) benefit from wiring.
@@ -395,6 +400,7 @@ def _classify_and_stub_complex_nets(circuit, node, **options):
 
     if total_stubbed:
         from skidl.logger import active_logger
+
         active_logger.info(
             f"  [selective_routing] Stubbed {total_stubbed} complex/distant nets after placement"
         )
@@ -406,8 +412,17 @@ class LabelsOnlyWarning(UserWarning):
     pass
 
 
-def _handle_fallback(circuit, tool_module, filepath, top_name, title, flatness,
-                     options, logger, reason=""):
+def _handle_fallback(
+    circuit,
+    tool_module,
+    filepath,
+    top_name,
+    title,
+    flatness,
+    options,
+    logger,
+    reason="",
+):
     """Handle routing failure fallback according to the auto_stub_fallback policy.
 
     Args:
@@ -733,7 +748,9 @@ def gen_schematic(
     # Stage-25 deconflict-stub mode is mutually exclusive with snap: it retires
     # snap entirely (every pin gets a deconflicted on-grid stub wire instead of
     # being crammed onto an IC pin). Refuse the ambiguous combination loudly.
-    if options.get("deconflict_stubs", False) and options.get("snap_before_route", False):
+    if options.get("deconflict_stubs", False) and options.get(
+        "snap_before_route", False
+    ):
         raise ValueError(
             "deconflict_stubs and snap_before_route are mutually exclusive: "
             "deconflict_stubs retires snap. Pass exactly one."
@@ -749,13 +766,13 @@ def gen_schematic(
     for attempt in range(retries):
         preprocess_circuit(circuit, **options)
 
-        node = SchNode(
-            circuit, tool_module, filepath, top_name, title, flatness
-        )
+        node = SchNode(circuit, tool_module, filepath, top_name, title, flatness)
 
         try:
             _place_and_classify(node, circuit, expansion_factor, **options)
-            if options.get("auto_stub", False) and options.get("label_clearance", False):
+            if options.get("auto_stub", False) and options.get(
+                "label_clearance", False
+            ):
                 # Label-clearance Pass 2: Pass 1's classifiers just froze the
                 # final stub set, but the placement they ran on reserved no room
                 # for the resulting net labels. Re-run preprocessing (recomputes
@@ -904,8 +921,14 @@ def gen_schematic(
                 if not erc_regen_ok:
                     # Routing failed even with expansion — handle per fallback policy.
                     _handle_fallback(
-                        circuit, tool_module, filepath, top_name,
-                        title, flatness, options, active_logger,
+                        circuit,
+                        tool_module,
+                        filepath,
+                        top_name,
+                        title,
+                        flatness,
+                        options,
+                        active_logger,
                         reason=f"ERC correction regeneration failed after expansion attempts",
                     )
                     break
@@ -915,8 +938,14 @@ def gen_schematic(
     # All retries exhausted.
     if failure_type and options.get("auto_stub", False):
         _handle_fallback(
-            circuit, tool_module, filepath, top_name,
-            title, flatness, options, active_logger,
+            circuit,
+            tool_module,
+            filepath,
+            top_name,
+            title,
+            flatness,
+            options,
+            active_logger,
             reason=f"Routing failed after all {retries} retries",
         )
         return

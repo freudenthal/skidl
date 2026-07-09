@@ -137,9 +137,9 @@ def test_every_signal_pin_gets_a_stub_end():
                 net = pin.net
                 if isinstance(net, NCNet) or getattr(net, "_is_power_net", False):
                     continue
-                assert id(pin) in stub_ends, (
-                    f"pin {getattr(part, 'ref', '?')}.{pin.num} has no stub end"
-                )
+                assert (
+                    id(pin) in stub_ends
+                ), f"pin {getattr(part, 'ref', '?')}.{pin.num} has no stub end"
                 end = stub_ends[id(pin)]
                 pin_w = (pin.pt * part.tx).round()
                 dist = abs(end.x - pin_w.x) + abs(end.y - pin_w.y)
@@ -196,9 +196,9 @@ def test_stub_ends_and_wire_endpoints_on_grid():
                 continue
             for seg in segs:
                 for p in (seg.p1, seg.p2):
-                    assert _on_grid(p.x) and _on_grid(p.y), (
-                        f"routed wire endpoint off-grid: {p}"
-                    )
+                    assert _on_grid(p.x) and _on_grid(
+                        p.y
+                    ), f"routed wire endpoint off-grid: {p}"
 
 
 # --------------------------------------------------------------------------
@@ -214,8 +214,11 @@ def test_deconflict_and_snap_before_route_mutually_exclusive():
     try:
         with pytest.raises(ValueError, match="mutually exclusive"):
             c.generate_schematic(
-                filepath=d, top_name="conflict", auto_stub=True,
-                deconflict_stubs=True, snap_before_route=True,
+                filepath=d,
+                top_name="conflict",
+                auto_stub=True,
+                deconflict_stubs=True,
+                snap_before_route=True,
             )
     finally:
         shutil.rmtree(d, ignore_errors=True)
@@ -223,8 +226,12 @@ def test_deconflict_and_snap_before_route_mutually_exclusive():
 
 def _gen_file(circuit, out, top, **opts):
     circuit.generate_schematic(
-        filepath=out, top_name=top, auto_stub=True,
-        auto_stub_fallback="labels", deconflict_stubs=True, **opts,
+        filepath=out,
+        top_name=top,
+        auto_stub=True,
+        auto_stub_fallback="labels",
+        deconflict_stubs=True,
+        **opts,
     )
     path = os.path.join(out, f"{top}.kicad_sch")
     assert os.path.exists(path)
@@ -258,15 +265,19 @@ def test_wired_nets_survive_the_full_path():
         c = Circuit(name="tia_full")
         _build_tia(c)
         text = _gen_file(
-            c, d, "tia_full", seed=1,
-            auto_stub_max_wire_pins=5, auto_stub_max_wire_dist=4000,
+            c,
+            d,
+            "tia_full",
+            seed=1,
+            auto_stub_max_wire_pins=5,
+            auto_stub_max_wire_dist=4000,
         )
         assert len(re.findall(r"\(wire\b", text)) >= 4
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
 
-_DET_SCRIPT = r'''
+_DET_SCRIPT = r"""
 import sys
 from skidl import Circuit, Net, Part
 out = sys.argv[1]
@@ -283,7 +294,7 @@ with c:
 c.generate_schematic(filepath=out, top_name="det", auto_stub=True,
     auto_stub_fallback="labels", deconflict_stubs=True,
     auto_stub_max_wire_pins=5, auto_stub_max_wire_dist=4000, seed=1)
-'''
+"""
 
 
 # --------------------------------------------------------------------------
@@ -295,22 +306,31 @@ def test_world_outward_dir_all_dihedral_orientations():
     Hand-computed expectations for every orientation x dihedral transform."""
     from types import SimpleNamespace
     from skidl.geometry import (
-        tx_rot_0, tx_rot_90, tx_rot_180, tx_rot_270, tx_flip_x, tx_flip_y,
+        tx_rot_0,
+        tx_rot_90,
+        tx_rot_180,
+        tx_rot_270,
+        tx_flip_x,
+        tx_flip_y,
     )
     from skidl.schematics.route import _world_outward_dir
 
     # expected[tx_name][orientation] = (dx, dy)
     expected = {
-        "I":   {"U": (0, -1), "D": (0, 1), "L": (1, 0), "R": (-1, 0)},
+        "I": {"U": (0, -1), "D": (0, 1), "L": (1, 0), "R": (-1, 0)},
         "R90": {"U": (1, 0), "D": (-1, 0), "L": (0, 1), "R": (0, -1)},
         "R180": {"U": (0, 1), "D": (0, -1), "L": (-1, 0), "R": (1, 0)},
         "R270": {"U": (-1, 0), "D": (1, 0), "L": (0, -1), "R": (0, 1)},
-        "Fx":  {"U": (0, -1), "D": (0, 1), "L": (-1, 0), "R": (1, 0)},
-        "Fy":  {"U": (0, 1), "D": (0, -1), "L": (1, 0), "R": (-1, 0)},
+        "Fx": {"U": (0, -1), "D": (0, 1), "L": (-1, 0), "R": (1, 0)},
+        "Fy": {"U": (0, 1), "D": (0, -1), "L": (1, 0), "R": (-1, 0)},
     }
     txs = {
-        "I": tx_rot_0, "R90": tx_rot_90, "R180": tx_rot_180,
-        "R270": tx_rot_270, "Fx": tx_flip_x, "Fy": tx_flip_y,
+        "I": tx_rot_0,
+        "R90": tx_rot_90,
+        "R180": tx_rot_180,
+        "R270": tx_rot_270,
+        "Fx": tx_flip_x,
+        "Fy": tx_flip_y,
     }
     for tx_name, tx in txs.items():
         for orient, want in expected[tx_name].items():
@@ -350,9 +370,9 @@ def test_stub_direction_follows_pin_orientation():
             vx, vy = end.x - pin_w.x, end.y - pin_w.y
             if vx == 0 and vy == 0:
                 continue  # fallback no-stub pin (deconflict exhaustion)
-            assert (vx == 0) != (vy == 0), (
-                f"{getattr(part, 'ref', '?')}.{pin.num} stub not axial: ({vx},{vy})"
-            )
+            assert (vx == 0) != (
+                vy == 0
+            ), f"{getattr(part, 'ref', '?')}.{pin.num} stub not axial: ({vx},{vy})"
             dx, dy = _world_outward_dir(pin)
             svx = 1 if vx > 0 else -1 if vx < 0 else 0
             svy = 1 if vy > 0 else -1 if vy < 0 else 0
@@ -389,8 +409,12 @@ def test_deconflict_routing_deterministic():
     def run():
         d = tempfile.mkdtemp(prefix="skidl_det_")
         try:
-            subprocess.run([sys.executable, "-c", _DET_SCRIPT, d],
-                           capture_output=True, text=True, env=dict(os.environ))
+            subprocess.run(
+                [sys.executable, "-c", _DET_SCRIPT, d],
+                capture_output=True,
+                text=True,
+                env=dict(os.environ),
+            )
             with open(os.path.join(d, "det.kicad_sch"), encoding="utf-8") as f:
                 return sorted(re.findall(r"\(xy [-\d. ]+\)", f.read()))
         finally:

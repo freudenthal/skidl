@@ -35,8 +35,10 @@ class _FakePart:
 @pytest.mark.parametrize(
     "filename, expected",
     [
-        (r"C:\Program Files\KiCad\10.0\share\kicad\symbols\Connector_Generic.kicad_sym",
-         "Connector_Generic"),
+        (
+            r"C:\Program Files\KiCad\10.0\share\kicad\symbols\Connector_Generic.kicad_sym",
+            "Connector_Generic",
+        ),
         ("/usr/share/kicad/symbols/Device.kicad_sym", "Device"),
         ("Connector_Generic.kicad_sym", "Connector_Generic"),
         ("Connector_Generic", "Connector_Generic"),
@@ -57,7 +59,9 @@ _HAS_LIBS = (
     or os.path.exists("/usr/share/kicad/symbols")
     or os.path.exists(os.path.expanduser("~/.local/share/kicad/9.0/symbols"))
 )
-_KICAD_CLI = shutil.which("kicad-cli") or r"C:\Program Files\KiCad\10.0\bin\kicad-cli.exe"
+_KICAD_CLI = (
+    shutil.which("kicad-cli") or r"C:\Program Files\KiCad\10.0\bin\kicad-cli.exe"
+)
 _HAS_CLI = os.path.exists(_KICAD_CLI) or shutil.which("kicad-cli") is not None
 
 
@@ -78,7 +82,9 @@ def test_rendered_lib_symbols_have_clean_nicknames():
             r[1] += vin
             r[2] += gnd
             c.generate_schematic(
-                filepath=d, top_name="nick", auto_stub=True,
+                filepath=d,
+                top_name="nick",
+                auto_stub=True,
                 auto_stub_fallback="labels",
             )
         sch = os.path.join(d, "nick.kicad_sch")
@@ -97,10 +103,11 @@ def test_rendered_lib_symbols_have_clean_nicknames():
             out = os.path.join(d, "nick.net")
             proc = subprocess.run(
                 [_KICAD_CLI, "sch", "export", "netlist", "--output", out, sch],
-                capture_output=True, text=True,
+                capture_output=True,
+                text=True,
             )
-            assert proc.returncode == 0, (
-                f"kicad-cli failed to load: {proc.stdout}{proc.stderr}"
-            )
+            assert (
+                proc.returncode == 0
+            ), f"kicad-cli failed to load: {proc.stdout}{proc.stderr}"
     finally:
         shutil.rmtree(d, ignore_errors=True)

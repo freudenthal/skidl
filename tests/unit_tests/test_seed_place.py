@@ -15,10 +15,10 @@ from skidl import POWER
 from skidl.geometry import BBox, Point, Tx, Vector, tx_rot_90
 from skidl.schematics import seed_place as sp
 
-
 # --------------------------------------------------------------------------- #
 # Fakes implementing the structural interface
 # --------------------------------------------------------------------------- #
+
 
 class FakePin:
     def __init__(self, pt, orientation, stub=False):
@@ -65,6 +65,7 @@ def make_part(ref, n_pins=2, **kw):
 # --------------------------------------------------------------------------- #
 # 1. Graph filter
 # --------------------------------------------------------------------------- #
+
 
 def test_graph_filter_excludes_power_and_high_fanout():
     a = make_part("R1")
@@ -114,6 +115,7 @@ def test_graph_parallel_nets_yield_two_pin_pairs():
 # 2. k-core
 # --------------------------------------------------------------------------- #
 
+
 def test_k_core_triangle_plus_tail():
     a, b, c, d = (make_part(r) for r in ("A", "B", "C", "D"))
     # Triangle A-B-C + tail C-D.
@@ -132,8 +134,7 @@ def test_k_core_triangle_plus_tail():
 def test_k_core_chain_all_one():
     parts = [make_part(f"R{i}") for i in range(5)]
     nets = [
-        FakeNet(f"n{i}", [parts[i].pins[1], parts[i + 1].pins[0]])
-        for i in range(4)
+        FakeNet(f"n{i}", [parts[i].pins[1], parts[i + 1].pins[0]]) for i in range(4)
     ]
     adj = sp.build_wired_graph(parts, nets)
     cores = sp.k_core(adj)
@@ -143,6 +144,7 @@ def test_k_core_chain_all_one():
 # --------------------------------------------------------------------------- #
 # 3. pick_center
 # --------------------------------------------------------------------------- #
+
 
 def test_pick_center_hub_wins_over_passives():
     hub = make_part("U1", n_pins=6)
@@ -177,8 +179,7 @@ def test_pick_center_deterministic_under_shuffle():
 def test_pick_center_chain_picks_endpoint():
     parts = [make_part(f"R{i}") for i in range(5)]
     nets = [
-        FakeNet(f"n{i}", [parts[i].pins[1], parts[i + 1].pins[0]])
-        for i in range(4)
+        FakeNet(f"n{i}", [parts[i].pins[1], parts[i + 1].pins[0]]) for i in range(4)
     ]
     adj = sp.build_wired_graph(parts, nets)
     cores = sp.k_core(adj)
@@ -192,12 +193,13 @@ def test_pick_center_chain_picks_endpoint():
 # 4. outward_face — the ADA4817 table (the +180 trap)
 # --------------------------------------------------------------------------- #
 
+
 @pytest.mark.parametrize(
     "letter, expected",
     [
         ("R", (-1, 0)),  # -in / +in : letter R -> outward LEFT
-        ("L", (1, 0)),   # OUT / FB  : letter L -> outward RIGHT
-        ("D", (0, 1)),   # +Vs       : letter D -> outward UP
+        ("L", (1, 0)),  # OUT / FB  : letter L -> outward RIGHT
+        ("D", (0, 1)),  # +Vs       : letter D -> outward UP
         ("U", (0, -1)),  # -Vs       : letter U -> outward DOWN
     ],
 )
@@ -217,6 +219,7 @@ def test_outward_face_rotated_90():
 # --------------------------------------------------------------------------- #
 # 5. grow_order — feedback pulls a bridging part forward
 # --------------------------------------------------------------------------- #
+
 
 def test_grow_order_bridging_part_before_leaf():
     # Triangle A-B-C (feedback) + leaf A-D. After A,B placed, C bridges 2 placed
@@ -238,6 +241,7 @@ def test_grow_order_bridging_part_before_leaf():
 # 6. choose_slot / fan-out — same-face satellites don't stack
 # --------------------------------------------------------------------------- #
 
+
 def test_fanout_satellites_do_not_overlap():
     # Hub with 4 pins all facing right (letter L -> outward right); 4 satellites.
     hub_pins = [FakePin(Point(200, 150 - 100 * i), "L") for i in range(4)]
@@ -253,6 +257,7 @@ def test_fanout_satellites_do_not_overlap():
     # No two satellite world bboxes overlap.
     def wbbox(s):
         return s.place_bbox * s.tx
+
     for i in range(len(sats)):
         for j in range(i + 1, len(sats)):
             assert not wbbox(sats[i]).intersects(wbbox(sats[j])), (i, j)
@@ -261,6 +266,7 @@ def test_fanout_satellites_do_not_overlap():
 # --------------------------------------------------------------------------- #
 # 7. Rotation anti-parallel
 # --------------------------------------------------------------------------- #
+
 
 def test_rotation_makes_pin_face_back():
     # Driver's connecting pin faces right; resistor placed to its right must be
@@ -285,6 +291,7 @@ def test_rotation_makes_pin_face_back():
 # 8. orientation_locked -> translation only
 # --------------------------------------------------------------------------- #
 
+
 def test_orientation_locked_translation_only():
     # Driver named to sort first -> it's the center; the locked R1 is placed
     # via choose_slot, exercising the locked-translation-only path.
@@ -296,13 +303,17 @@ def test_orientation_locked_translation_only():
     sp.seed_placement([driver, locked], [net], gap=100, grid=50)
 
     assert (locked.tx.a, locked.tx.b, locked.tx.c, locked.tx.d) == (
-        tx_rot_90.a, tx_rot_90.b, tx_rot_90.c, tx_rot_90.d
+        tx_rot_90.a,
+        tx_rot_90.b,
+        tx_rot_90.c,
+        tx_rot_90.d,
     )
 
 
 # --------------------------------------------------------------------------- #
 # 9. Determinism + RNG untouched
 # --------------------------------------------------------------------------- #
+
 
 def _build_tia_like():
     u1 = FakePart("U1", [FakePin(Point(-200, 50), "R"), FakePin(Point(200, 0), "L")])
@@ -342,6 +353,7 @@ def test_rng_state_untouched():
 # 10. Centroid — a part between two placed neighbours
 # --------------------------------------------------------------------------- #
 
+
 def test_centroid_between_two_placed():
     # A placed left, B placed right, C connects to both -> lands between them.
     a = make_part("A")
@@ -352,10 +364,16 @@ def test_centroid_between_two_placed():
     adj = sp.build_wired_graph([a, b, c], [na, nb])
 
     placed_info = {
-        a: {"origin": Point(-1000, 0), "tx": Tx().move(Point(-1000, 0)),
-            "wbbox": a.place_bbox * Tx().move(Point(-1000, 0))},
-        b: {"origin": Point(1000, 0), "tx": Tx().move(Point(1000, 0)),
-            "wbbox": b.place_bbox * Tx().move(Point(1000, 0))},
+        a: {
+            "origin": Point(-1000, 0),
+            "tx": Tx().move(Point(-1000, 0)),
+            "wbbox": a.place_bbox * Tx().move(Point(-1000, 0)),
+        },
+        b: {
+            "origin": Point(1000, 0),
+            "tx": Tx().move(Point(1000, 0)),
+            "wbbox": b.place_bbox * Tx().move(Point(1000, 0)),
+        },
     }
     origin, _rot = sp.choose_slot(c, placed_info, adj, gap=100, grid=50)
     assert -1000 <= origin.x <= 1000

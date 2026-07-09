@@ -16,9 +16,15 @@ from itertools import chain, count, zip_longest
 
 from skidl import Part
 from skidl.utilities import export_to_all, rmv_attr
-from .debug_draw import draw_end, draw_endpoint, draw_routing, draw_seg, draw_start, draw_text
+from .debug_draw import (
+    draw_end,
+    draw_endpoint,
+    draw_routing,
+    draw_seg,
+    draw_start,
+    draw_text,
+)
 from skidl.geometry import BBox, Point, Segment, Tx, Vector, tx_rot_90
-
 
 __all__ = ["RoutingFailure", "GlobalRoutingFailure", "SwitchboxRoutingFailure"]
 
@@ -165,13 +171,13 @@ def _seg_hits_interior(x0, y0, x1, y1, obstacles):
     if x0 == x1:  # vertical
         x = x0
         lo, hi = (y0, y1) if y0 <= y1 else (y1, y0)
-        for (xmn, ymn, xmx, ymx) in obstacles:
+        for xmn, ymn, xmx, ymx in obstacles:
             if xmn < x < xmx and min(hi, ymx) - max(lo, ymn) > 0:
                 return True
     else:  # horizontal
         y = y0
         lo, hi = (x0, x1) if x0 <= x1 else (x1, x0)
-        for (xmn, ymn, xmx, ymx) in obstacles:
+        for xmn, ymn, xmx, ymx in obstacles:
             if ymn < y < ymx and min(hi, xmx) - max(lo, xmn) > 0:
                 return True
     return False
@@ -187,12 +193,12 @@ def _colinear_foreign(x0, y0, x1, y1, net, foreign_h, foreign_v):
     """
     if y0 == y1:
         lo, hi = (x0, x1) if x0 <= x1 else (x1, x0)
-        for (xlo, xhi, onet) in foreign_h.get(y0, ()):
+        for xlo, xhi, onet in foreign_h.get(y0, ()):
             if onet is not net and min(hi, xhi) - max(lo, xlo) > 0:
                 return True
     else:
         lo, hi = (y0, y1) if y0 <= y1 else (y1, y0)
-        for (ylo, yhi, onet) in foreign_v.get(x0, ()):
+        for ylo, yhi, onet in foreign_v.get(x0, ()):
             if onet is not net and min(hi, yhi) - max(lo, ylo) > 0:
                 return True
     return False
@@ -223,8 +229,19 @@ def _mst_edges(points):
     return edges
 
 
-def _astar_pair(a, b, obstacles, occupied, foreign_h, foreign_v, net,
-                extra_xs=(), extra_ys=(), margin=100, turn=50.0):
+def _astar_pair(
+    a,
+    b,
+    obstacles,
+    occupied,
+    foreign_h,
+    foreign_v,
+    net,
+    extra_xs=(),
+    extra_ys=(),
+    margin=100,
+    turn=50.0,
+):
     """A* on a Hanan grid from world point ``a`` to ``b`` for ``net``.
 
     Candidate grid lines pass through the two endpoints, every obstacle edge,
@@ -237,10 +254,32 @@ def _astar_pair(a, b, obstacles, occupied, foreign_h, foreign_v, net,
     """
     ax, ay = a
     bx, by = b
-    xs = sorted({ax, bx, ax - margin, ax + margin, bx - margin, bx + margin,
-                 *(o[0] for o in obstacles), *(o[2] for o in obstacles), *extra_xs})
-    ys = sorted({ay, by, ay - margin, ay + margin, by - margin, by + margin,
-                 *(o[1] for o in obstacles), *(o[3] for o in obstacles), *extra_ys})
+    xs = sorted(
+        {
+            ax,
+            bx,
+            ax - margin,
+            ax + margin,
+            bx - margin,
+            bx + margin,
+            *(o[0] for o in obstacles),
+            *(o[2] for o in obstacles),
+            *extra_xs,
+        }
+    )
+    ys = sorted(
+        {
+            ay,
+            by,
+            ay - margin,
+            ay + margin,
+            by - margin,
+            by + margin,
+            *(o[1] for o in obstacles),
+            *(o[3] for o in obstacles),
+            *extra_ys,
+        }
+    )
     xi = {v: i for i, v in enumerate(xs)}
     yi = {v: i for i, v in enumerate(ys)}
     start = (xi[ax], yi[ay])
@@ -273,9 +312,20 @@ def _astar_pair(a, b, obstacles, occupied, foreign_h, foreign_v, net,
                 continue
             if _colinear_foreign(cx, cy, wx, wy, net, foreign_h, foreign_v):
                 continue
-            cost = abs(wx - cx) + abs(wy - cy) + (turn if indir and indir != axis else 0.0)
-            heapq.heappush(openq, (g + cost + h((nx, ny)), g + cost, next(ctr),
-                                   (nx, ny), axis, path + ((wx, wy),)))
+            cost = (
+                abs(wx - cx) + abs(wy - cy) + (turn if indir and indir != axis else 0.0)
+            )
+            heapq.heappush(
+                openq,
+                (
+                    g + cost + h((nx, ny)),
+                    g + cost,
+                    next(ctr),
+                    (nx, ny),
+                    axis,
+                    path + ((wx, wy),),
+                ),
+            )
     return None
 
 
@@ -543,7 +593,8 @@ class Router:
                 active_logger.warning(
                     "deconflict_stubs: could not place a clear stub end for "
                     "pin %s of net %r; labelling on the pin instead",
-                    getattr(pin, "num", "?"), getattr(net, "name", "?"),
+                    getattr(pin, "num", "?"),
+                    getattr(net, "name", "?"),
                 )
                 node._stub_ends[id(pin)] = Point(pin_w.x, pin_w.y)
                 pin.route_pt = copy.copy(pin.pt)
@@ -575,9 +626,7 @@ class Router:
 
         # Publish the full occupancy so the A* router avoids every pin + stub
         # end of every net (routed and label-only alike).
-        node._deconflict_occupied = {
-            k: v for k, v in occupied.items() if v is not None
-        }
+        node._deconflict_occupied = {k: v for k, v in occupied.items() if v is not None}
 
     def cleanup_wires(node):
         """Try to make wire segments look prettier."""
@@ -1149,6 +1198,7 @@ class Router:
             if deconflict:
                 g = float(GRID)
                 import math
+
                 lo_x = math.floor(b.min.x / g) * g
                 lo_y = math.floor(b.min.y / g) * g
                 hi_x = math.ceil(b.max.x / g) * g
@@ -1204,10 +1254,19 @@ class Router:
             ok = True
             new_segs = []
             for i, j in _mst_edges(pts):
-                path = _astar_pair(pts[i], pts[j], obstacles, occupied,
-                                   foreign_h, foreign_v, net,
-                                   extra_xs=occ_xs, extra_ys=occ_ys,
-                                   margin=MARGIN, turn=TURN)
+                path = _astar_pair(
+                    pts[i],
+                    pts[j],
+                    obstacles,
+                    occupied,
+                    foreign_h,
+                    foreign_v,
+                    net,
+                    extra_xs=occ_xs,
+                    extra_ys=occ_ys,
+                    margin=MARGIN,
+                    turn=TURN,
+                )
                 if path is None:
                     ok = False
                     break
@@ -1233,7 +1292,7 @@ class Router:
                 else:
                     node.wires[net] = []  # drop its pin->edge stub wires too
                 continue
-            for (x0, y0, x1, y1) in new_segs:
+            for x0, y0, x1, y1 in new_segs:
                 node.wires[net].append(Segment(Point(x0, y0), Point(x1, y1)))
                 register(net, x0, y0, x1, y1)
 

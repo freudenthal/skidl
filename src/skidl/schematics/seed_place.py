@@ -87,6 +87,7 @@ _DEFAULT_GRID = 50  # mils (kicad9 GRID constant); overridable via seed_placemen
 # Small helpers
 # --------------------------------------------------------------------------- #
 
+
 def _ref(part):
     """Deterministic sort key for a part: its ref string ('' if missing)."""
     return getattr(part, "ref", "") or ""
@@ -109,7 +110,9 @@ def _is_power_drive(drive):
 
 def _net_is_power(net):
     name = getattr(net, "name", "") or ""
-    return bool(POWER_NET_RE.match(name)) or _is_power_drive(getattr(net, "drive", None))
+    return bool(POWER_NET_RE.match(name)) or _is_power_drive(
+        getattr(net, "drive", None)
+    )
 
 
 def _net_stubbed(net):
@@ -140,6 +143,7 @@ def _rotated_bbox(local_bbox, rot_tx):
 # Graph construction
 # --------------------------------------------------------------------------- #
 
+
 def build_wired_graph(parts, nets, max_fanout=3):
     """Build a part-adjacency graph from WIRED nets only.
 
@@ -164,7 +168,8 @@ def build_wired_graph(parts, nets, max_fanout=3):
         real_pins = [
             pin
             for pin in _pins(net)
-            if getattr(pin, "part", None) in part_set and not getattr(pin, "stub", False)
+            if getattr(pin, "part", None) in part_set
+            and not getattr(pin, "stub", False)
         ]
         if not (2 <= len(real_pins) <= max_fanout):
             continue
@@ -235,6 +240,7 @@ def pick_center(adj, cores, pin_counts):
 # --------------------------------------------------------------------------- #
 # Geometry
 # --------------------------------------------------------------------------- #
+
 
 def outward_face(pin, part_tx):
     """Unit Vector (PLACED frame) pointing the way a wire leaves ``pin``.
@@ -348,6 +354,7 @@ def _overlaps_any(wbbox, placed_info):
 # Growth order
 # --------------------------------------------------------------------------- #
 
+
 def _bfs_depths(adj, center):
     depth = {center: 0}
     frontier = [center]
@@ -417,7 +424,10 @@ def grow_order(adj, center):
 # Top-level
 # --------------------------------------------------------------------------- #
 
-def seed_placement(parts, nets, skip=None, max_fanout=3, gap=None, grid=None, **options):
+
+def seed_placement(
+    parts, nets, skip=None, max_fanout=3, gap=None, grid=None, **options
+):
     """Deterministically seed ``part.tx`` for a connected group of parts.
 
     Mirrors ``random_placement``'s contract: mutates ``part.tx`` only, never

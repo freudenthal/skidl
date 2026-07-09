@@ -130,7 +130,9 @@ def _gen_placements(top, seed):
     try:
         c = Circuit(name=top)
         _build_divider(c)
-        return _symbol_placements(_read(_gen(c, d, top, seed_placement=True, seed=seed)))
+        return _symbol_placements(
+            _read(_gen(c, d, top, seed_placement=True, seed=seed))
+        )
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -197,9 +199,7 @@ def _child_wire_count(out, top, **opts):
 def test_small_subcircuit_max_zero_keeps_child_wires(out_dir):
     # Default (skidl blanket-stubs <=6-net subcircuits to labels): the small RC
     # child sheet routes no wires. Setting the knob to 0 keeps its local wire.
-    default_wires = _child_wire_count(
-        os.path.join(out_dir, "def"), "hier_def"
-    )
+    default_wires = _child_wire_count(os.path.join(out_dir, "def"), "hier_def")
     kept_wires = _child_wire_count(
         os.path.join(out_dir, "keep"), "hier_keep", auto_stub_small_subcircuit_max=0
     )

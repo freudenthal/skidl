@@ -68,8 +68,8 @@ def test_version_derivation_two_digits():
     import skidl.tools.kicad10.lib as k10
     import skidl.tools.kicad9.lib as k9
 
-    assert k10.__name__.split(".")[-2][len("kicad"):] == "10"
-    assert k9.__name__.split(".")[-2][len("kicad"):] == "9"
+    assert k10.__name__.split(".")[-2][len("kicad") :] == "10"
+    assert k9.__name__.split(".")[-2][len("kicad") :] == "9"
 
 
 def test_fp_lib_tbl_dir_no_literal_interpolation(monkeypatch):

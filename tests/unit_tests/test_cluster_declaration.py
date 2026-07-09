@@ -30,10 +30,10 @@ def _mk():
     other.ref = "C9"
     vcc = Net("VCC")
     gnd = Net("GND")
-    u[8] += vcc          # TL072 pin 8 = V+
-    c[1] += vcc          # C2 shares VCC with U3.8
+    u[8] += vcc  # TL072 pin 8 = V+
+    c[1] += vcc  # C2 shares VCC with U3.8
     c[2] += gnd
-    other[1] += gnd      # C9 shares NO net with U3
+    other[1] += gnd  # C9 shares NO net with U3
     other[2] += Net("N1")
     return u, c, other
 
@@ -53,7 +53,7 @@ def test_cluster_resolves_to_declared_pin():
 def test_cluster_bare_ref_resolves_when_unambiguous():
     u, c, other = _mk()
     node = _node(u, c, other)
-    res = _resolve_cluster("U3", c, node)          # bare ref, one shared net
+    res = _resolve_cluster("U3", c, node)  # bare ref, one shared net
     assert res is not None
     _my, target_pin, target_part = res
     assert target_part is u and str(target_pin.num) == "8"
@@ -62,7 +62,7 @@ def test_cluster_bare_ref_resolves_when_unambiguous():
 def test_cluster_unknown_ref_falls_back():
     u, c, other = _mk()
     node = _node(u, c, other)
-    assert _resolve_cluster("U99.8", c, node) is None   # no such ref -> heuristic
+    assert _resolve_cluster("U99.8", c, node) is None  # no such ref -> heuristic
 
 
 def test_cluster_no_shared_net_falls_back():

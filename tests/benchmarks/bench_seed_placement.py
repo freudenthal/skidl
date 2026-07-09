@@ -164,8 +164,13 @@ def _count_crossings(segs):
 
 
 def run_one(
-    fixture_name, mode, seed, row_threshold=None, max_group=None,
-    seed_max_fanout=None, seed_row_threshold=None,
+    fixture_name,
+    mode,
+    seed,
+    row_threshold=None,
+    max_group=None,
+    seed_max_fanout=None,
+    seed_row_threshold=None,
 ):
     """Build + place + route one fixture and return its metrics dict."""
     _GROUP_RECORDS.clear()
@@ -282,24 +287,34 @@ def main(argv=None):
     ap.add_argument("--mode", choices=("random", "seed"), default="random")
     ap.add_argument("--seeds", type=int, nargs="+", default=[1, 2, 3, 4, 5])
     ap.add_argument(
-        "--fixtures", nargs="+", default=list(FIXTURES.keys()),
+        "--fixtures",
+        nargs="+",
+        default=list(FIXTURES.keys()),
         help="subset of fixtures (default all)",
     )
     ap.add_argument("--out", default=None, help="write JSON results to this path")
     ap.add_argument(
-        "--row-threshold", type=int, default=None,
+        "--row-threshold",
+        type=int,
+        default=None,
         help="diagnostic: override _ROW_PLACE_THRESHOLD (force force-directed)",
     )
     ap.add_argument(
-        "--max-group", type=int, default=None,
+        "--max-group",
+        type=int,
+        default=None,
         help="diagnostic: override auto_stub_max_group (keep big groups whole)",
     )
     ap.add_argument(
-        "--seed-max-fanout", type=int, default=None,
+        "--seed-max-fanout",
+        type=int,
+        default=None,
         help="seed mode: max net fanout to keep in the wired graph (default 3)",
     )
     ap.add_argument(
-        "--seed-row-threshold", type=int, default=None,
+        "--seed-row-threshold",
+        type=int,
+        default=None,
         help="seed mode: force-directed cutoff for seeded groups",
     )
     args = ap.parse_args(argv)
@@ -309,8 +324,11 @@ def main(argv=None):
         results[fx] = {"seeds": {}}
         for seed in args.seeds:
             m = run_one(
-                fx, args.mode, seed,
-                row_threshold=args.row_threshold, max_group=args.max_group,
+                fx,
+                args.mode,
+                seed,
+                row_threshold=args.row_threshold,
+                max_group=args.max_group,
                 seed_max_fanout=args.seed_max_fanout,
                 seed_row_threshold=args.seed_row_threshold,
             )

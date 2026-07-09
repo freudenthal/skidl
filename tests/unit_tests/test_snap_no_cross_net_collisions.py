@@ -27,7 +27,6 @@ import pytest
 from skidl.geometry import Point, Tx
 from skidl.schematics.snap import _would_collide
 
-
 # --------------------------------------------------------------------------- #
 # Fast pure-unit coverage of the occupancy helper (no KiCad libs needed).
 # --------------------------------------------------------------------------- #
@@ -180,9 +179,9 @@ def test_ldo_bias_sense_not_fused_to_gnd():
     r7 = Part("Device", "R", value="10k", ref="R7")
     r8 = Part("Device", "R", value="10k", ref="R8")
     out, gnd, sense = Net("VBIAS29"), Net("GND"), Net("VBIAS_SENSE")
-    u5[1] += out          # OUT
-    u5[20] += out         # OUT (stacked at the same symbol position as pin 1)
-    u5[3] += sense        # a sense/FB pin
+    u5[1] += out  # OUT
+    u5[20] += out  # OUT (stacked at the same symbol position as pin 1)
+    u5[3] += sense  # a sense/FB pin
     c7[1] += out
     c7[2] += gnd
     r7[1] += out
@@ -213,9 +212,9 @@ def test_ldo_bias_sense_not_fused_to_gnd():
         sense_nodes = nets.get("VBIAS_SENSE", set())
         # Before the fix, R7.2 (VBIAS_SENSE) fused into GND via C7.2.
         assert sense_nodes, "VBIAS_SENSE net missing entirely"
-        assert not (gnd_nodes & sense_nodes), (
-            f"VBIAS_SENSE fused with GND: shared nodes {gnd_nodes & sense_nodes}"
-        )
+        assert not (
+            gnd_nodes & sense_nodes
+        ), f"VBIAS_SENSE fused with GND: shared nodes {gnd_nodes & sense_nodes}"
         assert "R7.2" in sense_nodes and "R8.1" in sense_nodes
     finally:
         shutil.rmtree(d, ignore_errors=True)
