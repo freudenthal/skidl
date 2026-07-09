@@ -25,9 +25,16 @@ import shutil
 
 import pytest
 
-from skidl import KICAD10, Net, Part, generate_schematic, lib_search_paths, set_default_tool
-from tests.unit_tests.test_kicad10 import requires_kicad10
-from tests.utils.kicad_gate import KicadCliUnavailable, assert_kicad_save_ok
+from skidl import (
+    KICAD10,
+    Net,
+    Part,
+    generate_schematic,
+    lib_search_paths,
+    set_default_tool,
+)
+from unit_tests.test_kicad10 import requires_kicad10
+from utils.kicad_gate import KicadCliUnavailable, assert_kicad_save_ok
 
 
 def _setup_kicad10():
@@ -55,8 +62,11 @@ def _build_power_design():
 
 def _build_dual_opamp():
     """LM358 with BOTH units placed (the multi-unit save-crash / #318 case)."""
-    op = Part("Amplifier_Operational", "LM358",
-              footprint="Package_SO:SOIC-8_3.9x4.9mm_P1.27mm")
+    op = Part(
+        "Amplifier_Operational",
+        "LM358",
+        footprint="Package_SO:SOIC-8_3.9x4.9mm_P1.27mm",
+    )
     gnd = Part("power", "GND")
     vcc = Part("power", "VCC")
     ua, ub = op.unit["uA"], op.unit["uB"]
@@ -82,8 +92,11 @@ def _generate(tmp_path, name, builder):
 
 @pytest.mark.parametrize(
     "name,builder",
-    [("divider", _build_divider), ("power", _build_power_design),
-     ("dual_opamp", _build_dual_opamp)],
+    [
+        ("divider", _build_divider),
+        ("power", _build_power_design),
+        ("dual_opamp", _build_dual_opamp),
+    ],
 )
 def test_no_save_crash_defect_classes_in_output(tmp_path, name, builder):
     """Generated output is free of all three save-crash defect classes."""
@@ -98,9 +111,10 @@ def test_no_save_crash_defect_classes_in_output(tmp_path, name, builder):
             assert m.group(1) not in ("", "/"), f"dangling instance path in {f.name}"
         # 2. No zero-length wires.
         for wm in re.finditer(
-            r'\(wire\b.*?\(pts\s*\(xy\s+([\d.eE+-]+)\s+([\d.eE+-]+)\)\s*'
-            r'\(xy\s+([\d.eE+-]+)\s+([\d.eE+-]+)\)',
-            txt, re.S,
+            r"\(wire\b.*?\(pts\s*\(xy\s+([\d.eE+-]+)\s+([\d.eE+-]+)\)\s*"
+            r"\(xy\s+([\d.eE+-]+)\s+([\d.eE+-]+)\)",
+            txt,
+            re.S,
         ):
             x1, y1, x2, y2 = map(float, wm.groups())
             assert not (x1 == x2 and y1 == y2), f"zero-length wire in {f.name}"
@@ -121,7 +135,8 @@ def test_multi_unit_shares_root_instance_path(tmp_path):
         m.group(1)
         for m in re.finditer(
             r'\(symbol\b.*?\(lib_id "Amplifier_Operational:LM358".*?\(path "([^"]+)"',
-            txt, re.S,
+            txt,
+            re.S,
         )
     ]
     assert len(lm358_paths) >= 2, "expected multiple LM358 units placed"
@@ -154,8 +169,11 @@ def test_auto_power_symbols_use_sheet_root_path(tmp_path):
 @requires_kicad10
 @pytest.mark.parametrize(
     "name,builder",
-    [("divider", _build_divider), ("power", _build_power_design),
-     ("dual_opamp", _build_dual_opamp)],
+    [
+        ("divider", _build_divider),
+        ("power", _build_power_design),
+        ("dual_opamp", _build_dual_opamp),
+    ],
 )
 def test_generated_fixture_passes_save_gate(tmp_path, name, builder):
     sch_files = _generate(tmp_path, name, builder)
@@ -172,7 +190,9 @@ def test_gate_detects_deliberately_dangling_path(tmp_path):
     sch_files = _generate(tmp_path, "good", _build_dual_opamp)
     good = sch_files[0]
     broken = good.with_name("broken_dangling.kicad_sch")
-    broken_txt = re.sub(r'\(path "/[0-9a-f-]+"', '(path "/"', good.read_text(encoding="utf-8"))
+    broken_txt = re.sub(
+        r'\(path "/[0-9a-f-]+"', '(path "/"', good.read_text(encoding="utf-8")
+    )
     assert '(path "/"' in broken_txt, "failed to construct a dangling-path fixture"
     broken.write_text(broken_txt, encoding="utf-8")
     with pytest.raises(AssertionError):

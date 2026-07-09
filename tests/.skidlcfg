@@ -5,6 +5,9 @@
     "pickle_dir": "./storage/lib_pickle_dir",
     "part_search_db_dir": "./storage",
     "lib_search_paths": {
+        "kicad10": [
+            "test_data/kicad10"
+        ],
         "kicad8": [
             "test_data/kicad8"
         ],
@@ -32,6 +35,7 @@
     "query_backup_lib": true,
     "backup_lib": null,
     "footprint_search_paths": {
+        "kicad10": "/home/devb/.config/kicad/10.0",
         "kicad8": "/home/devb/.config/kicad/8.0",
         "spice": "",
         "kicad7": "/home/devb/.config/kicad/7.0",

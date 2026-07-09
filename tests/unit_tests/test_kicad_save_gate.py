@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.utils.kicad_gate import assert_kicad_save_ok
+from utils.kicad_gate import assert_kicad_save_ok
 
 # argv after the fake cli path is e.g.
 #   sch upgrade --force <copy.kicad_sch>
