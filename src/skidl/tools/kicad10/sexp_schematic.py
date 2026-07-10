@@ -772,6 +772,22 @@ def part_to_lib_symbol_definition(part):
     part_name = part.name or "Unknown"
     lib_id = f"{lib_name}:{part_name}"
 
+    # Prefer embedding the raw library symbol VERBATIM (retained at parse time as
+    # part._raw_lib_sexp). KiCad's lib_symbol_mismatch check is structural, so a
+    # body regenerated from draw_cmds -- which omits fields the library carries
+    # (pin_names hide, ki_keywords/ki_fp_filters, per-pin metadata ...) -- always
+    # mismatches its library copy. Only the top-level name needs the LIB:NAME id
+    # (the library file names it bare); inner unit symbols keep NAME_u_s. Parts
+    # without a retained subtree (extends children, tool=SKIDL custom symbols,
+    # in-file power clones) fall through to the generated path below.
+    raw = getattr(part, "_raw_lib_sexp", None)
+    if raw is not None:
+        from copy import deepcopy
+
+        sym = deepcopy(raw)  # fresh copy per sheet: add_quotes is in-place
+        sym[1] = lib_id
+        return sym
+
     symbol_def = [
         "symbol",
         lib_id,

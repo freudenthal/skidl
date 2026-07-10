@@ -387,3 +387,47 @@ def test_wired_render_endpoints_on_grid(tmp_path):
     # Cross-check against ERC's own detector (all severities).
     all_types = _erc_all_types(out, "grid3")
     assert all_types.get("endpoint_off_grid", 0) == 0, all_types
+
+
+# ---------------------------------------------------------------------------
+# Verbatim lib_symbols (finding F: embed library symbols, kill lib_symbol_mismatch)
+# ---------------------------------------------------------------------------
+
+
+def _multiunit(ckt):
+    """A circuit mixing a multi-unit op-amp (LM358, 2 units + a power unit),
+    a multi-graphic IC (OPA340NA) and passives -- exercises verbatim embedding
+    of unit sub-symbols, not just simple two-pin bodies."""
+    from skidl import Net, Part
+
+    with ckt:
+        vpos = Net("+5V"); vpos.drive = POWER
+        gnd = Net("GND"); gnd.drive = POWER
+        a, b, c = Net("A"), Net("B"), Net("C")
+        u = Part("Amplifier_Operational", "LM358")  # dual op-amp (multi-unit)
+        u2 = Part("Amplifier_Operational", "OPA340NA")
+        r1 = Part("Device", "R", value="1k",
+                  footprint="Resistor_SMD:R_0603_1608Metric")
+        r2 = Part("Device", "R", value="1k",
+                  footprint="Resistor_SMD:R_0603_1608Metric")
+        u[1] += a; u[2] += a; u[3] += b
+        u2["3"] += b; u2["4"] += c; u2["1"] += c
+        r1[1] += a; r1[2] += gnd
+        r2[1] += c; r2[2] += gnd
+
+
+@requires_kicad10
+def test_lib_symbols_embedded_verbatim(tmp_path):
+    """Finding F guard rail: library symbols are embedded VERBATIM from the parsed
+    library subtree (not regenerated from draw_cmds), so KiCad's structural
+    lib_symbol_mismatch check reports zero -- including multi-unit bodies."""
+    out, text = _render(_multiunit, "verbatim", tmp_path)
+    # Library parts embedded under their LIB:NAME id, inner units keep NAME_u_s.
+    assert 'symbol "Amplifier_Operational:LM358"' in text
+    assert 'symbol "Device:R"' in text
+    all_types = _erc_all_types(out, "verbatim")
+    assert all_types.get("lib_symbol_mismatch", 0) == 0, all_types
+    # The verbatim body is what the GUI writes back, so the save-crash gate must
+    # still pass (no dangling paths / malformed defs introduced).
+    types = _erc_error_types(out, "verbatim")
+    assert types.get("power_pin_not_driven", 0) == 0, types

@@ -6,6 +6,7 @@
 Parsing of Kicad libraries.
 """
 
+import copy
 import os
 import re
 from pathlib import Path
@@ -295,6 +296,15 @@ def parse_lib_part(part, partial_parse):
 
     # Search for a parent that this part inherits from.
     extends = part_defn.search("/symbol/extends", ignore_case=True)
+
+    # Retain the raw library symbol subtree so lib_symbols can embed it VERBATIM
+    # (KiCad's lib_symbol_mismatch check is structural; a body regenerated from
+    # draw_cmds always differs from the library copy). Only for non-``extends``
+    # symbols: an extends child's raw subtree lacks the parent geometry, so it is
+    # not a standalone definition -- those keep the regenerated/flattened path.
+    if not extends:
+        part._raw_lib_sexp = copy.deepcopy(part_defn)
+
     if extends:
 
         # Make a copy of the parent part from the library.
