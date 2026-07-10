@@ -320,11 +320,12 @@ def _hier_labels(text):
 
 @requires_kicad10
 def test_hier_sheet_pins_option_emits_hierarchical_interconnect(tmp_path):
-    """With hierarchical_sheet_pins=True the child side of the KiCad hierarchical
-    interconnect is COMPLETE (Tier 1): each boundary net's on-sheet label is a
-    ``hierarchical_label`` emitted ON the net (not at a dangling fixed slot) and
-    the redundant ``global_label`` for that net is gone; the parent's sheet
-    symbols carry the paired sheet pins; the root sheet carries no hier label."""
+    """With hierarchical_sheet_pins=True the KiCad hierarchical interconnect is
+    COMPLETE (Tiers 1+2): each boundary net's on-sheet label is a
+    ``hierarchical_label`` emitted ON the net (not a dangling fixed slot), the
+    redundant ``global_label`` is gone, the parent's sheet symbols carry the
+    paired sheet pins each WIRED out to a name label, the root carries no hier
+    label, and ERC is error-free (label_dangling 0, pin_not_connected 0)."""
     out, text = _render(_hier_build, "hspon", tmp_path, hierarchical_sheet_pins=True)
     labels = _hier_labels(text)
     assert labels, "child hierarchical labels not emitted"
@@ -340,13 +341,68 @@ def test_hier_sheet_pins_option_emits_hierarchical_interconnect(tmp_path):
     # bidirectional (at ...))` inside a `(sheet ...)` (the net name is unquoted).
     top = (out / "hspon.kicad_sch").read_text(encoding="utf-8")
     assert re.search(r"\(pin \S+ bidirectional", top), "no sheet pins on parent"
-    # Root sheet must NOT carry a hierarchical_label (no parent to connect to).
+    # Each sheet pin is wired out to a same-named LOCAL label on the root sheet.
+    assert '(label "B"' in top, "no parent-side name label for B"
+    assert re.search(r"\(wire", top), "no parent-side stub wire"
+    # Root sheet (parent) uses LOCAL labels for stubs, not hier labels.
     assert "(hierarchical_label" not in top
-    # The child-side gap is closed: with the labels now on the net, KiCad reports
-    # zero dangling hierarchical labels (parent-side pin wiring is Tier 2, so
-    # pin_not_connected may still remain here -- that is asserted in Tier 2).
+    # Interconnect complete: no dangling labels, no unconnected sheet pins.
     types = _erc_error_types(out, "hspon")
     assert types.get("label_dangling", 0) == 0, types
+    assert types.get("pin_not_connected", 0) == 0, types
+
+
+def _three_level(ckt):
+    """root -> child (NO own parts) -> grandchild, with signal net SIGX passing
+    through the intermediate child. The intermediate has no parts of its own, so
+    ``get_boundary_nets()`` (which scans node.parts) misses SIGX -- only the
+    descendant-closure classification gives the child's box a SIGX sheet pin and
+    the child's sheet a SIGX export label. Exercises the transit-net path."""
+    from skidl import Net, Part, subcircuit
+
+    @subcircuit
+    def grandchild(sig, gnd, vpos):
+        u = Part("Amplifier_Operational", "OPA340NA")
+        r = Part("Device", "R", value="1k",
+                 footprint="Resistor_SMD:R_0603_1608Metric")
+        u["5"] += vpos; u["2"] += gnd; u["3"] += sig
+        u["4"] += r[1]; u["1"] += r[1]; r[2] += gnd
+
+    @subcircuit
+    def child(sig, gnd, vpos):
+        # No own parts -- only the grandchild. SIGX transits this level.
+        grandchild(sig, gnd, vpos)
+
+    with ckt:
+        vpos = Net("+5V"); vpos.drive = POWER
+        gnd = Net("GND"); gnd.drive = POWER
+        sig = Net("SIGX")
+        # A root-level part on SIGX makes it boundary at EVERY level.
+        rt = Part("Device", "R", value="10k",
+                  footprint="Resistor_SMD:R_0603_1608Metric")
+        rt[1] += sig; rt[2] += gnd
+        child(sig, gnd, vpos)
+
+
+@requires_kicad10
+def test_hier_sheet_pins_three_level_transit(tmp_path):
+    """A net transiting an intermediate sheet with no own parts still wires end
+    to end (descendant-closure boundary classification): ERC error-free, and the
+    intermediate sheet carries BOTH the grandchild's box and a hierarchical_label
+    for the transit net (its upward export)."""
+    out, _text = _render(_three_level, "tri", tmp_path, hierarchical_sheet_pins=True)
+    types = _erc_error_types(out, "tri")
+    assert not types, f"ERC errors on 3-level transit: {types}"
+    # The intermediate sheet embeds the grandchild box AND exports SIGX upward.
+    intermediate = None
+    for f in Path(out).glob("*.kicad_sch"):
+        if f.name == "tri.kicad_sch":
+            continue  # root
+        txt = f.read_text(encoding="utf-8")
+        if "(sheet" in txt and 'hierarchical_label "SIGX"' in txt:
+            intermediate = f.name
+            break
+    assert intermediate, "no intermediate sheet exporting the transit net SIGX"
 
 
 # ---------------------------------------------------------------------------

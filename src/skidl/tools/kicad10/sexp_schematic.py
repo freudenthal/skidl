@@ -1198,26 +1198,171 @@ def create_title_block_sexp(title):
 # Hierarchical sheet reference
 # ---------------------------------------------------------------------------
 
+_HGRID_MM = 1.27  # KiCad 50-mil grid; sheet pins/stubs/labels must land on it.
 
-def create_hierarchical_sheet_sexp(node, sheet_uuid, sheet_tx):
+
+def _snap_grid(v):
+    """Quantize a mm coordinate to the 1.27 mm grid (2-dp rounded)."""
+    return _round_mm(round(v / _HGRID_MM) * _HGRID_MM)
+
+
+def _descendant_parts(node):
+    """Every real part in this node's subtree (its own + all descendants')."""
+    parts = list(getattr(node, "parts", []))
+    for child in getattr(node, "children", {}).values():
+        parts.extend(_descendant_parts(child))
+    return parts
+
+
+def _hier_boundary_nets(node):
+    """Boundary nets of the hierarchical sheet BOX for ``node``.
+
+    A sheet box represents the node's WHOLE subtree, so a net is a boundary of
+    the box iff it has a pin on a part anywhere in the subtree AND a pin on a
+    part outside it. This is deliberately broader than
+    ``SchNode.get_boundary_nets()`` (which scans only ``node.parts`` -- correct
+    for a leaf): it also catches a TRANSIT net that passes through an
+    intermediate sheet holding only child sheets (no own parts). Without the
+    descendant closure such a net gets no sheet pin on the intermediate's box
+    and the transit connection breaks (verified by the 3-level canary).
+
+    Returns nets in a name-sorted, deterministic order.
+    """
+    sub_parts = _descendant_parts(node)
+    sub_ids = {id(p) for p in sub_parts}
+    boundary = []
+    seen = set()
+    for part in sub_parts:
+        for pin in part:
+            if not pin.is_connected():
+                continue
+            net = pin.net
+            if id(net) in seen:
+                continue
+            seen.add(id(net))
+            if any(id(p.part) not in sub_ids for p in net.pins):
+                boundary.append(net)
+    boundary.sort(key=lambda n: str(getattr(n, "name", "")))
+    return boundary
+
+
+def _sheet_stub_wire_sexp(x1, y1, x2, y2, uuid_seed):
+    """A short horizontal wire from a sheet pin out to its name label."""
+    return Sexp(
+        [
+            "wire",
+            ["pts", ["xy", _round_mm(x1), _round_mm(y1)], ["xy", _round_mm(x2), _round_mm(y2)]],
+            ["stroke", ["width", 0], ["type", "default"]],
+            ["uuid", _gen_uuid(uuid_seed)],
+        ]
+    )
+
+
+def _name_label_sexp(name, x, y, kind, uuid_seed, angle=0, justify="right"):
+    """A bare name label at (x, y): local ``label`` or ``hierarchical_label``.
+
+    Used for parent-side sheet-pin stubs, where there is no Pin object to feed
+    ``net_label_to_sexp``. ``kind`` is "local" (root parent: connects sibling
+    boxes by name) or "hier" (non-root/intermediate parent: also exports the
+    transit net upward through the intermediate's own sheet pin).
+    """
+    if kind == "hier":
+        fields = ["hierarchical_label", name, ["shape", "bidirectional"]]
+    else:
+        fields = ["label", name]
+    fields.extend(
+        [
+            ["at", _round_mm(x), _round_mm(y), angle],
+            ["effects", ["font", ["size", 1.27, 1.27]], ["justify", justify]],
+            ["uuid", _gen_uuid(uuid_seed)],
+        ]
+    )
+    return Sexp(fields)
+
+
+def create_hierarchical_sheet_sexp(node, sheet_uuid, sheet_tx, parent_is_root=True):
     """Create a hierarchical sheet S-expression for insertion into a parent sheet.
 
-    Includes sheet pins for boundary nets (nets connecting the child's
-    circuitry to the parent).
+    With the ``hierarchical_sheet_pins`` option ON this emits the parent half of
+    the KiCad hierarchical interconnect: a sheet pin per boundary net on the
+    box's left edge, each wired out to a short stub carrying a name label. The
+    label kind depends on whether the PARENT sheet is the root: on the root a
+    sheet-local ``label`` joins same-named pins across sibling boxes; on a
+    non-root (intermediate) sheet a ``hierarchical_label`` also EXPORTS the net
+    upward through that intermediate's own sheet pin (so a transit net threads
+    through every level). Same-named labels/pins connect by name -- no inter-box
+    routing.
 
     Args:
         node: SchNode for the child sheet.
         sheet_uuid: UUID of this sheet (for the "uuid" property).
         sheet_tx: Transformation matrix of the parent sheet.
+        parent_is_root: True if the sheet this box is drawn on is the root sheet.
 
     Returns:
-        Sexp: Sheet S-expression.
+        (Sexp, list[Sexp]): the ``sheet`` S-expression, and a list of sibling
+        elements (stub wires + name labels) to append alongside it in the parent
+        sheet's element list.
     """
     bbox = node.bbox * node.tx * sheet_tx
-    bx = _round_mm(bbox.ll.x)
-    by = _round_mm(bbox.ll.y)
+    # With the option ON, snap the box origin to the grid so pins/stubs/labels on
+    # the left edge land on-grid (the box size may keep 0.01 mm rounding -- only
+    # connection points must be grid-true; finding B cleared the off-grid class).
+    # With the option OFF the box has no pins, so keep the prior 0.01 mm rounding
+    # verbatim (default-path output stays byte-identical).
+    if _EMIT_HIER_SHEET_PINS:
+        bx = _snap_grid(bbox.ll.x)
+        by = _snap_grid(bbox.ll.y)
+    else:
+        bx = _round_mm(bbox.ll.x)
+        by = _round_mm(bbox.ll.y)
     bw = _round_mm(bbox.w)
     bh = _round_mm(bbox.h)
+
+    extras = []
+    pins = []
+    if _EMIT_HIER_SHEET_PINS:
+        pin_spacing = 2.54  # mm between pins (a grid multiple -> stays on-grid)
+        stub_len = 2.54  # outward stub length
+        boundary_nets = [
+            net
+            for net in _hier_boundary_nets(node)
+            if not _net_wants_power_symbol(net)
+            and not (getattr(net, "stub", False) or getattr(net, "_stub", False))
+        ]
+        # Grow the box so all pins fit on the left edge (visual only).
+        needed_h = pin_spacing * (len(boundary_nets) + 1)
+        if needed_h > bh:
+            bh = needed_h
+        label_kind = "local" if parent_is_root else "hier"
+        for i, net in enumerate(boundary_nets):
+            pin_y = _snap_grid(by + pin_spacing * (i + 1))
+            pins.append(
+                Sexp(
+                    [
+                        "pin",
+                        net.name,
+                        "bidirectional",
+                        ["at", bx, pin_y, 180],
+                        ["effects", ["font", ["size", 1.27, 1.27]], ["justify", "left"]],
+                        ["uuid", _gen_uuid(f"sheet_pin:{node.sheet_filename}:{net.name}")],
+                    ]
+                )
+            )
+            # Stub wire out to the left + a name label at its far end.
+            far_x = _snap_grid(bx - stub_len)
+            extras.append(
+                _sheet_stub_wire_sexp(
+                    bx, pin_y, far_x, pin_y,
+                    f"sheet_stub_wire:{node.sheet_filename}:{net.name}",
+                )
+            )
+            extras.append(
+                _name_label_sexp(
+                    net.name, far_x, pin_y, label_kind,
+                    f"sheet_stub_label:{node.sheet_filename}:{net.name}",
+                )
+            )
 
     sheet = Sexp(
         [
@@ -1252,52 +1397,10 @@ def create_hierarchical_sheet_sexp(node, sheet_uuid, sheet_tx):
             ],
         ]
     )
+    for pin in pins:
+        sheet.append(pin)
 
-    # Sheet pins for boundary nets -- the KiCad hierarchical-interconnect surface
-    # (a sheet pin on the parent's sheet symbol pairs with a hierarchical_label
-    # inside the child; see node_to_sexp_schematic). Gated on _EMIT_HIER_SHEET_PINS
-    # (the ``hierarchical_sheet_pins`` render option).
-    #
-    # DEFAULT OFF: boundary nets instead connect across sheets by NAME through the
-    # ``global_label`` on each of their pins -- ERC-clean today. The sheet-pin path
-    # is INCOMPLETE (the pin is placed at a left-edge slot but not yet wired to the
-    # parent net, and the child hierarchical_label is not yet wired to the net
-    # inside the child), so with the option ON it currently reports
-    # pin_not_connected / label_dangling until that wiring is finished upstream.
-    # It is preserved (not deleted) so the fork can complete it and re-enable it.
-    if _EMIT_HIER_SHEET_PINS and hasattr(node, "get_boundary_nets"):
-        boundary_nets = node.get_boundary_nets()
-        pin_spacing = 2.54  # mm between pins
-        pin_y = by + pin_spacing
-        for net in boundary_nets:
-            # Skip power nets that become power symbols (they don't need sheet pins).
-            if _net_wants_power_symbol(net):
-                continue
-            # Skip stubbed nets (they use global labels).
-            if getattr(net, "stub", False) or getattr(net, "_stub", False):
-                continue
-
-            pin_uuid = _gen_uuid(f"sheet_pin:{node.sheet_filename}:{net.name}")
-            # Place pins along the left edge of the sheet.
-            sheet.append(
-                Sexp(
-                    [
-                        "pin",
-                        net.name,
-                        "bidirectional",
-                        ["at", bx, _round_mm(pin_y), 180],
-                        [
-                            "effects",
-                            ["font", ["size", 1.27, 1.27]],
-                            ["justify", "left"],
-                        ],
-                        ["uuid", pin_uuid],
-                    ]
-                )
-            )
-            pin_y += pin_spacing
-
-    return sheet
+    return sheet, extras
 
 
 def hierarchical_label_to_sexp(net_name, pt_x, pt_y, angle=180):
@@ -2269,15 +2372,34 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
             _w = _pp * _ptx * tx
             _anchor_pts.add((_round_mm(_w.x), _round_mm(_w.y)))
     for _el in elements:
-        if (
-            isinstance(_el, (list, Sexp))
-            and len(_el)
-            and _el[0] in ("global_label", "label", "junction", "no_connect")
+        if not (isinstance(_el, (list, Sexp)) and len(_el)):
+            continue
+        if _el[0] in (
+            "global_label",
+            "label",
+            "hierarchical_label",
+            "junction",
+            "no_connect",
         ):
             for _s in _el:
                 if isinstance(_s, (list, Sexp)) and len(_s) >= 3 and _s[0] == "at":
                     _anchor_pts.add((_s[1], _s[2]))
                     break
+        elif _el[0] == "sheet":
+            # A hierarchical sheet's PINs are connection anchors on the parent
+            # sheet: the Tier-2 sheet-pin stub wires run from a pin out to a name
+            # label, so the pin end must count as anchored or the purge below
+            # (which does not know sheet pins) would drop the whole stub.
+            for _sub in _el:
+                if isinstance(_sub, (list, Sexp)) and len(_sub) and _sub[0] == "pin":
+                    for _s in _sub:
+                        if (
+                            isinstance(_s, (list, Sexp))
+                            and len(_s) >= 3
+                            and _s[0] == "at"
+                        ):
+                            _anchor_pts.add((_s[1], _s[2]))
+                            break
 
     def _wire_endpoints_of(_el):
         for _s in _el:
@@ -2393,8 +2515,17 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
     sheet_uuid = uuid_path.split("/")[
         -1
     ]  # Use the last UUID in the path for the sheet UUID.
+    # This box is drawn on the PARENT's sheet. The parent is the root iff this
+    # node is a direct child of root: node uuid_path "/root/thisnode" -> 2 "/".
+    # (The parent-side stub label kind hinges on this -- see
+    # create_hierarchical_sheet_sexp: root parent -> local label, intermediate
+    # parent -> hierarchical_label that also exports the transit net upward.)
+    _parent_is_root = uuid_path.count("/") <= 2
+    _sheet_sexp, _sheet_extras = create_hierarchical_sheet_sexp(
+        node, sheet_uuid, sheet_tx, parent_is_root=_parent_is_root
+    )
     return (
-        [create_hierarchical_sheet_sexp(node, sheet_uuid, sheet_tx)],
+        [_sheet_sexp] + _sheet_extras,
         {},
         {},
         filepath,
