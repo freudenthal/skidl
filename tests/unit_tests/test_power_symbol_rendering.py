@@ -243,6 +243,19 @@ def test_power_stubs_option_offsets_symbol_onto_stub_wire(tmp_path):
     assert text1.count("(wire") > text0.count("(wire"), "no stub wires added"
     # Still ERC-clean.
     assert not _erc_error_types(out1, "pwr1"), _erc_error_types(out1, "pwr1")
+    # DIRECTION: the stubs must push the power symbols AWAY from the part bodies,
+    # not into them. In this divider the two resistors are stacked vertically and
+    # VCC/GND are on the outermost pins, so the power symbols must be the vertical
+    # EXTREMES -- beyond both resistor origins. A toward-body offset (the bug this
+    # guards) would drop them between the resistors and fail this.
+    res_y = [
+        float(m.group(1))
+        for m in re.finditer(r'\(lib_id "Device:R"\)\s*\(at [\d.-]+ ([\d.-]+)', text1)
+    ]
+    pw_y = [y for _x, y in syms1]
+    assert res_y, "no resistors found"
+    assert min(pw_y) < min(res_y), f"a power stub points INTO the body: {pw_y} vs {res_y}"
+    assert max(pw_y) > max(res_y), f"a power stub points INTO the body: {pw_y} vs {res_y}"
 
 
 @requires_kicad10

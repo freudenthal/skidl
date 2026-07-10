@@ -291,19 +291,30 @@ def _power_symbol_to_sexp(pin, net_name, tx, uuid_path=None):
     # rendered (mm, Y-down) space via the linear part of combined_tx.
     x, y = px, py
     if _EMIT_POWER_STUBS:
-        _dvec = {"U": Point(0, 1), "D": Point(0, -1), "L": Point(-1, 0), "R": Point(1, 0)}[
-            calc_pin_dir(pin)
-        ]
-        _p0 = Point(0, 0) * combined_tx
-        _p1 = _dvec * combined_tx
-        _dx, _dy = _p1.x - _p0.x, _p1.y - _p0.y
-        _dlen = (_dx * _dx + _dy * _dy) ** 0.5 or 1.0
-        x = _snap_grid(px + _POWER_STUB_LEN * _dx / _dlen)
-        y = _snap_grid(py + _POWER_STUB_LEN * _dy / _dlen)
-        if (x, y) != (px, py):
-            _power_stub_wires.append(
-                _sheet_stub_wire_sexp(px, py, x, y, f"pwrstub:{net_name}:{px}:{py}:{x}:{y}")
-            )
+        # Offset the symbol one grid step AWAY FROM THE PART BODY, then wire it
+        # back to the pin. Direction = from the part's rendered bbox CENTER toward
+        # the pin, snapped to the dominant axis. This is robust for any rotation /
+        # mirror and sidesteps the calc_pin_dir sign convention (which, mapped
+        # through the sheet Y-flip, points INTO the body -- it inverted the stub
+        # for every axis-aligned part).
+        _ux = _uy = 0.0
+        try:
+            _bb = pin.part.bbox
+            _cen = Point((_bb.ll.x + _bb.ur.x) / 2.0, (_bb.ll.y + _bb.ur.y) / 2.0) * combined_tx
+            _ox, _oy = pt.x - _cen.x, pt.y - _cen.y
+            if abs(_ox) >= abs(_oy):
+                _ux = 1.0 if _ox >= 0 else -1.0
+            else:
+                _uy = 1.0 if _oy >= 0 else -1.0
+        except Exception:  # noqa: BLE001 - never break emission over geometry
+            _ux = _uy = 0.0
+        if (_ux, _uy) != (0.0, 0.0):
+            x = _snap_grid(px + _POWER_STUB_LEN * _ux)
+            y = _snap_grid(py + _POWER_STUB_LEN * _uy)
+            if (x, y) != (px, py):
+                _power_stub_wires.append(
+                    _sheet_stub_wire_sexp(px, py, x, y, f"pwrstub:{net_name}:{px}:{py}:{x}:{y}")
+                )
 
     # Power symbol angle: align the symbol body with the schematic pin's
     # outward stub direction.  ``calc_pin_dir`` gives the world-space
