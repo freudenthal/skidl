@@ -322,3 +322,68 @@ def test_hier_sheet_pins_option_emits_hierarchical_interconnect(tmp_path):
     assert re.search(r"\(pin \S+ bidirectional", top), "no sheet pins on parent"
     # Root sheet must NOT carry a hierarchical_label (no parent to connect to).
     assert "(hierarchical_label" not in top
+
+
+# ---------------------------------------------------------------------------
+# On-grid wire endpoints (finding B: A* corridors quantized to the grid)
+# ---------------------------------------------------------------------------
+
+_GRID_MM = 1.27  # KiCad 50-mil grid
+
+
+def _off_grid_endpoints(out):
+    """Every wire endpoint across all sheets whose x or y is off the 1.27 grid."""
+    bad = []
+    wire_re = re.compile(
+        r"\(wire\s*\(pts\s*\(xy ([\d.-]+) ([\d.-]+)\)\s*\(xy ([\d.-]+) ([\d.-]+)\)"
+    )
+    for f in sorted(Path(out).glob("*.kicad_sch")):
+        txt = f.read_text(encoding="utf-8")
+        for m in wire_re.finditer(txt):
+            x1, y1, x2, y2 = map(float, m.groups())
+            for x, y in ((x1, y1), (x2, y2)):
+                if (
+                    abs(x / _GRID_MM - round(x / _GRID_MM)) > 1e-3
+                    or abs(y / _GRID_MM - round(y / _GRID_MM)) > 1e-3
+                ):
+                    bad.append((f.name, x, y))
+    return bad
+
+
+def _dense_wired(ckt):
+    """A routing-dense sheet: three op-amps chained with feedback + input/load
+    resistors, so the A* router must run wires through corridors between part
+    bodies (where finding B's off-grid Hanan lines surfaced)."""
+    from skidl import Net, Part
+
+    with ckt:
+        vpos = Net("+5V"); vpos.drive = POWER
+        gnd = Net("GND"); gnd.drive = POWER
+        prev = Net("IN")
+        for i in range(3):
+            u = Part("Amplifier_Operational", "OPA340NA")
+            rf = Part("Device", "R", value="100k",
+                      footprint="Resistor_SMD:R_0603_1608Metric")
+            rin = Part("Device", "R", value="10k",
+                       footprint="Resistor_SMD:R_0603_1608Metric")
+            out_net = Net(f"N{i}")
+            u["5"] += vpos; u["2"] += gnd
+            u["3"] += prev
+            rin[1] += prev; rin[2] += gnd
+            u["4"] += out_net; u["1"] += out_net
+            rf[1] += out_net; rf[2] += u["3"]
+            prev = out_net
+
+
+@requires_kicad10
+def test_wired_render_endpoints_on_grid(tmp_path):
+    """Finding B guard rail: on the wired (seed_placement) path every emitted
+    wire endpoint lands on the 1.27 mm grid -- the A* corridor tracks derived
+    from part bbox edges are snapped to the grid, so KiCad ERC reports zero
+    endpoint_off_grid."""
+    out, _text = _render(_dense_wired, "grid3", tmp_path)
+    bad = _off_grid_endpoints(out)
+    assert not bad, f"off-grid wire endpoints: {bad[:8]}"
+    # Cross-check against ERC's own detector (all severities).
+    all_types = _erc_all_types(out, "grid3")
+    assert all_types.get("endpoint_off_grid", 0) == 0, all_types

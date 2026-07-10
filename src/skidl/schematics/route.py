@@ -8,6 +8,7 @@ Autorouter for generating wiring between symbols in a schematic.
 
 import copy
 import heapq
+import math
 import random
 import sys
 from collections import Counter, defaultdict
@@ -254,6 +255,22 @@ def _astar_pair(
     """
     ax, ay = a
     bx, by = b
+    # Corridor tracks come from obstacle edges. Endpoints, endpoint+/-margin
+    # (margin is a whole-grid multiple) and the folded-in pin coords (extra_*)
+    # are all on-grid, so the ONLY off-grid Hanan lines are the raw bbox edges.
+    # Snap those OUTWARD to the grid (low edges down, high edges up): the
+    # candidate corridor moves into free space (never toward the raw obstacle,
+    # which _seg_hits_interior still tests against), and every routed corner
+    # lands on-grid -> no endpoint_off_grid. Idempotent for the deconflict path,
+    # whose obstacles are already grid-grown.
+    _g = float(GRID)
+
+    def _lo(v):
+        return math.floor(v / _g) * _g
+
+    def _hi(v):
+        return math.ceil(v / _g) * _g
+
     xs = sorted(
         {
             ax,
@@ -262,8 +279,8 @@ def _astar_pair(
             ax + margin,
             bx - margin,
             bx + margin,
-            *(o[0] for o in obstacles),
-            *(o[2] for o in obstacles),
+            *(_lo(o[0]) for o in obstacles),
+            *(_hi(o[2]) for o in obstacles),
             *extra_xs,
         }
     )
@@ -275,8 +292,8 @@ def _astar_pair(
             ay + margin,
             by - margin,
             by + margin,
-            *(o[1] for o in obstacles),
-            *(o[3] for o in obstacles),
+            *(_lo(o[1]) for o in obstacles),
+            *(_hi(o[3]) for o in obstacles),
             *extra_ys,
         }
     )
