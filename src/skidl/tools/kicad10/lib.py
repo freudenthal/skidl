@@ -312,9 +312,15 @@ def parse_lib_part(part, partial_parse):
         parent_part = part.lib[parent_name].copy(dest=TEMPLATE)
 
         # Remove parent attributes that we don't want to overwrite in the child.
+        # ``_raw_lib_sexp`` in particular must NOT be inherited: it is the parent's
+        # verbatim library body; embedding it under the child's lib_id would emit
+        # the wrong definition (parent name/value/geometry) for the child. An
+        # extends child has no standalone raw subtree, so it keeps the regenerated
+        # lib_symbols path (part_to_lib_symbol_definition).
         parent_part_dict = vars(parent_part)
         for property_key in (
             "part_defn",
+            "_raw_lib_sexp",
             "_name",
             "_aliases",
             "description",

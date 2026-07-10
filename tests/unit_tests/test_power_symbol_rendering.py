@@ -395,39 +395,62 @@ def test_wired_render_endpoints_on_grid(tmp_path):
 
 
 def _multiunit(ckt):
-    """A circuit mixing a multi-unit op-amp (LM358, 2 units + a power unit),
-    a multi-graphic IC (OPA340NA) and passives -- exercises verbatim embedding
-    of unit sub-symbols, not just simple two-pin bodies."""
+    """A circuit with a NON-extends multi-unit op-amp (ADA4807-2ACP: two amp units
+    + a power unit), a multi-graphic IC (OPA340NA) and passives -- exercises
+    verbatim embedding of a body with several unit sub-symbols. A symbol that
+    ``extends`` a parent (e.g. LM358 -> LM2904) deliberately keeps the regenerated
+    path -- its raw subtree is the parent's -- so it is not used here."""
     from skidl import Net, Part
 
     with ckt:
         vpos = Net("+5V"); vpos.drive = POWER
+        vneg = Net("-5V"); vneg.drive = POWER
         gnd = Net("GND"); gnd.drive = POWER
         a, b, c = Net("A"), Net("B"), Net("C")
-        u = Part("Amplifier_Operational", "LM358")  # dual op-amp (multi-unit)
+        u = Part("Amplifier_Operational", "ADA4807-2ACP")  # dual, non-extends
         u2 = Part("Amplifier_Operational", "OPA340NA")
         r1 = Part("Device", "R", value="1k",
                   footprint="Resistor_SMD:R_0603_1608Metric")
         r2 = Part("Device", "R", value="1k",
                   footprint="Resistor_SMD:R_0603_1608Metric")
-        u[1] += a; u[2] += a; u[3] += b
-        u2["3"] += b; u2["4"] += c; u2["1"] += c
+        # Amp unit A, amp unit B (chained), power unit uC; disables tied high.
+        u[3] += a; u[2] += b; u[1] += b; u[5] += vpos
+        u[7] += b; u[8] += c; u[9] += c; u[6] += vpos
+        u[10] += vpos; u[4] += vneg; u[11] += gnd
+        u2["3"] += c; u2["4"] += a; u2["1"] += a; u2["5"] += vpos; u2["2"] += gnd
         r1[1] += a; r1[2] += gnd
         r2[1] += c; r2[2] += gnd
 
 
 @requires_kicad10
 def test_lib_symbols_embedded_verbatim(tmp_path):
-    """Finding F guard rail: library symbols are embedded VERBATIM from the parsed
-    library subtree (not regenerated from draw_cmds), so KiCad's structural
-    lib_symbol_mismatch check reports zero -- including multi-unit bodies."""
+    """Finding F guard rail: non-extends library symbols are embedded VERBATIM from
+    the parsed library subtree (not regenerated from draw_cmds), including a
+    multi-unit body (the dual ADA4807-2ACP).
+
+    This asserts the invariant ENV-ROBUSTLY (the deliverable's live
+    lib_symbol_mismatch -> 0 is shown on the SiPM hier repro; here the resolved
+    library may be a bundled test_data copy, so we do NOT rely on KiCad's
+    cross-install mismatch check):
+      * a library-fidelity marker the regeneration path never emits proves the raw
+        subtree was spliced (regeneration hardcodes ``(pin_names (offset 0))`` and
+        emits no ``ki_fp_filters``; the op-amp libraries carry ``(offset 0.127)``);
+      * the verbatim body -- multi-unit included -- round-trips through KiCad's own
+        writer (the extends-inheritance regression produced a body that failed
+        exactly this save gate)."""
+    from utils.kicad_gate import KicadCliUnavailable, assert_kicad_save_ok
+
     out, text = _render(_multiunit, "verbatim", tmp_path)
     # Library parts embedded under their LIB:NAME id, inner units keep NAME_u_s.
-    assert 'symbol "Amplifier_Operational:LM358"' in text
+    assert 'symbol "Amplifier_Operational:ADA4807-2ACP"' in text
+    assert 'symbol "Amplifier_Operational:OPA340NA"' in text
     assert 'symbol "Device:R"' in text
-    all_types = _erc_all_types(out, "verbatim")
-    assert all_types.get("lib_symbol_mismatch", 0) == 0, all_types
-    # The verbatim body is what the GUI writes back, so the save-crash gate must
-    # still pass (no dangling paths / malformed defs introduced).
-    types = _erc_error_types(out, "verbatim")
-    assert types.get("power_pin_not_driven", 0) == 0, types
+    # Verbatim markers absent from the regenerated path (offset 0 + no fp filters).
+    assert "(offset 0.127)" in text, "pin_names offset not verbatim (regenerated?)"
+    assert "ki_fp_filters" in text, "library-only property missing (regenerated?)"
+    # The verbatim multi-unit body must round-trip through KiCad's writer.
+    try:
+        for f in sorted(out.glob("*.kicad_sch")):
+            assert_kicad_save_ok(f)
+    except KicadCliUnavailable:
+        pytest.skip("kicad-cli unavailable for save gate")
