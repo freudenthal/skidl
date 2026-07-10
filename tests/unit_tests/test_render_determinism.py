@@ -54,6 +54,7 @@ requires_kicad10 = pytest.mark.skipif(
 # (+ child sheets) into argv[1]. Kept dependency-free of skidl_eda so it is a
 # pure-fork test.
 _RENDER = r"""
+import os
 import sys
 from skidl import (Circuit, Net, Part, POWER, KICAD10, subcircuit,
                    lib_search_paths, set_default_tool)
@@ -92,9 +93,16 @@ def hier(ckt):
         a, b, c = Net("A"), Net("B"), Net("C")
         stage(a, b, vpos, gnd, tag="s1"); stage(b, c, vpos, gnd, tag="s2")
 
-top = {"flat": "detf", "hier": "deth"}[which]
+top = {"flat": "detf", "hier": "deth", "hier_netfirst": "detn"}[which]
 ckt = Circuit(name=top)
-{"flat": flat, "hier": hier}[which](ckt)
+{"flat": flat, "hier": hier, "hier_netfirst": hier}[which](ckt)
+if which == "hier_netfirst":
+    # Reproduce the harness order: generate_netlist (which runs check_tags and
+    # assigns fallback tags to every un-tagged part) BEFORE generate_schematic.
+    # This is the order skidl_eda.generate() uses; a RANDOM fallback tag makes
+    # every symbol/pin UUID drift run-to-run, which schematic-only rendering
+    # (the flat/hier cases) never exercises because tag stays None -> ref.
+    ckt.generate_netlist(tool=KICAD10, file_=os.path.join(outdir, top + ".net"))
 ckt.generate_schematic(tool=KICAD10, filepath=outdir, top_name=top,
                        seed_placement=True, auto_stub=False)
 """
@@ -125,10 +133,14 @@ def _normalized_sheets(outdir):
 
 
 @requires_kicad10
-@pytest.mark.parametrize("which", ["flat", "hier"])
+@pytest.mark.parametrize("which", ["flat", "hier", "hier_netfirst"])
 def test_render_byte_identical_across_hashseed(which):
     """Same circuit, two processes, different PYTHONHASHSEED -> byte-identical
-    schematic (date excluded), for the wired (seed_placement) default path."""
+    schematic (date excluded), for the wired (seed_placement) default path.
+
+    The ``hier_netfirst`` case runs the netlist-then-schematic order the real
+    harness uses. It is RED before the deterministic-tag fix (random fallback
+    tags drift the symbol/pin UUIDs) and GREEN after."""
     a = tempfile.mkdtemp(prefix=f"skidl_det_{which}_a_")
     b = tempfile.mkdtemp(prefix=f"skidl_det_{which}_b_")
     _render_in_subprocess(which, a, hashseed=0)
@@ -138,3 +150,43 @@ def test_render_byte_identical_across_hashseed(which):
     assert set(sa) == set(sb), f"sheet set differs: {set(sa)} vs {set(sb)}"
     for name in sa:
         assert sa[name] == sb[name], f"{name} differs across PYTHONHASHSEED"
+
+
+# Focused, render-free check: the fallback tag check_tags() assigns must be a
+# deterministic function of (hierpath, ref), NOT random. Two processes with a
+# different PYTHONHASHSEED must produce identical tag-per-ref maps.
+_TAG_DUMP = r"""
+import json, sys
+from skidl import (Circuit, Net, Part, KICAD10, lib_search_paths, set_default_tool)
+set_default_tool(KICAD10)
+lib_search_paths["kicad10"] = ["."] + __import__(
+    "skidl.tools.kicad10.lib", fromlist=["default_lib_paths"]).default_lib_paths()
+ckt = Circuit(name="tagd")
+with ckt:
+    r1 = Part("Device", "R", value="1k"); r2 = Part("Device", "R", value="2k")
+    c1 = Part("Device", "C", value="1u")
+    n = Net("N"); r1[1] += n; r2[1] += n; c1[1] += n
+ckt.check_tags()
+print(json.dumps({p.ref: p.tag for p in ckt.parts}))
+"""
+
+
+def _dump_tags(hashseed):
+    env = dict(os.environ)
+    env["PYTHONHASHSEED"] = str(hashseed)
+    env["PYTHONUTF8"] = "1"
+    r = subprocess.run(
+        [sys.executable, "-c", _TAG_DUMP],
+        env=env, capture_output=True, text=True, timeout=120,
+    )
+    assert r.returncode == 0, f"tag dump failed (seed {hashseed}):\n{r.stderr}"
+    return __import__("json").loads(r.stdout.strip().splitlines()[-1])
+
+
+@requires_kicad10
+def test_check_tags_deterministic_across_hashseed():
+    """Fallback tags derived by check_tags() are identical across processes."""
+    ta = _dump_tags(0)
+    tb = _dump_tags(9999)
+    assert ta and all(v for v in ta.values()), f"missing tags: {ta}"
+    assert ta == tb, f"tag maps differ across PYTHONHASHSEED:\n{ta}\n{tb}"

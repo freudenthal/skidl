@@ -11,9 +11,8 @@ and object copying.
 """
 
 import inspect
-import random
-import string
 import os.path
+import uuid
 from collections import namedtuple
 from copy import deepcopy
 
@@ -25,6 +24,15 @@ from .utilities import export_to_all
 __all__ = ["OK", "WARNING", "ERROR"]
 
 OK, WARNING, ERROR = list(range(3))
+
+# Namespace for deriving deterministic fallback tags (see check_tag). A fixed
+# literal namespace so uuid5-derived tags are byte-stable across processes /
+# PYTHONHASHSEEDs, independent of any tools-layer namespace constant.
+_TAG_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_DNS, "skidl.tag")
+
+# Monotonic counter for the ref-less fallback path only (see check_tag). Kept
+# deterministic because check_tags() iterates parts in stable insertion order.
+_derived_tag_counter = 0
 
 
 @export_to_all
@@ -253,6 +261,16 @@ class SkidlBaseObject(object):
 
         Returns:
             True if the tag is set, False otherwise.
+
+        Note:
+            When ``create_if_missing`` is set, the fallback tag is derived
+            *deterministically* from the object's stable identity (hierarchy
+            path + reference designator) via uuid5 — NOT random. This keeps the
+            whole render byte-reproducible run-to-run, because every symbol /
+            pin UUID is seeded from the part's tag (see ``Part.hiername`` ->
+            ``tag_ref_name``). An explicit ``tag=`` is still the way to get a
+            *rename*-stable PCB association; this derived tag is stable across
+            runs, not across ref renumbering.
         """
         from skidl.logger import active_logger
 
@@ -263,12 +281,24 @@ class SkidlBaseObject(object):
                 f"Missing tag on {self.name} instantiated at {self.src_line(True)}."
             )
             if create_if_missing:
-                # Create a random tag if it is missing.
-                chars = string.ascii_letters + string.digits + "_"
-                length = 10
-                self.tag = ''.join(random.choices(chars, k=length))
+                # Derive a deterministic tag from the object's stable identity.
+                # check_tags() runs at netlist/PCB generation time, after refs
+                # are finalized and collision-checked unique per circuit, so
+                # hierpath+ref is unique -> derived tags stay unique.
+                global _derived_tag_counter
+                hiertuple = tuple(getattr(self, "hiertuple", ()) or ())
+                ident = getattr(self, "ref", None)
+                if not ident:
+                    # No ref (rare/defensive): still deterministic — name plus a
+                    # monotonic per-process index (never random).
+                    _derived_tag_counter += 1
+                    ident = "{}#{}".format(
+                        getattr(self, "name", "part"), _derived_tag_counter
+                    )
+                seed = ":".join(("skidl.tag",) + hiertuple + (str(ident),))
+                self.tag = uuid.uuid5(_TAG_NAMESPACE, seed).hex[:10]
                 active_logger.bare_warning(
-                    f"Random tag {self.tag} generated for {self.name}."
+                    f"Derived tag {self.tag} generated for {self.name}."
                 )
             return False
 
