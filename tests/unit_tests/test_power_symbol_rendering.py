@@ -308,20 +308,45 @@ def test_hier_sheet_pins_default_off_is_clean(tmp_path):
     assert types.get("pin_not_connected", 0) == 0, types
 
 
+def _hier_labels(text):
+    """(name, x, y) for every hierarchical_label in a schematic text blob."""
+    out = []
+    for m in re.finditer(
+        r'\(hierarchical_label "([^"]+)".*?\(at ([\d.-]+) ([\d.-]+)', text, re.DOTALL
+    ):
+        out.append((m.group(1), float(m.group(2)), float(m.group(3))))
+    return out
+
+
 @requires_kicad10
 def test_hier_sheet_pins_option_emits_hierarchical_interconnect(tmp_path):
-    """With hierarchical_sheet_pins=True the KiCad hierarchical machinery is
-    restored: child sheets carry hierarchical_labels and the parent's sheet
-    symbols carry sheet pins (the in-progress interconnect surface, preserved so
-    it can be completed and re-enabled)."""
+    """With hierarchical_sheet_pins=True the child side of the KiCad hierarchical
+    interconnect is COMPLETE (Tier 1): each boundary net's on-sheet label is a
+    ``hierarchical_label`` emitted ON the net (not at a dangling fixed slot) and
+    the redundant ``global_label`` for that net is gone; the parent's sheet
+    symbols carry the paired sheet pins; the root sheet carries no hier label."""
     out, text = _render(_hier_build, "hspon", tmp_path, hierarchical_sheet_pins=True)
-    assert "(hierarchical_label" in text, "child hierarchical labels not emitted"
+    labels = _hier_labels(text)
+    assert labels, "child hierarchical labels not emitted"
+    # Boundary net B (s1<->s2) now rides a hierarchical_label, NOT a global_label.
+    names = {n for n, _x, _y in labels}
+    assert "B" in names, names
+    assert 'global_label "B"' not in text, "redundant global_label survived for B"
+    # Every hierarchical_label sits on the 1.27 mm grid (so it lands on wires/pins).
+    for n, x, y in labels:
+        assert abs(x / _GRID_MM - round(x / _GRID_MM)) < 1e-3, (n, x, y)
+        assert abs(y / _GRID_MM - round(y / _GRID_MM)) < 1e-3, (n, x, y)
     # Parent sheet symbol carries sheet pins for boundary nets: `(pin NAME
     # bidirectional (at ...))` inside a `(sheet ...)` (the net name is unquoted).
     top = (out / "hspon.kicad_sch").read_text(encoding="utf-8")
     assert re.search(r"\(pin \S+ bidirectional", top), "no sheet pins on parent"
     # Root sheet must NOT carry a hierarchical_label (no parent to connect to).
     assert "(hierarchical_label" not in top
+    # The child-side gap is closed: with the labels now on the net, KiCad reports
+    # zero dangling hierarchical labels (parent-side pin wiring is Tier 2, so
+    # pin_not_connected may still remain here -- that is asserted in Tier 2).
+    types = _erc_error_types(out, "hspon")
+    assert types.get("label_dangling", 0) == 0, types
 
 
 # ---------------------------------------------------------------------------

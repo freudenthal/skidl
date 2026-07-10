@@ -1011,27 +1011,40 @@ def calc_pin_dir(pin):
 
 
 def net_label_to_sexp(
-    pin, tx=Tx(), force=False, local=False, at_world=None, uuid_path=None
+    pin, tx=Tx(), force=False, local=False, at_world=None, uuid_path=None, kind=None
 ):
     """Create S-expression for a net label at a pin stub.
 
     Generates a power symbol if the net name matches a known KiCad power
-    symbol; otherwise a local ``label`` (``local=True``) or a ``global_label``.
+    symbol; otherwise a label of the requested ``kind``.
 
     Args:
         pin: Pin with net connection.
         tx: Transformation matrix.
         force: If True, skip the stub check (used for NetTerminal pins
             which always need a label regardless of stub state).
-        local: If True, emit a SHEET-LOCAL ``label`` instead of a project-wide
-            ``global_label``. Use for sheet-INTERNAL nets (stage 24 scoping
-            fix): a ``global_label`` connects by name across every sheet in the
-            project, so an internal net named e.g. ``SW3`` on two sheets would
-            silently merge -- a Blocker-B-class leak. A local ``label`` is
-            confined to its sheet. Verified ERC-clean on KiCad 10 whether it
-            sits on a pin or a wire end (only the benign isolated_pin_label
-            warning, identical to global_label). Cross-sheet nets must stay
-            ``global_label`` (or use the hierarchical_label machinery).
+        local: Back-compat boolean used only when ``kind`` is None: True ->
+            ``kind="local"``, False -> ``kind="global"``.
+        kind: Label kind, one of ``"local"`` / ``"global"`` / ``"hier"``. When
+            given it wins over ``local``.
+
+            * ``"local"`` -- a SHEET-LOCAL ``label`` (stage 24 scoping fix): a
+              ``global_label`` connects by name across every sheet in the
+              project, so a sheet-INTERNAL net named e.g. ``SW3`` on two sheets
+              would silently merge -- a Blocker-B-class leak. A local ``label``
+              is confined to its sheet.
+            * ``"global"`` -- a project-wide ``global_label`` (the default
+              cross-sheet connection: boundary nets connect by name).
+            * ``"hier"`` -- a ``hierarchical_label`` (shape bidirectional): the
+              child half of the KiCad hierarchical interconnect, paired by name
+              with the sheet pin on the parent's sheet symbol. Used for
+              boundary nets when the ``hierarchical_sheet_pins`` option is ON.
+              KiCad merges a same-named ``label`` on the sheet into it, so the
+              emission audit can still add a local unifier.
+
+            All three sit ERC-clean on a pin or a wire end (only the benign
+            isolated_pin_label warning). ``global``/``hier`` carry
+            ``(shape bidirectional)``; a plain ``label`` does not.
 
     Returns:
         Sexp or None: Label/power symbol S-expression, or None if no label needed.
@@ -1051,11 +1064,18 @@ def net_label_to_sexp(
         if pwr:
             return pwr
 
-    # Sheet-INTERNAL nets get a local ``label`` (sheet-scoped); everything else
-    # (cross-sheet / boundary nets) keeps ``global_label`` for project-wide,
-    # name-based connectivity. A local label is a global_label Sexp minus the
-    # ``shape`` field.
-    label_type = "label" if local else "global_label"
+    # Sheet-INTERNAL nets get a local ``label`` (sheet-scoped); cross-sheet /
+    # boundary nets keep ``global_label`` for project-wide name-based
+    # connectivity, or a ``hierarchical_label`` when the hierarchical_sheet_pins
+    # option routes them through sheet pins. A local label is a global_label
+    # Sexp minus the ``shape`` field.
+    if kind is None:
+        kind = "local" if local else "global"
+    label_type = {
+        "local": "label",
+        "global": "global_label",
+        "hier": "hierarchical_label",
+    }[kind]
 
     # Position at pin location (Y-flip is already in sheet_tx), unless the
     # caller overrides with an explicit placement-space point (deconflict-stub
@@ -1082,8 +1102,8 @@ def net_label_to_sexp(
     justify = "left" if angle in (0, 90) else "right"
 
     fields = [label_type, pin.net.name]
-    if not local:
-        # global_label carries a shape; a plain label does not.
+    if kind in ("global", "hier"):
+        # global_label / hierarchical_label carry a shape; a plain label does not.
         fields.append(["shape", "bidirectional"])
     fields.extend(
         [
@@ -1515,7 +1535,7 @@ def _audit_sheet_connectivity(node, elements, backend, sheet_tx):
         )
 
 
-def _audit_and_force_pin_labels(node, elements, tx, uuid_path, is_internal):
+def _audit_and_force_pin_labels(node, elements, tx, uuid_path, label_kind):
     """Guarantee every net's on-sheet pins are CONNECTED in the emitted drawing.
 
     Per-pin "is it covered?" is not enough: the per-net A* fallback and the single
@@ -1523,11 +1543,15 @@ def _audit_and_force_pin_labels(node, elements, tx, uuid_path, is_internal):
     boxed-in pin stranded on a dangling stub (that pin looks "covered" by its own
     stub-wire endpoint yet the net's drawing diverges from the netlist). This runs
     a union-find over the emitted wires AND same-name labels, finds each net whose
-    on-sheet pins fall into more than one component, and drops a name label
-    (local for a sheet-internal net, global for a boundary net) on any component
-    that lacks one -- unifying the net by name. This is the renderer-side mirror
-    of the harness ``drawing_connectivity`` gate, closing the hole before the file
-    ships. Returns the number of labels forced. Mutates ``elements`` in place.
+    on-sheet pins fall into more than one component, and drops a name label on any
+    component that lacks one -- unifying the net by name. The label kind comes
+    from ``label_kind(net)`` (local for internal, global for a boundary net, or
+    local when the hierarchical_sheet_pins option carries the boundary net by a
+    hier label -- a same-named local label merges into it, whereas a global there
+    would silently bridge project-wide names the hier path deliberately scopes).
+    This is the renderer-side mirror of the harness ``drawing_connectivity`` gate,
+    closing the hole before the file ships. Returns the number of labels forced.
+    Mutates ``elements`` in place.
     """
     from collections import OrderedDict, defaultdict
 
@@ -1645,7 +1669,7 @@ def _audit_and_force_pin_labels(node, elements, tx, uuid_path, is_internal):
                 continue  # this component already carries the net's name
             anchor = min(comps[root], key=_pin_key)[0]
             label = net_label_to_sexp(
-                anchor, tx=tx, force=True, local=is_internal(net), uuid_path=uuid_path
+                anchor, tx=tx, force=True, kind=label_kind(net), uuid_path=uuid_path
             )
             if label:
                 elements.append(label)
@@ -1775,8 +1799,30 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
     else:
         _boundary_net_ids = set()
 
+    # KiCad rejects a hierarchical_label on the root sheet (no parent to pair
+    # its sheet pin with), so the root's boundary nets fall back to a local
+    # label. Same root guard the sheet-pin emitter uses.
+    _is_root_sheet = uuid_path.count("/") <= 1
+
     def _is_internal(net):
         return net is not None and id(net) not in _boundary_net_ids
+
+    def _label_kind(net):
+        """Label kind for ``net`` on this sheet: 'local' | 'global' | 'hier'.
+
+        Internal nets are always sheet-local. A boundary (cross-sheet) net
+        connects by project-wide ``global_label`` by default; with the
+        ``hierarchical_sheet_pins`` option ON it uses the KiCad hierarchical
+        interconnect -- a ``hierarchical_label`` in the child paired by name to
+        the parent's sheet pin -- except on the ROOT sheet, where a hierarchical
+        label is illegal so it falls back to a local label (joined to the
+        children through the sheet pins + Tier-2 parent stubs' local labels).
+        """
+        if _is_internal(net):
+            return "local"
+        if _EMIT_HIER_SHEET_PINS:
+            return "local" if _is_root_sheet else "hier"
+        return "global"
 
     def _onpin_real_pin(nt_net):
         """Return the lone on-sheet real pin for an on-pin-eligible net, else None.
@@ -1853,7 +1899,7 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
                     real_pin,
                     tx=tx,
                     force=True,
-                    local=_is_internal(pin.net),
+                    kind=_label_kind(pin.net),
                     uuid_path=uuid_path,
                 )
                 if label:
@@ -1864,7 +1910,7 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
                 pin,
                 tx=tx,
                 force=True,
-                local=_is_internal(pin.net),
+                kind=_label_kind(pin.net),
                 at_world=stub_ends.get(id(pin)) if deconflict else None,
                 uuid_path=uuid_path,
             )
@@ -2016,7 +2062,7 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
             if deconflict and not is_power:
                 continue  # closure labeller handles non-power pins in this mode
             label = net_label_to_sexp(
-                pin, tx=tx, local=_is_internal(net), uuid_path=uuid_path
+                pin, tx=tx, kind=_label_kind(net), uuid_path=uuid_path
             )
             if label:
                 elements.append(label)
@@ -2086,7 +2132,7 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
                 (id(pin), stub_ends[id(pin)].x, stub_ends[id(pin)].y) for pin in pins
             ]
             islands = _decisions.net_islands(pin_pts, segs, tol=_CLOSE_TOL)
-            local = _is_internal(net)
+            net_kind = _label_kind(net)
             # Endpoint degree over this net's segments: a stub end that is a
             # degree-1 leaf and carries no label reads as an
             # ``unconnected_wire_endpoint`` in KiCad. trim_stubs already spared
@@ -2114,7 +2160,7 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
                     pin_by_id[anchor_pid],
                     tx=tx,
                     force=True,
-                    local=local,
+                    kind=net_kind,
                     at_world=stub_ends[anchor_pid],
                     uuid_path=uuid_path,
                 )
@@ -2145,7 +2191,7 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
                         pin,
                         tx=tx,
                         force=True,
-                        local=local,
+                        kind=net_kind,
                         at_world=end,
                         uuid_path=uuid_path,
                     )
@@ -2271,7 +2317,7 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
     # so it reconnects to its net by name; this is the renderer-side mirror of
     # the harness drawing_connectivity gate, catching the hole before the file
     # ships. Power/NC pins are covered by their symbol; NetTerminals self-label.
-    _forced = _audit_and_force_pin_labels(node, elements, tx, uuid_path, _is_internal)
+    _forced = _audit_and_force_pin_labels(node, elements, tx, uuid_path, _label_kind)
 
     if node.flattened:
         # This node is flattened, so return elements for inclusion in the parent sheet.
@@ -2314,38 +2360,16 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
     # Add lib_symbols section to schematic.
     schematic.append(lib_symbols_sexp)
 
-    # Hierarchical labels for boundary nets -- the child-sheet half of the KiCad
-    # hierarchical interconnect (pairs with a sheet pin on the parent's sheet
-    # symbol; see create_hierarchical_sheet_sexp). Gated on _EMIT_HIER_SHEET_PINS
-    # (the ``hierarchical_sheet_pins`` render option); default OFF.
-    #
-    # DEFAULT OFF: boundary nets instead connect by NAME via the ``global_label``
-    # each of their pins already carries (net_label_to_sexp with local=False),
-    # exactly like power nets connect by their power-symbol name -- ERC-clean, and
-    # what the drawing_connectivity gate verifies. The hierarchical_label path is
-    # INCOMPLETE (the label sits at a fixed sheet-edge slot, not yet wired to the
-    # net inside this child), so with the option ON it currently reports
-    # label_dangling until that wiring lands. Kept (not deleted) so the fork can
-    # finish it and re-enable it. Never emitted on the ROOT sheet: a
-    # hierarchical_label there has no parent to connect to (KiCad errors on it).
-    _is_root_sheet = uuid_path.count("/") <= 1
-    if (
-        _EMIT_HIER_SHEET_PINS
-        and not _is_root_sheet
-        and hasattr(node, "get_boundary_nets")
-    ):
-        boundary_nets = node.get_boundary_nets()
-        hlabel_y = 10.0  # Starting Y position in mm for labels along the left edge.
-        for net in boundary_nets:
-            # Skip power nets and stubbed nets.
-            if _net_wants_power_symbol(net):
-                continue
-            if getattr(net, "stub", False) or getattr(net, "_stub", False):
-                continue
-            elements.append(
-                hierarchical_label_to_sexp(net.name, 5.0, hlabel_y, angle=180)
-            )
-            hlabel_y += 2.54
+    # Child-sheet half of the KiCad hierarchical interconnect: with the
+    # ``hierarchical_sheet_pins`` option ON, each boundary net's on-sheet label
+    # is emitted as a ``hierarchical_label`` (kind="hier") AT the net's routed
+    # position (NetTerminal pin / on-pin relocation point) by the label-emission
+    # loops above -- see _label_kind() -- so it lands ON the net (no
+    # label_dangling) and pairs by name with the sheet pin on the parent's sheet
+    # symbol (create_hierarchical_sheet_sexp). The old fixed sheet-edge-slot loop
+    # that emitted a redundant, disconnected hierarchical_label here (the
+    # label_dangling source) has been removed. Default OFF: boundary nets connect
+    # by ``global_label`` name exactly as before.
 
     # Spread net labels off component bodies (connectivity-preserving).
     # Decision (overlap + nudge target) lives in schematics/decisions.py; the
