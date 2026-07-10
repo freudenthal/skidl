@@ -461,6 +461,129 @@ def test_hier_sheet_pins_three_level_transit(tmp_path):
     assert intermediate, "no intermediate sheet exporting the transit net SIGX"
 
 
+def _contained_partless(ckt):
+    """root -> container (NO own parts) -> two grandchildren sharing net MID.
+
+    MID is created in the container and used ONLY by its two grandchildren, so it
+    is fully CONTAINED in the container's subtree -- it must stay a local label
+    (pairing the two grandchild boxes' sheet pins on the container page), NOT a
+    ``hierarchical_label`` exported upward (which would have no matching sheet pin
+    in the root -> ``hier_label_mismatch``). INP genuinely transits root->
+    container->grandchild, so it MUST still export."""
+    from skidl import Net, Part, subcircuit
+
+    @subcircuit
+    def gchild(vin, vout, vpos, gnd):
+        u = Part("Amplifier_Operational", "OPA340NA")
+        r = Part("Device", "R", value="1k",
+                 footprint="Resistor_SMD:R_0603_1608Metric")
+        u["5"] += vpos; u["2"] += gnd; u["3"] += vin; u["4"] += vout; u["1"] += vout
+        r[1] += vout; r[2] += gnd
+
+    @subcircuit
+    def container(inp, vpos, gnd):
+        mid = Net("MID")  # shared only between the two grandchildren below
+        gchild(inp, mid, vpos, gnd, tag="g1")   # produces MID
+        gchild(mid, Net("DEEP"), vpos, gnd, tag="g2")  # consumes MID
+
+    with ckt:
+        vpos = Net("+5V"); vpos.drive = POWER
+        gnd = Net("GND"); gnd.drive = POWER
+        inp = Net("INP")
+        rt = Part("Device", "R", value="10k",
+                  footprint="Resistor_SMD:R_0603_1608Metric")
+        rt[1] += inp; rt[2] += gnd  # root part -> INP transits into the container
+        container(inp, vpos, gnd)
+
+
+def _contained_mixed(ckt):
+    """root -> section (OWN part + a child sheet) with contained net LOC.
+
+    LOC is produced by the child sheet and consumed by the section's OWN part, so
+    it never leaves the section's subtree -> must stay a local label, NOT an
+    exported ``hierarchical_label`` (the mixed-sheet variant of the bug). INP
+    still transits root->section->child and must export."""
+    from skidl import Net, Part, subcircuit
+
+    @subcircuit
+    def gchild(vin, vout, vpos, gnd):
+        u = Part("Amplifier_Operational", "OPA340NA")
+        u["5"] += vpos; u["2"] += gnd; u["3"] += vin; u["4"] += vout; u["1"] += vout
+
+    @subcircuit
+    def section(inp, vpos, gnd):
+        loc = Net("LOC")
+        gchild(inp, loc, vpos, gnd)  # child sheet produces LOC
+        # section's OWN part consumes LOC -> LOC is contained in section's subtree
+        r = Part("Device", "R", value="2k",
+                 footprint="Resistor_SMD:R_0603_1608Metric")
+        r[1] += loc; r[2] += gnd
+
+    with ckt:
+        vpos = Net("+5V"); vpos.drive = POWER
+        gnd = Net("GND"); gnd.drive = POWER
+        inp = Net("INP")
+        rt = Part("Device", "R", value="10k",
+                  footprint="Resistor_SMD:R_0603_1608Metric")
+        rt[1] += inp; rt[2] += gnd
+        section(inp, vpos, gnd)
+
+
+def _intermediate_sheet_text(out, top):
+    """Text of the non-root sheet that itself embeds a child sheet box (the
+    intermediate container/section in these tests)."""
+    for f in sorted(Path(out).glob("*.kicad_sch")):
+        if f.name == f"{top}.kicad_sch":
+            continue  # root
+        txt = f.read_text(encoding="utf-8")
+        if "(sheet" in txt:  # embeds at least one child sheet box
+            return txt
+    return None
+
+
+@requires_kicad10
+def test_hier_sheet_pins_contained_net_not_exported_partless(tmp_path):
+    """A net contained within a parts-less intermediate's subtree (shared only
+    among its descendant sheets) is NOT exported ABOVE that intermediate: no
+    ``hier_label_mismatch`` ERC error, the container sheet does not carry a
+    hierarchical_label for the contained net MID, and the genuine transit net INP
+    still exports. Regression for the nesting-breaks bug.
+
+    (MID *is* a legit hierarchical_label inside the grandchild sheets -- it
+    escapes each grandchild UP TO the container, pairing with the container's
+    sheet pin. The bug was the container re-exporting it to the root.)"""
+    out, text = _render(
+        _contained_partless, "cpl", tmp_path, hierarchical_sheet_pins=True
+    )
+    types = _erc_error_types(out, "cpl")
+    assert types.get("hier_label_mismatch", 0) == 0, types
+    assert not types, f"ERC errors on contained-net nesting: {types}"
+    # The container (intermediate) sheet must NOT re-export the contained net MID.
+    inter = _intermediate_sheet_text(out, "cpl")
+    assert inter is not None, "no intermediate sheet found"
+    assert 'hierarchical_label "MID"' not in inter, "contained net MID over-exported"
+    # But the genuine transit net INP must still export upward (somewhere).
+    assert 'hierarchical_label "INP"' in text, "real transit net INP no longer exports"
+
+
+@requires_kicad10
+def test_hier_sheet_pins_contained_net_not_exported_mixed(tmp_path):
+    """A net linking an intermediate sheet's OWN part to one of its CHILD sheets
+    stays within the subtree -> the intermediate does not export it upward
+    (mixed-sheet variant): no ``hier_label_mismatch``, the section sheet carries no
+    hierarchical_label for LOC, INP still exports."""
+    out, text = _render(
+        _contained_mixed, "cmx", tmp_path, hierarchical_sheet_pins=True
+    )
+    types = _erc_error_types(out, "cmx")
+    assert types.get("hier_label_mismatch", 0) == 0, types
+    assert not types, f"ERC errors on mixed contained-net nesting: {types}"
+    inter = _intermediate_sheet_text(out, "cmx")
+    assert inter is not None, "no intermediate sheet found"
+    assert 'hierarchical_label "LOC"' not in inter, "contained net LOC over-exported"
+    assert 'hierarchical_label "INP"' in text, "real transit net INP no longer exports"
+
+
 # ---------------------------------------------------------------------------
 # On-grid wire endpoints (finding B: A* corridors quantized to the grid)
 # ---------------------------------------------------------------------------

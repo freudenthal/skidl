@@ -1367,8 +1367,26 @@ def create_hierarchical_sheet_sexp(node, sheet_uuid, sheet_tx, parent_is_root=Tr
         needed_h = pin_spacing * (len(boundary_nets) + 1)
         if needed_h > bh:
             bh = needed_h
-        label_kind = "local" if parent_is_root else "hier"
+        # Parent-side label kind is decided PER NET, not by parent_is_root alone.
+        # A boundary net of this child box is EXPORTED upward
+        # (``hierarchical_label`` + a sheet pin on the parent's own box) only if
+        # it also escapes the PARENT node's subtree; a net that terminates inside
+        # the parent (connects sibling boxes and/or the parent's own parts) stays
+        # a sheet-local ``label``. Using parent_is_root alone over-exported every
+        # net through an intermediate sheet, so an internal net got a
+        # hierarchical_label with no matching sheet pin in the grandparent ->
+        # KiCad ``hier_label_mismatch`` (the nesting-breaks bug). For a root
+        # parent the parent subtree is everything, so export_names is empty and
+        # every net is local -- subsuming the old parent_is_root branch.
+        parent_node = getattr(node, "parent", None)
+        if parent_node is not None and not parent_is_root:
+            export_names = {
+                getattr(n, "name", None) for n in _hier_boundary_nets(parent_node)
+            }
+        else:
+            export_names = set()
         for i, net in enumerate(boundary_nets):
+            label_kind = "hier" if net.name in export_names else "local"
             pin_y = _snap_grid(by + pin_spacing * (i + 1))
             pins.append(
                 Sexp(
@@ -1949,6 +1967,17 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
     else:
         _boundary_net_ids = set()
 
+    # Nets that escape this node's WHOLE subtree (a pin outside node + all its
+    # descendants). Distinct from ``_boundary_net_ids`` above (own-parts scan):
+    # a net linking this sheet's own part to one of its CHILD sheets is boundary
+    # here (needs a label to leave this page) but does NOT escape the subtree, so
+    # it must stay a sheet-local ``label`` that pairs with the child box's sheet
+    # pin -- NOT a ``hierarchical_label`` exported upward (which would have no
+    # matching sheet pin in the grandparent -> KiCad ``hier_label_mismatch``).
+    # For a leaf node this set equals ``_boundary_net_ids`` (subtree == own
+    # parts), so leaf behaviour is unchanged.
+    _subtree_boundary_ids = {id(n) for n in _hier_boundary_nets(node)}
+
     # KiCad rejects a hierarchical_label on the root sheet (no parent to pair
     # its sheet pin with), so the root's boundary nets fall back to a local
     # label. Same root guard the sheet-pin emitter uses.
@@ -1964,14 +1993,18 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
         connects by project-wide ``global_label`` by default; with the
         ``hierarchical_sheet_pins`` option ON it uses the KiCad hierarchical
         interconnect -- a ``hierarchical_label`` in the child paired by name to
-        the parent's sheet pin -- except on the ROOT sheet, where a hierarchical
-        label is illegal so it falls back to a local label (joined to the
-        children through the sheet pins + Tier-2 parent stubs' local labels).
+        the parent's sheet pin -- except (a) on the ROOT sheet, where a
+        hierarchical label is illegal, and (b) for a net that only reaches a
+        CHILD sheet (stays within this node's subtree): both fall back to a
+        sheet-local label. Only a net that truly escapes the subtree upward is
+        exported as a ``hierarchical_label``.
         """
         if _is_internal(net):
             return "local"
         if _EMIT_HIER_SHEET_PINS:
-            return "local" if _is_root_sheet else "hier"
+            if _is_root_sheet or id(net) not in _subtree_boundary_ids:
+                return "local"
+            return "hier"
         return "global"
 
     def _onpin_real_pin(nt_net):
