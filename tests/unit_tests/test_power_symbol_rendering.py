@@ -203,6 +203,49 @@ def test_wired_render_power_nets_not_routed(tmp_path):
 
 
 @requires_kicad10
+def test_power_stubs_option_offsets_symbol_onto_stub_wire(tmp_path):
+    """With power_stubs=True every power symbol is pulled one grid step off its
+    pin onto a short stub WIRE (the classic pin -> wire -> power-symbol look),
+    and the render stays ERC-clean. Default (OFF) keeps symbols on the pin."""
+    # Default: power symbols coincident with pins (no dedicated stub wire).
+    out0, text0 = _render(_divider, "pwr0", tmp_path)
+    # power_stubs ON: symbols offset, each sitting on a wire endpoint.
+    out1, text1 = _render(_divider, "pwr1", tmp_path, power_stubs=True)
+
+    def _sym_pts(txt):
+        return [
+            (round(float(m.group(1)), 2), round(float(m.group(2)), 2))
+            for m in re.finditer(
+                r'\(lib_id "power:(?!PWR_FLAG)[^"]+"\)\s*\(at ([\d.-]+) ([\d.-]+)', txt
+            )
+        ]
+
+    def _wire_ends(txt):
+        pts = set()
+        for m in re.finditer(
+            r"\(wire\s*\(pts\s*\(xy ([\d.-]+) ([\d.-]+)\)\s*\(xy ([\d.-]+) ([\d.-]+)\)",
+            txt,
+        ):
+            x1, y1, x2, y2 = map(float, m.groups())
+            pts.add((round(x1, 2), round(y1, 2)))
+            pts.add((round(x2, 2), round(y2, 2)))
+        return pts
+
+    syms1 = _sym_pts(text1)
+    assert syms1, "no power symbols emitted"
+    ends1 = _wire_ends(text1)
+    # Every power symbol sits at a wire endpoint (its stub), and on-grid.
+    for sx, sy in syms1:
+        assert (sx, sy) in ends1, f"power symbol {sx},{sy} not on a stub wire end"
+        assert abs(sx / _GRID_MM - round(sx / _GRID_MM)) < 1e-3, (sx, sy)
+        assert abs(sy / _GRID_MM - round(sy / _GRID_MM)) < 1e-3, (sx, sy)
+    # The stub path produced MORE wires than the on-pin default.
+    assert text1.count("(wire") > text0.count("(wire"), "no stub wires added"
+    # Still ERC-clean.
+    assert not _erc_error_types(out1, "pwr1"), _erc_error_types(out1, "pwr1")
+
+
+@requires_kicad10
 def test_custom_rail_gets_infile_power_symbol(tmp_path):
     """A non-stock rail name (drive=POWER) gets a cloned in-file power symbol whose
     Value is the rail name -- not a plain global label. It carries the project-local

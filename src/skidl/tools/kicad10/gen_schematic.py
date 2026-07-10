@@ -555,6 +555,7 @@ def _handle_fallback(
         title,
         version=20230409,
         hierarchical_sheet_pins=options.get("hierarchical_sheet_pins", False),
+        power_stubs=options.get("power_stubs", False),
     )
     finalize_parts_and_nets(circuit, **options)
 
@@ -944,6 +945,7 @@ def gen_schematic(
             title,
             version=20230409,
             hierarchical_sheet_pins=options.get("hierarchical_sheet_pins", False),
+            power_stubs=options.get("power_stubs", False),
         )
 
         active_logger.info(f"Schematic written to {output_file}")
@@ -1022,6 +1024,7 @@ def gen_schematic(
                             hierarchical_sheet_pins=options.get(
                                 "hierarchical_sheet_pins", False
                             ),
+                            power_stubs=options.get("power_stubs", False),
                         )
                         finalize_parts_and_nets(circuit, **options)
                         erc_regen_ok = True

@@ -280,8 +280,30 @@ def _power_symbol_to_sexp(pin, net_name, tx, uuid_path=None):
     pin_pt = getattr(pin, "pt", Point(pin.x, pin.y))
     pt = pin_pt * combined_tx
 
-    x = _round_mm(pt.x)
-    y = _round_mm(pt.y)
+    px = _round_mm(pt.x)  # the real IC pin position
+    py = _round_mm(pt.y)
+
+    # Symbol position: coincident with the pin by default. With the
+    # ``power_stubs`` option ON, pull the symbol one grid step OUTWARD along the
+    # pin's stub direction and draw a pin->symbol stub wire (the classic KiCad
+    # "pin -> short wire -> power symbol" look, so nothing sits crammed on the
+    # body). calc_pin_dir gives the outward direction in SKiDL space; map it into
+    # rendered (mm, Y-down) space via the linear part of combined_tx.
+    x, y = px, py
+    if _EMIT_POWER_STUBS:
+        _dvec = {"U": Point(0, 1), "D": Point(0, -1), "L": Point(-1, 0), "R": Point(1, 0)}[
+            calc_pin_dir(pin)
+        ]
+        _p0 = Point(0, 0) * combined_tx
+        _p1 = _dvec * combined_tx
+        _dx, _dy = _p1.x - _p0.x, _p1.y - _p0.y
+        _dlen = (_dx * _dx + _dy * _dy) ** 0.5 or 1.0
+        x = _snap_grid(px + _POWER_STUB_LEN * _dx / _dlen)
+        y = _snap_grid(py + _POWER_STUB_LEN * _dy / _dlen)
+        if (x, y) != (px, py):
+            _power_stub_wires.append(
+                _sheet_stub_wire_sexp(px, py, x, y, f"pwrstub:{net_name}:{px}:{py}:{x}:{y}")
+            )
 
     # Power symbol angle: align the symbol body with the schematic pin's
     # outward stub direction.  ``calc_pin_dir`` gives the world-space
@@ -1527,6 +1549,16 @@ _AUDIT_STRICT = os.environ.get("SKIDL_AUDIT_STRICT", "0") not in (
 # create_hierarchical_sheet_sexp + node_to_sexp_schematic.
 _EMIT_HIER_SHEET_PINS = False
 
+# When True (the ``power_stubs`` render option), each power pin renders its
+# ``power:*`` symbol at the end of a short outward STUB WIRE (the classic KiCad
+# look) instead of coincident with the pin. _power_symbol_to_sexp offsets the
+# symbol one grid step along the pin's outward direction and records the pin->
+# symbol wire in _power_stub_wires, which node_to_sexp_schematic drains into the
+# sheet's elements. Default OFF -- symbols sit on the pin exactly as before.
+_EMIT_POWER_STUBS = False
+_POWER_STUB_LEN = 2.54  # mm outward stub (2 grid units)
+_power_stub_wires = []  # per-sheet sink: pin->symbol stub wires to emit
+
 
 class SheetConnectivityError(Exception):
     """A rendered sheet has a coordinate owned by more than one net (a fusion)."""
@@ -1828,6 +1860,10 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
 
     # Storage for S-expression elements of schematic.
     elements = []
+    # Reset the per-sheet power-stub-wire sink (power_stubs option). This node's
+    # power symbols are emitted AFTER the child recursion below, so clearing here
+    # is safe: each child recursion clears + drains its own sink before returning.
+    _power_stub_wires.clear()
 
     # Collect lib_symbols needed for this node's parts.
     lib_symbols = {}
@@ -2356,6 +2392,13 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
     # across the whole project (power symbols connect globally by name).
     _append_pwr_flags(elements, uuid_path)
 
+    # Drain the power-stub wires (pin -> offset power symbol) collected while
+    # emitting power symbols on this sheet (power_stubs option). Done before the
+    # purge so it sees these wires + their power-symbol anchors.
+    if _power_stub_wires:
+        elements.extend(_power_stub_wires)
+        _power_stub_wires.clear()
+
     # Purge dangling wire remnants. Snap moves parts by reassigning part.tx,
     # but a router wire to the old position can survive as a short stub whose
     # far end touches nothing (KiCad flags these as wire_dangling). Drop any
@@ -2400,6 +2443,21 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
                         ):
                             _anchor_pts.add((_s[1], _s[2]))
                             break
+        elif _el[0] == "symbol":
+            # A power symbol's pin (= its `at`) anchors the power_stubs stub wire
+            # whose far end sits on the offset symbol; without this the purge
+            # would drop that stub (its symbol end looks unanchored).
+            _lib = next(
+                (s for s in _el if isinstance(s, (list, Sexp)) and len(s) >= 2 and s[0] == "lib_id"),
+                None,
+            )
+            if _lib and _is_power_libid(str(_lib[1])):
+                _at = next(
+                    (s for s in _el if isinstance(s, (list, Sexp)) and len(s) >= 3 and s[0] == "at"),
+                    None,
+                )
+                if _at:
+                    _anchor_pts.add((_at[1], _at[2]))
 
     def _wire_endpoints_of(_el):
         for _s in _el:
@@ -2546,6 +2604,7 @@ def write_top_schematic(
     title,
     version=20230409,
     hierarchical_sheet_pins=False,
+    power_stubs=False,
 ):
     """Generate and write the complete schematic from a placed+routed node tree.
 
@@ -2565,8 +2624,10 @@ def write_top_schematic(
             path is not yet fully wired (see _EMIT_HIER_SHEET_PINS).
     """
 
-    global _EMIT_HIER_SHEET_PINS
+    global _EMIT_HIER_SHEET_PINS, _EMIT_POWER_STUBS
     _EMIT_HIER_SHEET_PINS = bool(hierarchical_sheet_pins)
+    _EMIT_POWER_STUBS = bool(power_stubs)
+    _power_stub_wires.clear()
 
     init_power_symbol_data()
 
