@@ -144,6 +144,24 @@ def _erc_error_types(out, top):
     return types
 
 
+def _erc_all_types(out, top):
+    """ERC violation-type histogram including WARNINGS (lib_symbol_issues et al.
+    are warnings, invisible to the --severity-error run above)."""
+    sch = out / f"{top}.kicad_sch"
+    rpt = out / f"{top}-erc-all.rpt"
+    subprocess.run(
+        [KICAD_CLI, "sch", "erc", "--output", str(rpt), str(sch)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    txt = rpt.read_text(encoding="utf-8") if rpt.exists() else ""
+    types = {}
+    for m in re.finditer(r"\[(\w+)\]:", txt):
+        types[m.group(1)] = types.get(m.group(1), 0) + 1
+    return types
+
+
 def _divider(ckt):
     from skidl import Net, Part
 
@@ -186,19 +204,37 @@ def test_wired_render_power_nets_not_routed(tmp_path):
 
 @requires_kicad10
 def test_custom_rail_gets_infile_power_symbol(tmp_path):
-    """A non-stock rail name (drive=POWER) gets a cloned in-file (power) symbol
-    whose Value is the rail name -- not a plain global label."""
+    """A non-stock rail name (drive=POWER) gets a cloned in-file power symbol whose
+    Value is the rail name -- not a plain global label. It carries the project-local
+    ``SKiDL_rails:`` nickname (not stock ``power:``) and is backed by a written
+    ``SKiDL_rails.kicad_sym`` + ``sym-lib-table`` so ERC resolves it (0
+    lib_symbol_issues) instead of complaining against the stock ``power`` lib."""
     out, text = _render(_custom_rail, "cust", tmp_path)
-    assert 'symbol "power:VBIAS_28V"' in text  # cloned lib definition
-    assert 'lib_id "power:VBIAS_28V"' in text  # instance
+    assert 'symbol "SKiDL_rails:VBIAS_28V"' in text  # cloned lib definition
+    assert 'lib_id "SKiDL_rails:VBIAS_28V"' in text  # instance
     assert 'property "Value" "VBIAS_28V"' in text  # value = rail name
+    # The clone must NOT masquerade as a stock power-lib symbol (that is finding C).
+    assert 'lib_id "power:VBIAS_28V"' not in text
     # The cloned definition carries the (power ...) flag, so KiCad treats it as a
     # real power symbol (global-by-name), not a plain global label.
-    defn = text.split('symbol "power:VBIAS_28V"', 1)[1].split("(symbol", 1)[0]
+    defn = text.split('symbol "SKiDL_rails:VBIAS_28V"', 1)[1].split("(symbol", 1)[0]
     assert "(power" in defn
     assert 'global_label "VBIAS_28V"' not in text
+    # Project-local library + table backing the nickname.
+    lib = out / "SKiDL_rails.kicad_sym"
+    tbl = out / "sym-lib-table"
+    assert lib.exists() and tbl.exists()
+    lib_text = lib.read_text(encoding="utf-8")
+    assert '(symbol "VBIAS_28V"' in lib_text  # bare name in the standalone lib
+    assert '"SKiDL_rails"' in tbl.read_text(encoding="utf-8")
     types = _erc_error_types(out, "cust")
     assert types.get("power_pin_not_driven", 0) == 0, types
+    # The whole point of finding C: no lib_symbol_issues for the custom rail. The
+    # table's ${KIPRJMOD} only resolves when a project file is present (the harness
+    # scaffold always writes one); stub a minimal .kicad_pro so ERC has that context.
+    (out / "cust.kicad_pro").write_text("{}", encoding="utf-8")
+    all_types = _erc_all_types(out, "cust")
+    assert all_types.get("lib_symbol_issues", 0) == 0, all_types
 
 
 @requires_kicad10

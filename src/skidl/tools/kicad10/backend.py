@@ -182,7 +182,8 @@ class Kicad9Backend:
                 # Power symbols occupy their pin cell (= the symbol `at`) on a
                 # power net. Seed it keyed by that net so a signal label can't be
                 # nudged onto it and fused into the rail (stage 19, Blocker B
-                # hardening). Its lib_id is "power:<net>".
+                # hardening). Its lib_id is "power:<net>" (stock rails) or
+                # "SKiDL_rails:<net>" (non-stock in-file clones).
                 lib_id = next(
                     (
                         s
@@ -193,7 +194,7 @@ class Kicad9Backend:
                     ),
                     None,
                 )
-                if lib_id and str(lib_id[1]).startswith("power:"):
+                if lib_id and _ksch._is_power_libid(str(lib_id[1])):
                     at = next(
                         (
                             s
@@ -208,7 +209,7 @@ class Kicad9Backend:
                         occupied_seed.append(
                             (
                                 _cell(float(at[1]), float(at[2])),
-                                str(lib_id[1])[len("power:") :],
+                                _ksch._power_net_from_libid(str(lib_id[1])),
                             )
                         )
             elif elem[0] == "junction":

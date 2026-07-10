@@ -96,6 +96,42 @@ def init_power_symbol_data():
     pwr_symbol_names = set([p.name for p in pwr_lib])
 
 
+# Nickname for non-stock rail symbols cloned in-file (e.g. V5P, VBIAS_28V).
+# Stock rail names (GND, VCC, +5V ... present in the KiCad ``power`` library) and
+# PWR_FLAG keep the ``power:`` lib nickname, which resolves against KiCad's global
+# sym-lib-table. A non-stock rail name has no ``power`` entry, so KiCad ERC reports
+# ``lib_symbol_issues`` ("Symbol 'V5P' not found in symbol library 'power'"); such
+# clones instead carry ``SKiDL_rails:`` and are backed by a project-local
+# ``SKiDL_rails.kicad_sym`` + ``sym-lib-table`` (written by write_top_schematic) so
+# ERC resolves them cleanly.
+_CUSTOM_RAIL_LIB = "SKiDL_rails"
+_POWER_LIB_PREFIXES = ("power:", _CUSTOM_RAIL_LIB + ":")
+
+
+def _is_power_libid(lib_id):
+    """True if *lib_id* is a rendered power/rail symbol (stock or custom clone)."""
+    return isinstance(lib_id, str) and lib_id.startswith(_POWER_LIB_PREFIXES)
+
+
+def _power_net_from_libid(lib_id):
+    """Recover the net/rail name from a power-symbol lib_id (either prefix)."""
+    if isinstance(lib_id, str) and ":" in lib_id:
+        return lib_id.split(":", 1)[1]
+    return lib_id
+
+
+def _power_libid_for(name):
+    """The lib_id a power symbol for rail *name* should carry.
+
+    Stock names present in the KiCad ``power`` library (and ``PWR_FLAG``) keep the
+    ``power:`` nickname; any other rail name is a non-stock in-file clone and gets
+    the project-local ``SKiDL_rails:`` nickname.
+    """
+    if name == "PWR_FLAG" or name in pwr_symbol_names:
+        return f"power:{name}"
+    return f"{_CUSTOM_RAIL_LIB}:{name}"
+
+
 def _net_wants_power_symbol(net):
     """True if *net* should render as a KiCad ``power:*`` symbol at each pin.
 
@@ -165,7 +201,7 @@ def _extract_power_lib_symbol(name):
     if src is None:
         return None
     clone = deepcopy(src)
-    clone[1] = f"power:{name}"
+    clone[1] = f"{_CUSTOM_RAIL_LIB}:{name}"
     prefix = template + "_"  # inner unit symbols are "<template>_<unit>_<style>"
     for sub in clone:
         if not (hasattr(sub, "__getitem__") and len(sub) >= 2):
@@ -179,6 +215,12 @@ def _extract_power_lib_symbol(name):
         # what the global-by-name connection keys on).
         elif tag == "property" and len(sub) >= 3 and sub[1] == "Value":
             sub[2] = name
+    # Register an UNQUOTED snapshot so write_top_schematic can emit a project-local
+    # SKiDL_rails.kicad_sym + sym-lib-table (keyed by full lib_id). Snapshot now
+    # because the returned ``clone`` is embedded per-sheet and mutated in place by
+    # that sheet's add_quotes (which is not idempotent) -- storing the live object
+    # would double-quote the library file.
+    _custom_power_symbols[clone[1]] = deepcopy(clone)
     return clone
 
 
@@ -251,7 +293,7 @@ def _power_symbol_to_sexp(pin, net_name, tx, uuid_path=None):
     intrinsic = _power_symbol_pin_angle(net_name)
     angle = (_PIN_LABEL_ANGLE[calc_pin_dir(pin)] - intrinsic) % 360
 
-    lib_id = f"power:{net_name}"
+    lib_id = _power_libid_for(net_name)
     inst_uuid = _gen_uuid(f"pwr:{net_name}:{x}:{y}:{_pwr_counter[0]}")
 
     symbol = Sexp(
@@ -469,9 +511,9 @@ def _append_pwr_flags(elements, uuid_path):
                 lib_id = sub[1]
             elif sub[0] == "at" and len(sub) >= 3:
                 at = (sub[1], sub[2])
-        if not lib_id or not lib_id.startswith("power:") or lib_id == "power:PWR_FLAG":
+        if not _is_power_libid(lib_id) or lib_id == "power:PWR_FLAG":
             continue
-        name = lib_id.split(":", 1)[1]
+        name = _power_net_from_libid(lib_id)
         if name in _pwr_flag_net_names and name not in _pwr_flagged and at is not None:
             seen.setdefault(name, at)
     for name, (x, y) in seen.items():
@@ -1295,9 +1337,10 @@ def _calc_sheet_tx(bbox):
 
 
 def _power_lib_ids_in_elements(elements):
-    """Return the set of ``power:*`` lib_ids referenced by symbol instances in
-    ``elements``. Used to emit exactly the power-symbol definitions a sheet needs,
-    so every emitted power instance has a matching lib_symbols definition."""
+    """Return the set of power-symbol lib_ids (``power:*`` and ``SKiDL_rails:*``)
+    referenced by symbol instances in ``elements``. Used to emit exactly the
+    power-symbol definitions a sheet needs, so every emitted power instance has a
+    matching lib_symbols definition."""
     found = set()
     for el in elements:
         if not (hasattr(el, "__getitem__") and len(el) and el[0] == "symbol"):
@@ -1307,8 +1350,7 @@ def _power_lib_ids_in_elements(elements):
                 hasattr(sub, "__getitem__")
                 and len(sub) >= 2
                 and sub[0] == "lib_id"
-                and isinstance(sub[1], str)
-                and sub[1].startswith("power:")
+                and _is_power_libid(sub[1])
             ):
                 found.add(sub[1])
     return found
@@ -1417,7 +1459,7 @@ def _audit_sheet_connectivity(node, elements, backend, sheet_tx):
             # intended coincidence as a cross-net fusion.
             if (
                 lib_id
-                and str(lib_id[1]).startswith("power:")
+                and _is_power_libid(str(lib_id[1]))
                 and str(lib_id[1]) != "power:PWR_FLAG"
             ):
                 at = next(
@@ -1429,7 +1471,9 @@ def _audit_sheet_connectivity(node, elements, backend, sheet_tx):
                     None,
                 )
                 if at:
-                    cell_nets[_key(at[1], at[2])].add(str(lib_id[1])[len("power:") :])
+                    cell_nets[_key(at[1], at[2])].add(
+                        _power_net_from_libid(str(lib_id[1]))
+                    )
 
     from skidl.logger import active_logger
 
@@ -2386,10 +2430,95 @@ def write_top_schematic(
         node, uuid_path=uuid_path, version=version
     )
 
+    # Non-stock rail clones (SKiDL_rails:*) need a project-local library +
+    # sym-lib-table so KiCad ERC can resolve them (else lib_symbol_issues against
+    # the stock ``power`` lib). Written after all sheets, once the clone set is known.
+    _write_custom_rail_library(filepath)
+
     # Optional: validate with kicad-cli if available.
     _validate_with_kicad_cli(output_file)
 
     return output_file
+
+
+def _write_custom_rail_library(directory):
+    """Emit ``SKiDL_rails.kicad_sym`` + a ``sym-lib-table`` entry for the non-stock
+    rail symbols cloned in-file this generation.
+
+    Stock power symbols resolve against KiCad's global ``power`` library; the
+    in-file clones for non-stock rails (V5P, VBIAS_28V ...) carry a
+    ``SKiDL_rails:`` nickname that only resolves via a project-local table. Without
+    this, ERC reports ``lib_symbol_issues`` for every custom-rail instance even
+    though the symbol renders fine from the embedded ``lib_symbols`` definition.
+    """
+    if not _custom_power_symbols:
+        return
+
+    from copy import deepcopy
+
+    lib = Sexp(
+        [
+            "kicad_symbol_lib",
+            ["version", 20241209],
+            ["generator", "skidl"],
+            ["generator_version", __version__],
+        ]
+    )
+    for lib_id, definition in sorted(_custom_power_symbols.items()):
+        sym = deepcopy(definition)
+        # In a standalone .kicad_sym the symbol name is the bare rail name; the
+        # nickname (SKiDL_rails) comes from the sym-lib-table, not the symbol.
+        sym[1] = _power_net_from_libid(lib_id)
+        lib.append(sym)
+
+    def need_quote(x):
+        tag = x[0]
+        if tag == "symbol" and len(x) > 1 and isinstance(x[1], str):
+            return True
+        return tag in (
+            "property",
+            "name",
+            "number",
+            "generator",
+            "generator_version",
+        )
+
+    def need_quote_alternate(x):
+        return x[0] == "alternate"
+
+    lib.add_quotes(need_quote)
+    lib.add_quotes(need_quote_alternate, stop_idx=2)
+
+    sym_path = os.path.join(directory, f"{_CUSTOM_RAIL_LIB}.kicad_sym")
+    with open(sym_path, "w") as f:
+        f.write(lib.to_str())
+
+    _ensure_sym_lib_table_entry(directory)
+
+
+def _ensure_sym_lib_table_entry(directory):
+    """Ensure the project ``sym-lib-table`` maps the ``SKiDL_rails`` nickname to the
+    local ``SKiDL_rails.kicad_sym`` (KIPRJMOD-relative). Creates the table if absent;
+    otherwise inserts the entry only when missing (preserving other libraries)."""
+    table_path = os.path.join(directory, "sym-lib-table")
+    entry = (
+        f'  (lib (name "{_CUSTOM_RAIL_LIB}")(type "KiCad")'
+        f'(uri "${{KIPRJMOD}}/{_CUSTOM_RAIL_LIB}.kicad_sym")(options "")(descr ""))'
+    )
+    if not os.path.exists(table_path):
+        with open(table_path, "w") as f:
+            f.write(f"(sym_lib_table\n  (version 7)\n{entry}\n)\n")
+        return
+
+    with open(table_path, "r") as f:
+        text = f.read()
+    if f'(name "{_CUSTOM_RAIL_LIB}")' in text:
+        return  # already present -- leave the user's table untouched.
+    idx = text.rfind(")")
+    if idx == -1:
+        return
+    with open(table_path, "w") as f:
+        f.write(text[:idx] + entry + "\n" + text[idx:])
 
 
 # ---------------------------------------------------------------------------
