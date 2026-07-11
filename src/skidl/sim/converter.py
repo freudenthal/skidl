@@ -823,19 +823,23 @@ class SpiceConverter:
 
     @staticmethod
     def _scan_lib(path, name):
-        """Find ``name`` in a .lib/.sub file -> ('subckt', [nodes]) | ('model', None).
+        """Find ``name`` in a .lib/.sub file.
 
-        Returns ``(None, None)`` if the file is unreadable or defines neither a
-        ``.subckt`` nor a ``.model`` by that name. Subckt node names are read from
-        the definition line (params like ``PARAM=1`` end the node list).
+        -> ``('subckt', [nodes], "")`` | ``('model', None, DTYPE)`` |
+        ``(None, None, "")``. ``DTYPE`` is the ``.model``'s declared device type
+        (``VDMOS`` / ``NMOS`` / ``NPN`` / ``D`` ...), needed to emit a 3-terminal
+        VDMOS line correctly. Returns ``(None, None, "")`` if the file is
+        unreadable or defines neither a ``.subckt`` nor a ``.model`` by that name.
+        Subckt node names are read from the definition line (params like
+        ``PARAM=1`` end the node list).
         """
         if not name or not path:
-            return None, None
+            return None, None, ""
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as fh:
                 text = fh.read()
         except OSError:
-            return None, None
+            return None, None, ""
         sub = re.search(
             rf"^\s*\.subckt\s+{re.escape(str(name))}\b(.*)$",
             text,
@@ -847,34 +851,46 @@ class SpiceConverter:
                 if tok.lower() == "params:" or "=" in tok:
                     break  # PSpice 'PARAMS:' keyword or the first param -> nodes end
                 nodes.append(tok)
-            return "subckt", nodes
+            return "subckt", nodes, ""
         mod = re.search(
-            rf"^\s*\.model\s+{re.escape(str(name))}\b",
+            rf"^\s*\.model\s+{re.escape(str(name))}\s+(\S+)",
             text,
             re.IGNORECASE | re.MULTILINE,
         )
         if mod:
-            return "model", None
-        return None, None
+            return "model", None, mod.group(1).split("(")[0]
+        # A .model with the type on a continuation line (rare) still matches kind.
+        mod2 = re.search(
+            rf"^\s*\.model\s+{re.escape(str(name))}\b",
+            text,
+            re.IGNORECASE | re.MULTILINE,
+        )
+        if mod2:
+            return "model", None, ""
+        return None, None, ""
 
     @staticmethod
     def _scan_lib_first(path):
-        """First model in a file -> ('subckt', name, [nodes]) | ('model', name, None).
+        """First model in a file.
 
-        Used for store files keyed only by MPN, where the internal model/subckt
-        name isn't known ahead of time. Returns ``(None, None, None)`` if none.
+        -> ``('subckt', name, [nodes], "")`` | ``('model', name, None, DTYPE)`` |
+        ``(None, None, None, "")``. ``DTYPE`` is the ``.model``'s declared device
+        type (for the VDMOS 3-terminal case). Used for store files keyed only by
+        MPN, where the internal model/subckt name isn't known ahead of time.
         """
         if not path:
-            return None, None, None
+            return None, None, None, ""
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as fh:
                 text = fh.read()
         except OSError:
-            return None, None, None
+            return None, None, None, ""
         sub = re.search(
             r"^\s*\.subckt\s+(\S+)(.*)$", text, re.IGNORECASE | re.MULTILINE
         )
-        mod = re.search(r"^\s*\.model\s+(\S+)", text, re.IGNORECASE | re.MULTILINE)
+        mod = re.search(
+            r"^\s*\.model\s+(\S+)\s*(\S+)?", text, re.IGNORECASE | re.MULTILINE
+        )
         # Honor whichever appears first in the file.
         if sub and (not mod or sub.start() < mod.start()):
             nodes = []
@@ -882,10 +898,11 @@ class SpiceConverter:
                 if tok.lower() == "params:" or "=" in tok:
                     break
                 nodes.append(tok)
-            return "subckt", sub.group(1), nodes
+            return "subckt", sub.group(1), nodes, ""
         if mod:
-            return "model", mod.group(1), None
-        return None, None, None
+            dtype = (mod.group(2) or "").split("(")[0]
+            return "model", mod.group(1), None, dtype
+        return None, None, None, ""
 
     @staticmethod
     def _parse_sim_pins(spec) -> dict:
@@ -998,20 +1015,23 @@ class SpiceConverter:
         sim = self._sim_props(component)
         name = sim.get("name")
         path = self._resolve_lib_path(sim.get("library"))
-        kind_in_file, subckt_nodes = self._scan_lib(path, name)
+        kind_in_file, subckt_nodes, model_type = self._scan_lib(path, name)
         self._emit_external(
-            component, ref, path, name, kind_in_file, subckt_nodes, "sim_library"
+            component, ref, path, name, kind_in_file, subckt_nodes,
+            "sim_library", model_type,
         )
 
     def _add_store_model(self, component, ref, path) -> None:
         """Attach a device's model from the local MPN store (name discovered)."""
-        kind_in_file, name, subckt_nodes = self._scan_lib_first(path)
+        kind_in_file, name, subckt_nodes, model_type = self._scan_lib_first(path)
         self._emit_external(
-            component, ref, path, name, kind_in_file, subckt_nodes, "local_store"
+            component, ref, path, name, kind_in_file, subckt_nodes,
+            "local_store", model_type,
         )
 
     def _emit_external(
-        self, component, ref, path, name, kind_in_file, subckt_nodes, source
+        self, component, ref, path, name, kind_in_file, subckt_nodes, source,
+        model_type="",
     ) -> None:
         """Shared emit for an external model (Sim.Library or store), by file kind."""
         self._include_lib(path)
@@ -1045,7 +1065,7 @@ class SpiceConverter:
         elif kind_in_file == "model":
             nodes = self._get_component_nodes(component)
             self._emit_primitive_with_external_model(
-                dev_kind, ref, name, nodes, component
+                dev_kind, ref, name, nodes, component, model_type
             )
             self.model_provenance[ref] = ResolvedModel(
                 ref, dev_kind or "?", "vendor_lib", name, source=source
@@ -1056,9 +1076,27 @@ class SpiceConverter:
             logger.warning(f"{ref}: no usable model found in {path} - skipping")
 
     def _emit_primitive_with_external_model(
-        self, kind, ref, name, nodes, component=None
+        self, kind, ref, name, nodes, component=None, model_type=""
     ) -> None:
-        """Emit a D/Q/M instance referencing an external ``.model`` name (no card)."""
+        """Emit a D/Q/M instance referencing an external ``.model`` name (no card).
+
+        Transistor terminals are resolved by pin *name* (C/B/E, D/G/S) exactly
+        like the curated ``_add_bjt_transistor``/``_add_mosfet`` paths -- KiCad
+        symbols number their pins inconsistently, so the pre-fix positional order
+        silently swapped drain/gate (or collector/base) for a vendor-lib device,
+        producing a clean-provenance but DEAD part (bug M1). ``model_type`` is the
+        ``.model``'s declared type; an ngspice ``VDMOS`` card is a *3-terminal*
+        element (``M nd ng ns model``), so a 4-node M line misparses against it.
+        """
+        mtype = (model_type or "").strip().upper()
+
+        # Defensive: MOS-family model type on a non-MOSFET device (or vice versa).
+        if mtype in ("NMOS", "PMOS", "VDMOS") and kind != "mosfet":
+            logger.warning(
+                f"{ref}: external model '{name}' is a {mtype} card but the device "
+                f"kind is '{kind}' - terminal mapping may be wrong"
+            )
+
         if kind == "diode" and len(nodes) >= 2:
             # Resolve A/K by pin name so a vendor-lib diode isn't reversed either
             # (bug #12). component is None only for legacy callers -> positional.
@@ -1067,10 +1105,31 @@ class SpiceConverter:
             else:
                 self.spice_circuit.D(ref, nodes[0], nodes[1], model=name)
         elif kind == "bjt" and len(nodes) >= 3:
-            self.spice_circuit.Q(ref, nodes[0], nodes[1], nodes[2], model=name)
+            named = self._named_terminal_nodes(component) if component is not None else {}
+            if all(k in named for k in ("C", "B", "E")):
+                c_node, b_node, e_node = named["C"], named["B"], named["E"]
+            else:
+                c_node, b_node, e_node = nodes[0], nodes[1], nodes[2]
+            self.spice_circuit.Q(ref, c_node, b_node, e_node, model=name)
         elif kind == "mosfet" and len(nodes) >= 3:
-            bulk = nodes[3] if len(nodes) >= 4 else nodes[2]
-            self.spice_circuit.M(ref, nodes[0], nodes[1], nodes[2], bulk, model=name)
+            named = self._named_terminal_nodes(component) if component is not None else {}
+            if all(k in named for k in ("D", "G", "S")):
+                d_node, g_node, s_node = named["D"], named["G"], named["S"]
+                b_node = named.get("B", s_node)
+            else:
+                d_node, g_node, s_node = nodes[0], nodes[1], nodes[2]
+                b_node = nodes[3] if len(nodes) >= 4 else nodes[2]
+            if mtype == "VDMOS":
+                # ngspice VDMOS is 3-terminal (D G S). PySpice's M() forces 4
+                # nodes, so emit the element raw. Prefix matches PySpice's M
+                # naming (M<ref>) so get_current()/probes stay consistent.
+                self.spice_circuit.raw_spice += (
+                    f"\nM{ref} {d_node} {g_node} {s_node} {name}"
+                )
+            else:
+                self.spice_circuit.M(
+                    ref, d_node, g_node, s_node, b_node, model=name
+                )
         else:
             logger.warning(
                 f"{ref}: external .model '{name}' needs a diode/BJT/MOSFET device "
@@ -1161,7 +1220,8 @@ class SpiceConverter:
     def _add_index_model(self, component, ref, hit) -> None:
         """Attach a model resolved from the external library index."""
         self._emit_external(
-            component, ref, hit.path, hit.name, hit.kind, hit.nodes, "library_index"
+            component, ref, hit.path, hit.name, hit.kind, hit.nodes,
+            "library_index", getattr(hit, "device_type", ""),
         )
 
     def _emit_models(self):
@@ -3573,7 +3633,7 @@ class SpiceConverter:
                     f"{ref}: Sim.Library file not found: {sim.get('library')}"
                 )
                 continue
-            kind_in_file, _nodes = self._scan_lib(path, name)
+            kind_in_file, _nodes, _dtype = self._scan_lib(path, name)
             if kind_in_file is None:
                 problems.append(
                     f"{ref}: Sim.Name '{name}' is neither a .subckt nor a .model in "
