@@ -642,13 +642,30 @@ class Circuit(SkidlBaseObject):
     def merge_net_names(self):
         """
         Assign the same name to all segments of multi-segment nets.
-        
+
         This ensures that connected nets share a common name.
         """
 
         for net in self.nets:
             if len(net.nets) > 1:
                 net.merge_names()
+
+    def finalize_refs(self):
+        """Append a numeric suffix to explicit refs that lack one (``CO`` -> ``CO1``).
+
+        KiCad treats a reference without a trailing number as *unannotated* and
+        displays/exports it as ``CO?`` in the schematic and BOM (LLC E2E R8), so
+        refs are finalized before any netlist/schematic/XML output. Idempotent
+        (a ref already ending in a digit is untouched); ``#``-prefixed power
+        pseudo-parts are left alone; the ref setter uniquifies on collision so
+        netlist and schematic -- generated from the same finalized parts --
+        stay equivalent.
+        """
+        for part in self.parts:
+            ref = getattr(part, "ref", None) or ""
+            if not ref or ref.startswith("#") or ref[-1].isdigit():
+                continue
+            part.ref = ref + "1"
 
     def merge_nets(self):
         """
@@ -770,6 +787,7 @@ class Circuit(SkidlBaseObject):
         active_logger.reset_counters()
 
         self.merge_net_names()
+        self.finalize_refs()
 
         # Don't do any checks for empty footprints or missing tags
         # since this should be done when tool-specific netlists are generated.
@@ -865,6 +883,7 @@ class Circuit(SkidlBaseObject):
         active_logger.reset_counters()
 
         self.merge_net_names()
+        self.finalize_refs()
 
         tool = tool or skidl.config.tool
         netlist = tool_modules[tool].gen_xml(self)
@@ -1305,6 +1324,7 @@ class Circuit(SkidlBaseObject):
             skidl.empty_footprint_handler = _empty_footprint_handler
 
         self.merge_net_names()
+        self.finalize_refs()
         self.merge_nets() # Merge nets or schematic routing will fail.
 
         tool = kwargs.pop("tool", skidl.config.tool)

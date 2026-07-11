@@ -29,7 +29,7 @@ from skidl.net import NCNet
 from skidl.pckg_info import __version__
 from skidl.schematics.net_terminal import NetTerminal
 from skidl.schlib import SchLib
-from skidl.utilities import export_to_all
+from skidl.utilities import eng_value_str, export_to_all
 
 # UUID namespace — same as gen_netlist.py so UUIDs are cross-referenceable.
 _NAMESPACE_UUID = uuid.UUID("7026fcc6-e1a0-409e-aaf4-6a17ea82654f")
@@ -439,7 +439,9 @@ def _pwr_flag_to_sexp(x, y, net_name, uuid_path=None):
     enough because the coincident point is on the globally-named power net.
     """
     _flg_counter[0] += 1
-    flg_ref = f"#FLG{_flg_counter[0]:03d}"
+    # #FLG01-style, matching the skidl-eda ERC-autofix path (LLC E2E R8: one
+    # ref format for power flags however they were added).
+    flg_ref = f"#FLG{_flg_counter[0]:02d}"
     x = _round_mm(x)
     y = _round_mm(y)
     inst_uuid = _gen_uuid(f"flg:{net_name}:{x}:{y}:{_flg_counter[0]}")
@@ -683,7 +685,9 @@ def part_to_sexp(part, uuid_path, tx=Tx()):
             [
                 "property",
                 "Value",
-                str(part.value),
+                # Engineering notation for bare floats (2.2e-05 -> 22u);
+                # exact strings pass through (LLC E2E R8).
+                eng_value_str(part.value),
                 ["at", origin.x, origin.y + 2.54, angle],
                 ["effects", ["font", ["size", 1.27, 1.27]], ["justify", "left"]],
             ]

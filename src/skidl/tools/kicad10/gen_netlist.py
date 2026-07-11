@@ -14,7 +14,7 @@ from simp_sexp import Sexp
 from skidl.design_class import NetClass
 from skidl.pckg_info import __version__
 from skidl.scriptinfo import scriptinfo, get_script_dir
-from skidl.utilities import export_to_all
+from skidl.utilities import eng_value_str, export_to_all
 
 # This UUID was generated using uuidgen for passing as the namespace argument to uuid.uuid5().
 namespace_uuid = uuid.UUID("7026fcc6-e1a0-409e-aaf4-6a17ea82654f")
@@ -171,7 +171,7 @@ def gen_netlist_comp(part, **kwargs):
 
     part_name = part.name
     ref = part.ref
-    value = part.value_to_str()
+    value = eng_value_str(part.value_to_str())
     footprint = getattr(part, "footprint", "")
     description = getattr(part, "description", "")
     datasheet = getattr(part, "datasheet", "")

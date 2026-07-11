@@ -12,6 +12,7 @@ including string manipulation, list operations, file handling, and other utility
 import collections
 import hashlib
 import json
+import math
 import os
 import os.path
 from os.path import abspath, normpath, expandvars, expanduser
@@ -1288,3 +1289,46 @@ def opened(f_or_fn, mode):
             f"argument must be a filename or a file-like object (is: {type(f_or_fn)})"
         )
 
+
+
+@export_to_all
+def eng_value_str(value):
+    """Human-readable engineering notation for bare-float part values (LLC E2E R8).
+
+    ``2.2e-05`` -> ``22u``, ``1e-07`` -> ``100n``, ``0.1`` -> ``100m`` -- number
+    plus SI multiplier only, NO unit inference (KiCad convention: ``22u`` on an
+    inductor reads as 22 uH). Only values that are Python floats or *float-shaped*
+    strings (containing ``.`` or an exponent) are reformatted; every other string
+    (``"22uH"``, ``"SS3H10"``, plain integers like ``"10"``) passes through
+    verbatim, so exact user-chosen values are never rewritten.
+    """
+    if isinstance(value, str):
+        s = value.strip()
+        # Only float-SHAPED strings ('.', 'e/E' exponent) are candidates; plain
+        # integer strings ("10", "4700") are exact values, not float reprs.
+        if not re.search(r"[.eE]", s):
+            return value
+        try:
+            num = float(s)
+        except ValueError:
+            return value
+    elif isinstance(value, float):
+        num = value
+    else:
+        return str(value)
+
+    if num == 0 or not math.isfinite(num):
+        return str(value)
+    sign = "-" if num < 0 else ""
+    mag = abs(num)
+    exp3 = int(math.floor(math.log10(mag) / 3.0) * 3)
+    exp3 = max(-15, min(12, exp3))
+    suffixes = {
+        -15: "f", -12: "p", -9: "n", -6: "u", -3: "m",
+        0: "", 3: "k", 6: "M", 9: "G", 12: "T",
+    }
+    mantissa = mag / (10.0 ** exp3)
+    m_str = f"{mantissa:.4g}"
+    if "e" in m_str or "E" in m_str:  # pragma: no cover - 4g on <1000 never does
+        return str(value)
+    return f"{sign}{m_str}{suffixes[exp3]}"
