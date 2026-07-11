@@ -95,10 +95,18 @@ def _parse_file(path: str) -> List[ModelHit]:
     hits: List[ModelHit] = []
     prec = _precedence(path)
     n = len(lines)
+    depth = 0  # nesting inside .subckt/.ends -- only depth-0 defs are usable
     for i, raw in enumerate(lines):
         s = raw.strip()
         low = s.lower()
+        if low.startswith(".ends") or low == ".end":
+            depth = max(0, depth - 1)
+            continue
         if low.startswith(".subckt"):
+            top_level = depth == 0
+            depth += 1
+            if not top_level:
+                continue  # an internal helper subckt -- not instantiable directly
             toks = s.split()[1:]
             j = i + 1
             while j < n and lines[j].lstrip().startswith("+"):
@@ -120,7 +128,7 @@ def _parse_file(path: str) -> List[ModelHit]:
                 k -= 1
             header = "\n".join(reversed(header_lines))
             hits.append(ModelHit(name, path, "subckt", "", nodes, header, prec=prec))
-        elif low.startswith(".model"):
+        elif low.startswith(".model") and depth == 0:
             toks = s.split()
             if len(toks) < 2:
                 continue
