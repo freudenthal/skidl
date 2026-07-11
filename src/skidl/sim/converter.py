@@ -5,10 +5,12 @@ This module handles the translation from circuit-synth components and nets
 to SPICE netlists that can be simulated with PySpice/ngspice.
 """
 
+import hashlib
 import logging
 import math
 import os
 import re
+import shutil
 from dataclasses import dataclass
 from itertools import combinations
 from typing import Any, Dict, List, Optional
@@ -924,16 +926,61 @@ class SpiceConverter:
             pos_node[idx] = node
         return [pos_node[i] for i in sorted(pos_node)]
 
+    @staticmethod
+    def _include_cache_dir() -> str:
+        """Space-free cache for staged external libs. ngspice's ``.include`` (as
+        emitted unquoted by PySpice) truncates a path at the first space and
+        mishandles non-ASCII, so a lib living under e.g. ``Operational
+        Amplifier/`` must be staged to a clean path first."""
+        return os.path.join(
+            os.path.expanduser("~"), ".skidl", "spice_models", "_include_cache"
+        )
+
+    @staticmethod
+    def _needs_staging(path) -> bool:
+        p = str(path)
+        return any(c.isspace() for c in p) or any(ord(c) > 127 for c in p)
+
+    def _safe_lib_path(self, path) -> str:
+        """An ngspice-safe (space-free, ASCII) path for ``.include``.
+
+        When the source path has spaces / non-ASCII, copy it into the include
+        cache under a deterministic ``<stem>_<hash8><ext>`` name (same source ->
+        same staged file, so runs stay reproducible) and return that. Clean
+        paths are returned unchanged -> byte-identical emission to before.
+        Note: a staged copy breaks any *relative* ``.include``/``.lib`` inside
+        the model file; corpus files are overwhelmingly self-contained.
+        """
+        p = os.path.abspath(str(path))
+        if not self._needs_staging(p) or not os.path.exists(p):
+            return p
+        cache = self._include_cache_dir()
+        stem = re.sub(r"[^A-Za-z0-9._-]", "_", os.path.basename(p))
+        root, ext = os.path.splitext(stem)
+        digest = hashlib.sha1(p.encode("utf-8", "replace")).hexdigest()[:8]
+        staged = os.path.join(cache, f"{root}_{digest}{ext or '.lib'}")
+        try:
+            if not os.path.exists(staged) or (
+                os.path.getmtime(staged) < os.path.getmtime(p)
+            ):
+                os.makedirs(cache, exist_ok=True)
+                shutil.copyfile(p, staged)
+            return staged
+        except OSError as exc:  # pragma: no cover - filesystem specifics
+            logger.warning(f"Could not stage SPICE lib {p} to space-free cache: {exc}")
+            return p
+
     def _include_lib(self, path) -> None:
         """`.include` an external file once (idempotent per converter)."""
         if not path or path in self.included_libs:
             return
         self.included_libs.add(path)
+        safe = self._safe_lib_path(path)
         try:
-            self.spice_circuit.include(path)
-            logger.debug(f"Included SPICE library {path}")
+            self.spice_circuit.include(safe)
+            logger.debug(f"Included SPICE library {safe}")
         except Exception as exc:  # pragma: no cover - PySpice/ngspice specifics
-            logger.warning(f"Failed to include SPICE library {path}: {exc}")
+            logger.warning(f"Failed to include SPICE library {safe}: {exc}")
 
     def _add_external_model(self, component, ref) -> None:
         """Attach a device's external vendor model (Sim.Library + Sim.Name)."""

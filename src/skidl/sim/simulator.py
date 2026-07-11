@@ -9,10 +9,19 @@ import logging
 import os
 import platform
 import re
+import shutil
 from typing import Dict, List, Optional, Tuple, Union
 
 # Configure logging
 logger = logging.getLogger(__name__)
+
+# ngspice codemodel (.cm) source dir, discovered from KiCad's bundled ngspice.
+# KiCad ships analog.cm / spice2poly.cm / ... but no ``spinit``, so ngspice loads
+# NONE of them by default -- which breaks every vendor macromodel that uses a
+# PSpice ``POLY(n)`` controlled source (they route through spice2poly.cm's XSPICE
+# codemodel). We load them explicitly, once per process, on the shared instance.
+_NGSPICE_CM_DIR = None
+_CODEMODELS_LOADED = False
 
 try:
     import PySpice
@@ -66,6 +75,7 @@ try:
                 _cm_dir = _ver_dir / "lib" / "ngspice"
                 if _cm_dir.is_dir():
                     os.environ.setdefault("SPICE_LIB_DIR", str(_cm_dir))
+                    _NGSPICE_CM_DIR = str(_cm_dir)
                 logger.debug(f"Set ngspice library path: {_dll}")
                 break
 
@@ -103,6 +113,57 @@ try:
 except ImportError as e:
     PYSPICE_AVAILABLE = False
     logger.warning(f"PySpice not available: {e}")
+
+
+# Codemodels to load, in a safe order (spice2poly first so POLY translation is
+# available). Only those actually present in the codemodel dir are loaded.
+_CODEMODEL_FILES = (
+    "spice2poly.cm",
+    "analog.cm",
+    "digital.cm",
+    "xtradev.cm",
+    "xtraevt.cm",
+    "table.cm",
+    "tlines.cm",
+)
+
+
+def _ensure_codemodels(shared) -> None:
+    """Load KiCad's bundled ngspice codemodels onto ``shared`` once per process.
+
+    KiCad ships the ``.cm`` files but no ``spinit`` to load them, so vendor
+    macromodels using PSpice ``POLY(n)`` sources fail with ``unable to find
+    definition of model a$poly$...`` until ``spice2poly.cm`` is loaded. The
+    ngspice ``codemodel`` command mangles paths containing spaces (KiCad lives
+    under ``Program Files``), so we stage the ``.cm`` files into a space-free
+    cache and load them with forward-slash paths. No-op off Windows / when the
+    codemodel dir wasn't found / after the first successful call.
+    """
+    global _CODEMODELS_LOADED
+    if _CODEMODELS_LOADED or not _NGSPICE_CM_DIR:
+        return
+    _CODEMODELS_LOADED = True  # attempt once regardless of per-file outcome
+    cache = os.path.join(
+        os.path.expanduser("~"), ".skidl", "spice_models", "_ngspice_cm"
+    )
+    loaded = []
+    for cm in _CODEMODEL_FILES:
+        src = os.path.join(_NGSPICE_CM_DIR, cm)
+        if not os.path.exists(src):
+            continue
+        try:
+            dst = os.path.join(cache, cm)
+            if not os.path.exists(dst) or (
+                os.path.getmtime(dst) < os.path.getmtime(src)
+            ):
+                os.makedirs(cache, exist_ok=True)
+                shutil.copyfile(src, dst)
+            shared.exec_command(f"codemodel {dst.replace(os.sep, '/')}")
+            loaded.append(cm)
+        except Exception as exc:  # a single bad codemodel must not kill the sim
+            logger.debug(f"Could not load ngspice codemodel {cm}: {exc}")
+    if loaded:
+        logger.debug(f"Loaded ngspice codemodels: {', '.join(loaded)}")
 
 
 class SimulationResult:
@@ -654,6 +715,9 @@ class CircuitSimulator:
         # Otherwise use the legacy call unchanged, so default sims are unaffected.
         if compat or CircuitSimulator._ngbehavior_set:
             shared = NgSpiceShared.new_instance()
+            # Ensure codemodels (esp. spice2poly.cm) are loaded so vendor POLY
+            # macromodels parse. Once-per-process; no-op when unavailable.
+            _ensure_codemodels(shared)
             if compat:
                 shared.exec_command(f"set ngbehavior={compat}")
                 CircuitSimulator._ngbehavior_set = True
