@@ -277,7 +277,12 @@ class SkidlBaseObject(object):
         if getattr(self, "tag", None):
             return True
         else:
-            active_logger.bare_warning(
+            # DEBUG, not WARNING (LLC E2E R10): the uuid5 fallback below is the
+            # designed, deterministic path for untagged parts — verified drift-
+            # free by double-generate byte-diffs — so there is no user action to
+            # take. An explicit tag= still matters for rename-stable PCB
+            # association (docstring above), which is DEBUG-level advice.
+            active_logger.debug(
                 f"Missing tag on {self.name} instantiated at {self.src_line(True)}."
             )
             if create_if_missing:
@@ -297,7 +302,7 @@ class SkidlBaseObject(object):
                     )
                 seed = ":".join(("skidl.tag",) + hiertuple + (str(ident),))
                 self.tag = uuid.uuid5(_TAG_NAMESPACE, seed).hex[:10]
-                active_logger.bare_warning(
+                active_logger.debug(
                     f"Derived tag {self.tag} generated for {self.name}."
                 )
             return False
