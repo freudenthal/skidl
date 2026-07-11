@@ -134,6 +134,36 @@ def test_sim_only_part_missing_footprint_is_not_an_error(tmp_path, skidl_log):
     assert any("sim-only" in m and "VDC" in m for m in warns), warns
 
 
+def test_sim_modeled_part_missing_footprint_is_a_warning(tmp_path, skidl_log):
+    """A Device part carrying Sim.* modeling fields (a transformer with
+    Sim_Params) but no footprint logs a warning, not a red ERROR (C8) -- while a
+    plain footprint-less Device R stays an error."""
+    import builtins
+
+    import skidl as skidl_pkg
+    from skidl.part import default_empty_footprint_handler
+
+    _setup()
+    t1 = Part("Device", "Transformer_1P_SS", ref="T1")  # no footprint
+    t1.Sim_Params = "lp=0.5 n=0.1"
+    r1 = Part("Device", "R", ref="R1", value="1k")  # no footprint, not sim-modeled
+    Net("A").connect(t1["1"], r1[1])
+    Net("0").connect(t1["2"], r1[2])
+    saved_handler = skidl_pkg.empty_footprint_handler
+    skidl_pkg.empty_footprint_handler = default_empty_footprint_handler
+    try:
+        builtins.default_circuit.generate_netlist(
+            tool=KICAD10, file_=str(tmp_path / "t.net")
+        )
+    finally:
+        skidl_pkg.empty_footprint_handler = saved_handler
+    msgs = [r.getMessage() for r in skidl_log.records]
+    # transformer -> warning naming it sim-modeled
+    assert any("sim-modeled" in m and "T1" in m for m in msgs), msgs
+    # plain R -> still a bare error
+    assert active_logger.bare_error.count >= 1
+
+
 # --- R6: lazy symbol-dir warning ---------------------------------------------
 
 

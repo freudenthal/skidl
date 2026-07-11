@@ -595,3 +595,30 @@ def test_sim_stack_imports_without_circuit_synth():
     assert (
         r.returncode == 0 and "OK" in r.stdout
     ), f"standalone import failed:\nstdout={r.stdout}\nstderr={r.stderr[-800:]}"
+
+
+@requires_sim
+def test_get_current_on_inductor_resolves_l_branch():
+    """get_current on an inductor resolves the "l"+ref branch (an inductor LCH
+    is ngspice branch "llch"), returning ~V/R at steady state -- not a fabricated
+    0.0 from a loose suffix match (C7). A bogus ref raises KeyError."""
+    _setup()
+    v = Part("Simulation_SPICE", "VDC", ref="V1", value="5")
+    r = Part("Device", "R", ref="R1", value="10")
+    l = Part("Device", "L", ref="LCH", value="1m")
+    Net("VIN").connect(v[1], r[1])
+    Net("MID").connect(r[2], l[1])
+    Net("0").connect(v[2], l[2])
+    from skidl.sim import simulate
+
+    try:
+        an = simulate().transient_analysis(
+            step_time=1e-6, end_time=2e-3, max_time=1e-5
+        )
+    except Exception as e:
+        pytest.skip(f"ngspice not available: {type(e).__name__}: {str(e)[:80]}")
+    il = an.get_current("LCH")
+    final = il[-1] if hasattr(il, "__len__") else il
+    assert abs(final - 0.5) < 0.05, final  # V/R = 5/10 = 0.5 A at steady state
+    with pytest.raises(KeyError):
+        an.get_current("NOSUCHREF")

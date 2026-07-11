@@ -649,6 +649,10 @@ def part_to_sexp(part, uuid_path, tx=Tx()):
     # tripped kicad-sch-api's validator (B1/B2). Emit the parent's base ref instead.
     base_ref = getattr(getattr(part, "parent", None), "ref", None) or part.ref
 
+    # Honor Part(in_bom=False) so a model-only element (e.g. an HV self-cap that
+    # exists purely for the sim) can be kept out of the exported BOM (C9).
+    in_bom = "yes" if getattr(part, "in_bom", True) else "no"
+
     symbol_list = [
         "symbol",
         ["lib_id", lib_id],
@@ -656,7 +660,7 @@ def part_to_sexp(part, uuid_path, tx=Tx()):
         mirror,
         ["unit", unit_num],
         ["exclude_from_sim", "no"],
-        ["in_bom", "yes"],
+        ["in_bom", in_bom],
         ["on_board", "yes"],
         ["dnp", "no"],
         ["fields_autoplaced", "yes"],

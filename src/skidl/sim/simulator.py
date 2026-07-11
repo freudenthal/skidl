@@ -231,9 +231,13 @@ class SimulationResult:
         # Fallback: match against the branch-current table.
         branches = getattr(self.analysis, "branches", None) or {}
         low = component.lower()
-        # <ref>, <ref>.lower(), then PySpice's v-prefixed voltage-source branch
-        # name; finally any branch key ending with the ref (defensive).
-        candidates = [component, low, "v" + low]
+        # <ref>, <ref>.lower(), then PySpice's element-letter-prefixed branch
+        # names: "v"+ref for a voltage source, "l"+ref for an inductor (an
+        # inductor "LCH" is branch "llch"). Both explicit forms come BEFORE the
+        # loose endswith scan so a real inductor branch is preferred over an
+        # unrelated key that merely ends in the same suffix (C7). Finally any
+        # branch key ending with the ref (defensive).
+        candidates = [component, low, "v" + low, "l" + low]
         key = next((c for c in candidates if c in branches), None)
         if key is None:
             key = next((k for k in branches if k.endswith(low)), None)

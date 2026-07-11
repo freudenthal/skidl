@@ -266,6 +266,42 @@ def test_kicad10_multiunit_shares_base_reference(tmp_path):
 
 
 @requires_kicad10
+def test_kicad10_in_bom_false_renders_no(tmp_path):
+    """Part(in_bom=False) renders (in_bom "no") on the placed symbol instance so
+    a model-only element can be kept out of the exported BOM (C9); a default
+    part stays (in_bom "yes")."""
+    from skidl import Net, Part, generate_schematic
+
+    set_default_tool(KICAD10)
+    lib_search_paths["kicad10"] = ["."] + __import__(
+        "skidl.tools.kicad10.lib", fromlist=["default_lib_paths"]
+    ).default_lib_paths()
+    import builtins
+
+    builtins.default_circuit.mini_reset()
+    r1 = Part("Device", "R", ref="R1", value="10k",
+              footprint="Resistor_SMD:R_0805_2012Metric")
+    c1 = Part("Device", "C", ref="CHV1", value="12p", in_bom=False,
+              footprint="Capacitor_SMD:C_0805_2012Metric")
+    Net("A").connect(r1[1], c1[1])
+    Net("0").connect(r1[2], c1[2])
+
+    out = tmp_path / "bom"
+    out.mkdir()
+    generate_schematic(tool=KICAD10, filepath=str(out), top_name="bom")
+    text = sorted(out.glob("*.kicad_sch"))[0].read_text(encoding="utf-8")
+    # Placed symbol blocks: the one holding CHV1's Reference must carry
+    # (in_bom no); the R1 block keeps (in_bom yes). (KiCad serializes the flag
+    # as an unquoted token.)
+    blocks = text.split("(symbol")
+    chv = [b for b in blocks if '"CHV1"' in b and "lib_id" in b]
+    assert chv, "CHV1 symbol instance not found"
+    assert any("(in_bom no)" in b for b in chv), "CHV1 not marked in_bom no"
+    r_blocks = [b for b in blocks if '"R1"' in b and "lib_id" in b]
+    assert r_blocks and all("(in_bom yes)" in b for b in r_blocks), "R1 not in_bom yes"
+
+
+@requires_kicad10
 def test_kicad10_schematic_passes_save_gate(tmp_path):
     """A KICAD10-generated schematic (stamp 20230409) passes the hardened save
     gate — KiCad 10 upgrades the file on load without a save-crash."""
