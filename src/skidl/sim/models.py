@@ -10,6 +10,16 @@ Models are sourced from:
 
 The models are organized by component type and can be used directly in simulations
 or customized for specific requirements.
+
+Diode fallback honesty: a diode whose model name is NOT in this library and that
+carries ``Sim.Params`` degrades to a *generic* seed model plus the overrides. That
+seed is **silicon** (``DefaultDiode``) unless the part is identified as a Schottky
+-- via ``Sim.Device="SCHOTTKY"``, a ``value="schottky"`` keyword, or a well-known
+Schottky family prefix (SS/STPS/PMEG/MBR/SK/SB/B2xx/B3xx). A silicon seed on a
+Schottky is silently wrong (Vf ~0.7 V vs ~0.4 V), so give unknown Schottkys the
+hint or fit EG/IS/N explicitly. ``DefaultSchottky`` is a generic with **BV=40 V**;
+above ~40 V PIV use a curated HV entry (SS3H10/SS310 100 V, STPS3150 150 V) or
+override BV.
 """
 
 import logging
@@ -123,6 +133,64 @@ class ModelLibrary:
             },
             description="1 A 40 V through-hole Schottky rectifier",
             manufacturer="Various",
+        )
+
+        # >=100 V Schottky rectifiers -- the LLC / offline-PSU secondary band.
+        # Without these, any rectifier above ~40 V PIV silently reverse-breaks
+        # if fit against the SS14/1N5819 entries (LLC E2E finding R1).
+        self.models["SS3H10"] = SpiceModel(
+            name="SS3H10",
+            model_type="D",
+            parameters={
+                "IS": 1.8e-6,  # Saturation current
+                "RS": 0.041,  # Series resistance (Vf ~0.85 V @ 3 A)
+                "N": 1.08,  # Emission coefficient
+                "CJO": 300e-12,  # Zero-bias junction capacitance
+                "M": 0.54,  # Grading coefficient
+                "VJ": 0.61,  # Junction potential
+                "BV": 100,  # Reverse breakdown voltage
+                "IBV": 1e-4,  # Current at breakdown
+                "EG": 0.69,  # Bandgap (Schottky barrier)
+                "XTI": 2,  # Saturation-current temp exponent
+            },
+            description="3 A 100 V SMA Schottky rectifier",
+            manufacturer="Vishay",
+        )
+
+        self.models["SS310"] = SpiceModel(
+            name="SS310",
+            model_type="D",
+            parameters={
+                "IS": 1.4e-6,
+                "RS": 0.035,
+                "N": 1.06,
+                "CJO": 250e-12,
+                "M": 0.5,
+                "BV": 100,
+                "IBV": 1e-4,
+                "EG": 0.69,
+                "XTI": 2,
+            },
+            description="3 A 100 V SMA Schottky rectifier (SS14 family)",
+            manufacturer="Various",
+        )
+
+        self.models["STPS3150"] = SpiceModel(
+            name="STPS3150",
+            model_type="D",
+            parameters={
+                "IS": 6e-7,
+                "RS": 0.06,
+                "N": 1.1,
+                "CJO": 170e-12,
+                "M": 0.45,
+                "BV": 150,
+                "IBV": 1e-4,
+                "EG": 0.69,
+                "XTI": 2,
+            },
+            description="3 A 150 V Schottky rectifier",
+            manufacturer="STMicroelectronics",
         )
 
         self.models["LED_Red"] = SpiceModel(

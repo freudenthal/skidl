@@ -68,9 +68,21 @@ class SpiceConverter:
     # ``_emit_models``). Params are deliberately generic (textbook silicon values).
     GENERIC_MODELS = {
         "DefaultDiode": ("D", {"IS": 1e-14, "RS": 0.1, "N": 1.0, "CJO": 2e-12}),
+        # Generic Schottky: BV=40 V (a generic, NOT a rating -- above ~40 V PIV
+        # use a curated HV entry like SS3H10/STPS3150 or override BV). EG/XTI
+        # make derived cards seeded from it temperature-honest Schottkys.
         "DefaultSchottky": (
             "D",
-            {"IS": 1e-6, "RS": 0.05, "N": 1.05, "CJO": 100e-12, "BV": 40, "IBV": 1e-3},
+            {
+                "IS": 1e-6,
+                "RS": 0.05,
+                "N": 1.05,
+                "CJO": 100e-12,
+                "BV": 40,
+                "IBV": 1e-3,
+                "EG": 0.69,
+                "XTI": 2,
+            },
         ),
         "DefaultNPN": ("NPN", {"BF": 100, "IS": 1e-14, "VAF": 100}),
         "DefaultPNP": ("PNP", {"BF": 100, "IS": 1e-14, "VAF": 100}),
@@ -101,7 +113,16 @@ class SpiceConverter:
         "pmos": "DefaultPMOS",
         "powernmos": "DefaultPowerNMOS",
         "diode": "DefaultDiode",
+        "schottky": "DefaultSchottky",
     }
+
+    # Well-known Schottky part-number family prefixes (prefix + digit). Used ONLY
+    # to pick which generic seeds the Sim.Params fallback for an unknown diode
+    # name -- never to invent a datasheet fit. A silicon seed on a Schottky is
+    # silently wrong (Vf ~0.7 V vs ~0.4 V; LLC E2E finding R2).
+    _SCHOTTKY_PREFIX_RE = re.compile(
+        r"^(?:SS|STPS|PMEG|MBR|SK|SB|B[23])\d", re.IGNORECASE
+    )
 
     def __init__(self, circuit_synth_circuit):
         self.circuit = circuit_synth_circuit
@@ -362,6 +383,7 @@ class SpiceConverter:
         "C": "capacitor",
         "L": "inductor",
         "D": "diode",
+        "SCHOTTKY": "diode",
         "NPN": "bjt",
         "PNP": "bjt",
         "NMOS": "mosfet",
@@ -545,7 +567,7 @@ class SpiceConverter:
         if value:
             return str(value)
         if kind == "diode":
-            return "DefaultDiode"
+            return "DefaultSchottky" if device == "schottky" else "DefaultDiode"
         if kind == "bjt":
             return (
                 "DefaultPNP" if ("pnp" in symbol or device == "pnp") else "DefaultNPN"
@@ -553,6 +575,21 @@ class SpiceConverter:
         return (
             "DefaultPMOS" if ("pmos" in symbol or device == "pmos") else "DefaultNMOS"
         )
+
+    def _diode_fallback_generic(self, component, base) -> str:
+        """Which generic seeds an unknown diode's Sim.Params fallback.
+
+        ``DefaultSchottky`` when the part is identified as a Schottky -- an
+        explicit ``Sim.Device="SCHOTTKY"`` hint, or a well-known Schottky family
+        prefix on the model name (classification only; the datasheet fit still
+        comes from the user's overrides). Silicon ``DefaultDiode`` otherwise.
+        """
+        device = str(self._sim_props(component).get("device", "")).strip().lower()
+        if device == "schottky":
+            return "DefaultSchottky"
+        if base and self._SCHOTTKY_PREFIX_RE.match(str(base).strip()):
+            return "DefaultSchottky"
+        return "DefaultDiode"
 
     @staticmethod
     def _parse_sim_params(spec) -> dict:
@@ -668,6 +705,8 @@ class SpiceConverter:
             # overrides this stays a hard, loud validation error (below).
             if overrides and kind in self._KIND_GENERIC:
                 generic = self._KIND_GENERIC[kind]
+                if kind == "diode":
+                    generic = self._diode_fallback_generic(component, base)
                 device_type, gparams = self.GENERIC_MODELS[generic]
                 merged = dict(gparams)
                 for key, val in overrides.items():
@@ -677,9 +716,21 @@ class SpiceConverter:
                 self.model_provenance[ref] = ResolvedModel(
                     ref, kind, "generic", f"{base}->{generic}", overridden=True
                 )
+                # The seed choice (silicon vs Schottky) and the effective reverse
+                # rating must never be silent -- a silicon seed on a Schottky, or
+                # a BV=40 generic at PSU PIV, is the silently-wrong class the LLC
+                # E2E hit (R1/R2).
+                extra = ""
+                if device_type == "D":
+                    bv = merged.get("BV")
+                    extra = (
+                        f", effective BV={self._coerce_param(bv)} V"
+                        if bv is not None
+                        else ", no BV (reverse breakdown not modeled)"
+                    )
                 logger.warning(
                     f"{ref}: model '{base}' not in library; simulating as "
-                    f"{generic} + Sim.Params overrides (tier=generic)"
+                    f"{generic} + Sim.Params overrides (tier=generic{extra})"
                 )
                 return derived
             self.model_provenance[ref] = ResolvedModel(ref, kind, "unresolved", base)

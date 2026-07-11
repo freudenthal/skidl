@@ -341,6 +341,141 @@ def test_alias_sim_params_override_still_wins():
     assert any(name.startswith("1N4148W_") for name in conv.derived_models)
 
 
+# --- HV Schottky models + Schottky-aware fallback (LLC E2E R1/R2) ---------
+
+
+@requires_sim
+def test_hv_schottky_models_resolve_datasheet_fit():
+    """SS3H10 / STPS3150 / SS310 resolve as datasheet_fit with BV >= 100 -- the
+    R1 gap (no >=100 V Schottky meant LLC rectifiers silently reverse-broke)."""
+    _setup()
+    for name, bv in (("SS3H10", 100), ("STPS3150", 150), ("SS310", 100)):
+        conv = SpiceConverter(skidl_flat_view())
+        spec, tier, resolved = conv._lookup_model_spec(name, "diode")
+        assert spec is not None and tier == "datasheet_fit", name
+        device_type, params = spec
+        assert device_type == "D" and params["BV"] >= bv, (name, params)
+        assert params.get("EG") == 0.69, name  # a real Schottky fit
+
+
+@requires_sim
+def test_ss3h10_diode_converts_with_provenance():
+    """A diode with plain value='SS3H10' (no Sim.Params) converts datasheet_fit
+    and its .model card carries BV=100 -- the R1 fix's user-facing contract."""
+    _setup()
+    d = Part("Device", "D", value="SS3H10", ref="D1")
+    Net("A").connect(d["A"])
+    Net("K").connect(d["K"])
+    conv = SpiceConverter(skidl_flat_view())
+    netlist = str(conv.convert(strict=False))
+    prov = conv.model_provenance["D1"]
+    assert prov.tier == "datasheet_fit" and prov.name == "SS3H10"
+    assert "SS3H10" in conv.library_models
+    assert conv.library_models["SS3H10"][1]["BV"] == 100
+    assert "SS3H10" in netlist
+
+
+@requires_sim
+def test_schottky_keyword_selects_generic():
+    """value='schottky' is a type hint -> DefaultSchottky (mirrors 'diode')."""
+    _setup()
+    d = Part("Device", "D", value="schottky", ref="D1")
+    Net("A").connect(d["A"])
+    Net("K").connect(d["K"])
+    conv = SpiceConverter(skidl_flat_view())
+    conv.convert(strict=False)
+    assert conv.model_provenance["D1"].name == "DefaultSchottky"
+    assert conv.model_provenance["D1"].tier == "generic"
+
+
+@requires_sim
+def test_sim_device_schottky_hint_seeds_fallback(caplog):
+    """Unknown diode name + Sim.Params + Sim.Device='SCHOTTKY' seeds the derived
+    card from DefaultSchottky (EG=0.69 present), provenance recorded, and the
+    fallback warning names the seed + effective BV (R2: never silently silicon)."""
+    import logging as _logging
+
+    _setup()
+    d = Part("Device", "D", value="XYZ999", ref="D1")
+    d.Sim_Device = "SCHOTTKY"
+    d.Sim_Params = "BV=100 IBV=1e-4"
+    Net("A").connect(d["A"])
+    Net("K").connect(d["K"])
+    conv = SpiceConverter(skidl_flat_view())
+    with caplog.at_level(_logging.WARNING, logger="skidl.sim.converter"):
+        conv.convert(strict=False)
+    prov = conv.model_provenance["D1"]
+    assert prov.tier == "generic" and prov.name == "XYZ999->DefaultSchottky"
+    card = conv.derived_models["DefaultSchottky_D1"]
+    assert card[0] == "D" and card[1]["EG"] == 0.69 and card[1]["BV"] == 100
+    warn = next(r for r in caplog.records if "not in library" in r.message)
+    assert "DefaultSchottky" in warn.message and "BV=100" in warn.message
+
+
+@requires_sim
+def test_schottky_prefix_table_seeds_fallback():
+    """Unknown 'PMEG10020' + Sim.Params (no hint) -> the family-prefix table
+    seeds DefaultSchottky; a no-prefix unknown ('XYZ999') stays silicon."""
+    _setup()
+    d1 = Part("Device", "D", value="PMEG10020", ref="D1")
+    d1.Sim_Params = "BV=100"
+    d2 = Part("Device", "D", value="XYZ999", ref="D2")
+    d2.Sim_Params = "IS=1e-12"
+    Net("A").connect(d1["A"], d2["A"])
+    Net("K").connect(d1["K"], d2["K"])
+    conv = SpiceConverter(skidl_flat_view())
+    conv.convert(strict=False)
+    assert conv.model_provenance["D1"].name == "PMEG10020->DefaultSchottky"
+    assert conv.model_provenance["D2"].name == "XYZ999->DefaultDiode"
+
+
+@requires_sim
+def test_unknown_diode_without_overrides_still_hard_error():
+    """No Sim.Params -> the unknown name stays a loud validation error; the
+    Schottky-aware fallback must not have widened the silent path."""
+    from skidl.sim.converter import SimulationValidationError
+
+    _setup()
+    d = Part("Device", "D", value="SS999", ref="D1")
+    d.Sim_Device = "SCHOTTKY"
+    Net("A").connect(d["A"])
+    Net("K").connect(d["K"])
+    with pytest.raises(SimulationValidationError):
+        SpiceConverter(skidl_flat_view()).convert(strict=True)
+
+
+def _reverse_bias_node(diode_value, volts):
+    """Live helper: <volts> V reverse across a diode behind 100 ohm; returns the
+    cathode-node voltage. ~volts = blocking; ~BV = breakdown conduction."""
+    _setup()
+    v1 = Part("Simulation_SPICE", "VDC", value=str(volts))
+    r1 = Part("Device", "R", value="100")
+    d1 = Part("Device", "D", value=diode_value, ref="D1")
+    Net("VS").connect(v1[1], r1[1])
+    Net("KN").connect(r1[2], d1["K"])  # reverse: cathode to the + side
+    Net("0").connect(v1[2], d1["A"])
+    spice = SpiceConverter(skidl_flat_view()).convert(strict=True)
+    import skidl.sim.simulator  # noqa: F401
+
+    an = spice.simulator().operating_point()
+    return float(an["KN"][0])
+
+
+@requires_sim
+def test_hv_schottky_blocks_llc_piv_where_ss14_breaks_down():
+    """Live (the R1 repro, both directions): at the LLC's ~82 V PIV an SS3H10
+    (BV=100) blocks -- node holds ~82 V, leakage-only -- while an SS14 (BV=40)
+    conducts in reverse breakdown (node clamps toward ~40 V). The >40 V misuse
+    must at least SIMULATE the breakdown; physics honesty, not a lint."""
+    try:
+        kn_hv = _reverse_bias_node("SS3H10", 82)
+        kn_lv = _reverse_bias_node("SS14", 82)
+    except Exception as e:
+        pytest.skip(f"ngspice not available: {type(e).__name__}: {str(e)[:80]}")
+    assert kn_hv > 81.0, f"SS3H10 should block 82 V, node={kn_hv}"
+    assert kn_lv < 50.0, f"SS14 must show breakdown at 82 V PIV, node={kn_lv}"
+
+
 # --- live simulation (ngspice) --------------------------------------------
 
 
