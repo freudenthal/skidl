@@ -42,7 +42,12 @@ def default_lib_paths():
     try:
         paths.append(os.environ[f"KICAD{kicad_version}_SYMBOL_DIR"])
     except KeyError:
-        active_logger.warning(
+        # Import-time noise fix (LLC E2E R6): every kicadN backend runs this
+        # at import (config_ builds lib_search_paths for ALL_TOOLS), but only
+        # one backend is ever used -- so stay quiet (DEBUG) here. load_sch_lib
+        # re-emits this loudly if THIS backend is actually asked to load a
+        # library it cannot find while the env var is still unset.
+        active_logger.debug(
             f"KICAD{kicad_version}_SYMBOL_DIR environment variable is missing, so the default KiCad symbol libraries won't be searched."
         )
 
@@ -108,6 +113,15 @@ def load_sch_lib(lib, filename=None, lib_search_paths_=None, lib_section=None):
             # Break from the loop once a library file is successfully opened.
             break
     if not f:
+        # Lazy re-emit of the symbol-dir warning (DEBUG-only at import; see
+        # default_lib_paths): this backend was actually asked for a library
+        # it cannot find and the default-symbol-dir env var is still unset.
+        if "KICAD8_SYMBOL_DIR" not in os.environ:
+            active_logger.warning(
+                "KICAD8_SYMBOL_DIR environment variable is missing, so the "
+                "default KiCad symbol libraries were not searched "
+                f"while looking for {filename}."
+            )
         raise FileNotFoundError(
             f"Unable to open KiCad Schematic Library File {filename}"
         )

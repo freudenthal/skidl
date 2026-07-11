@@ -695,8 +695,7 @@ class Circuit(SkidlBaseObject):
         active_logger.push(erc_logger)
 
         # Reset the counters to clear any warnings/errors from previous ERC run.
-        active_logger.error.reset()
-        active_logger.warning.reset()
+        active_logger.reset_counters()
 
         self.merge_net_names()
 
@@ -768,8 +767,7 @@ class Circuit(SkidlBaseObject):
         from .tools import tool_modules
 
         # Reset the counters to clear any warnings/errors from previous run.
-        active_logger.error.reset()
-        active_logger.warning.reset()
+        active_logger.reset_counters()
 
         self.merge_net_names()
 
@@ -821,8 +819,7 @@ class Circuit(SkidlBaseObject):
         from .tools import tool_modules
 
         # Reset the counters to clear any warnings/errors from previous run.
-        active_logger.error.reset()
-        active_logger.warning.reset()
+        active_logger.reset_counters()
 
         self.merge_net_names()
 
@@ -865,8 +862,7 @@ class Circuit(SkidlBaseObject):
         from .tools import tool_modules
 
         # Reset the counters to clear any warnings/errors from previous run.
-        active_logger.error.reset()
-        active_logger.warning.reset()
+        active_logger.reset_counters()
 
         self.merge_net_names()
 
@@ -1106,8 +1102,7 @@ class Circuit(SkidlBaseObject):
         """
 
         # Reset the counters to clear any warnings/errors from previous run.
-        active_logger.error.reset()
-        active_logger.warning.reset()
+        active_logger.reset_counters()
 
         self.merge_net_names()
 
@@ -1289,8 +1284,7 @@ class Circuit(SkidlBaseObject):
         from .tools import tool_modules
 
         # Reset the counters to clear any warnings/errors from previous run.
-        active_logger.error.reset()
-        active_logger.warning.reset()
+        active_logger.reset_counters()
 
         # Supply a schematic-specific empty footprint handler.
         save_empty_footprint_handler = skidl.empty_footprint_handler
@@ -1358,8 +1352,7 @@ class Circuit(SkidlBaseObject):
         """
 
         # Reset the counters to clear any warnings/errors from previous run.
-        active_logger.error.reset()
-        active_logger.warning.reset()
+        active_logger.reset_counters()
 
         self.merge_net_names()
 

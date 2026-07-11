@@ -288,21 +288,40 @@ class SkidlLogger(logging.getLoggerClass()):
         self.error(msg)
         raise exc_class(msg)
 
+    def reset_counters(self):
+        """Reset ALL error/warning counters (including the bare_* variants).
+
+        The per-phase resets used to clear only ``error``/``warning``, so
+        ``bare_error``/``bare_warning`` counts leaked across phases and each
+        later phase re-reported the earlier phase's totals (LLC E2E R4: the
+        same "4 errors" printed for both netlist and schematic generation).
+        """
+        for counter in (self.error, self.warning, self.bare_error, self.bare_warning):
+            counter.reset()
+
     def report_summary(self, phase_desc):
         """
         Report a summary of logged errors and warnings.
-        
+
+        Self-describing (LLC E2E R4): these are counts of SKiDL *log records*
+        for this phase -- independent of any external ERC gate (e.g. the
+        kicad-cli ERC a harness may run) -- so a nonzero count printed beside a
+        clean gate result is not a contradiction. Silent when nothing was
+        logged; the error summary is emitted at WARNING so a nonzero count is
+        visible without implying the phase failed.
+
         Args:
             phase_desc (str): Description of the phase being summarized (e.g., "generating netlist").
         """
-        if (self.error.count, self.warning.count, self.bare_error.count, self.bare_warning.count) == (0, 0, 0, 0):
-            self.summary(f"No errors or warnings found while {phase_desc}.\n")
-        else:
-            self.summary(
-                f"{active_logger.warning.count + active_logger.bare_warning.count} warnings found while {phase_desc}."
-            )
-            self.summary(
-                f"{active_logger.error.count + active_logger.bare_error.count} errors found while {phase_desc}.\n"
+        n_warn = self.warning.count + self.bare_warning.count
+        n_err = self.error.count + self.bare_error.count
+        detail = "see the .log/.erc file; independent of any external ERC gate"
+        if n_warn:
+            self.summary(f"{n_warn} SKiDL log warnings while {phase_desc} ({detail}).")
+        if n_err:
+            # Plain Logger.warning: don't add trace or bump the warning counter.
+            logging.Logger.warning(
+                self, f"{n_err} SKiDL log errors while {phase_desc} ({detail})."
             )
 
 

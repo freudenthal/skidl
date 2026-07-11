@@ -235,7 +235,7 @@ class SpiceConverter:
                 "be treated as one SPICE node -- rename them to disambiguate.",
                 sorted(set(name_collisions)),
             )
-        logger.info(
+        logger.debug(
             "Flattened hierarchy for simulation: %d component(s), %d net(s)",
             len(components),
             len(nets),
@@ -468,7 +468,7 @@ class SpiceConverter:
         value = getattr(component, "value", None)
 
         if self._sim_excluded(component):
-            logger.info(f"{ref}: excluded from simulation (Sim.Enable=0)")
+            logger.debug(f"{ref}: excluded from simulation (Sim.Enable=0)")
             return
 
         # An external vendor model (Sim.Library) supersedes the built-in handlers:
@@ -741,11 +741,11 @@ class SpiceConverter:
             ref, kind, tier, prov_name, overridden=bool(overrides)
         )
         if resolved != base:
-            logger.info(
+            logger.debug(
                 f"{ref}: model '{base}' aliased to library die '{resolved}' "
                 f"(package-suffix), tier={tier}"
             )
-        logger.info(
+        logger.debug(
             f"{ref} ({prov_name}): model tier={tier}"
             + (" (+Sim.Params override)" if overrides else "")
         )
@@ -983,7 +983,7 @@ class SpiceConverter:
             self.model_provenance[ref] = ResolvedModel(
                 ref, dev_kind or "subckt", "vendor_lib", name, source=source
             )
-            logger.info(f"{ref}: external subckt {name} from {base} ({source})")
+            logger.debug(f"{ref}: external subckt {name} from {base} ({source})")
         elif kind_in_file == "model":
             nodes = self._get_component_nodes(component)
             self._emit_primitive_with_external_model(
@@ -992,7 +992,7 @@ class SpiceConverter:
             self.model_provenance[ref] = ResolvedModel(
                 ref, dev_kind or "?", "vendor_lib", name, source=source
             )
-            logger.info(f"{ref}: external .model {name} from {base} ({source})")
+            logger.debug(f"{ref}: external .model {name} from {base} ({source})")
         else:
             # validate() reports this in strict mode; lenient mode just skips.
             logger.warning(f"{ref}: no usable model found in {path} - skipping")
@@ -1074,13 +1074,23 @@ class SpiceConverter:
             self.spice_circuit.model(name, device_type, **params)
             logger.debug(f"Emitted derived .model {name} {device_type}")
 
-        # One honest summary line: which fidelity tier every active device got, so
-        # a textbook generic is never silently mistaken for the real part.
+        # One honest summary line per convert() (LLC E2E R7: the per-device build
+        # lines are DEBUG; this is the single INFO): device count + tier counts,
+        # so a textbook generic is never silently mistaken for the real part.
+        # Full per-ref detail stays at DEBUG and on ``model_provenance``.
         if self.model_provenance:
+            from collections import Counter as _Counter
+
+            tiers = _Counter(p.tier for p in self.model_provenance.values())
+            tier_str = ", ".join(f"{n} {t}" for t, n in sorted(tiers.items()))
+            logger.info(
+                f"Converted {len(self.model_provenance)} modelled device(s); "
+                f"tiers: {tier_str}"
+            )
             summary = ", ".join(
                 f"{r}={p.tier}" for r, p in sorted(self.model_provenance.items())
             )
-            logger.info(f"Model provenance: {summary}")
+            logger.debug(f"Model provenance: {summary}")
             generics = [
                 p.name for p in self.model_provenance.values() if p.tier == "generic"
             ]
@@ -1937,7 +1947,7 @@ class SpiceConverter:
             self.model_provenance[ref] = ResolvedModel(
                 ref, "transformer", "sim_params", f"xfmr(lp={lp}, ls={ls}, k={k})"
             )
-            logger.info(
+            logger.debug(
                 f"{ref}: transformer as coupled inductors (lp={lp}, ls={ls}, "
                 f"k={k}); dots at AA/SA per the KiCad symbol"
             )
@@ -1961,7 +1971,7 @@ class SpiceConverter:
             ref, "transformer", "sim_params",
             f"xfmr_{shape}(lp={lp}, ls=[{ls_str}], k={k})",
         )
-        logger.info(
+        logger.debug(
             f"{ref}: {shape} transformer as {len(lnames)} coupled inductors "
             f"(lp={lp}, ls=[{ls_str}], k={k}); pairwise K; dots at first-named "
             f"pin of each winding"
@@ -2210,7 +2220,7 @@ class SpiceConverter:
             if topology == "flyback"
             else ""
         )
-        logger.info(
+        logger.debug(
             f"{ref}: {topology} behavioral macromodel (open-loop, vout={vout}, "
             f"fsw={self._fmt_hz(params['FSW'])}); active load-step recovery is not "
             f"modeled (open loop){extra}"
@@ -2283,7 +2293,7 @@ class SpiceConverter:
             ref, "buck", "sim_params", f"buck_averaged(vref={vref})"
         )
         fsw = params["FSW"]
-        logger.info(
+        logger.debug(
             f"{ref}: buck averaged macromodel (voltage-mode, CCM, vref={vref}, "
             f"gm={gm}, cea={cea}); for loop-gain/phase-margin via .ac. Results above "
             f"~{self._fmt_hz(fsw / 2)} (FSW/2) are not physical (averaging breaks)."
@@ -2388,7 +2398,7 @@ class SpiceConverter:
             ref, "halfbridge", "sim_params",
             f"halfbridge_openloop(fsw={self._fmt_hz(fsw)}, dt={n(dt)})",
         )
-        logger.info(
+        logger.debug(
             f"{ref}: half-bridge switch stage (open-loop, fsw={self._fmt_hz(fsw)}, "
             f"dt={n(dt)}, ron={ron}); FSW-swept for the resonant gain curve; "
             f"antiparallel diodes give the tank a deadtime freewheel path (ZVS)"

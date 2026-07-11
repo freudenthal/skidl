@@ -1438,9 +1438,21 @@ def default_empty_footprint_handler(part):
         By default, this function logs an error message if the footprint is missing.
         Override this function if you want to try and set some default footprint
         for particular types of parts (such as using an 0805 footprint for a resistor).
+        Simulation-only parts (KiCad's ``Simulation_SPICE`` library -- sources,
+        probes) never have footprints, so they log a warning instead of an error
+        (LLC E2E R4: they counted as phantom "errors" beside a clean ERC gate).
     """
 
+    import os as _os
+
     from .logger import active_logger
+
+    lib_name = str(getattr(getattr(part, "lib", None), "filename", "") or "")
+    if "simulation_spice" in _os.path.basename(lib_name).lower():
+        active_logger.bare_warning(
+            f"No footprint for sim-only part {part.name}/{part.ref} (expected)."
+        )
+        return
 
     active_logger.bare_error(
         f"No footprint for {part.name}/{part.ref} added at {part.src_line(True)}."
