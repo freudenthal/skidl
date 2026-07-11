@@ -10,6 +10,7 @@ import math
 import os
 import re
 from dataclasses import dataclass
+from itertools import combinations
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -1646,71 +1647,202 @@ class SpiceConverter:
     # Transformers: coupled inductors via a K element (Stage 21.1)        #
     # ------------------------------------------------------------------ #
 
-    def _transformer_terminals(self, component):
-        """Resolve a 1P/1S transformer's AA/AB/SA/SB SPICE nodes by pin name.
+    # Secondary winding letter pairs, in symbol order: SA/SB (1st secondary),
+    # SC/SD (2nd), SE/SF (3rd), ... A KiCad Transformer_1P_2S adds SC/SD; wider
+    # multi-secondary symbols would continue the sequence.
+    _XFMR_SEC_PAIRS = (("SA", "SB"), ("SC", "SD"), ("SE", "SF"), ("SG", "SH"))
 
-        KiCad's ``Device:Transformer_1P_1S`` names its pins AA/AB (primary) and
-        SA/SB (secondary), with the polarity dots printed at AA and SA. Returns a
-        dict of all four nodes or None when any winding end is unconnected (no
-        half-wound transformers) or no live pin map is available.
+    def _transformer_pin_scan(self, component):
+        """Scan a transformer's winding pins -> ``(present, nodes)`` or None.
+
+        ``present`` is the set of winding pin *names the symbol has* (AA/AB and
+        SA..SH), regardless of connection; ``nodes`` maps the *connected* ones to
+        their SPICE node. Returns None when no live pin map is available (a
+        dict/JSON circuit). The present/connected split lets callers tell a
+        center-tapped 1P_SS (symbol has SA/SC/SB, no SD) from an independent-
+        secondary 1P_2S (SA/SB/SC/SD) by pin existence, and name a specific
+        unconnected winding end.
         """
         pin_map = getattr(component, "_pins", None)
         if not isinstance(pin_map, dict):
             return None
+        present = set()
         nodes = {}
         for pin in pin_map.values():
-            net = getattr(pin, "net", None)
-            if net is None:
-                continue
             name = (getattr(pin, "name", "") or "").strip().upper()
-            if name in ("AA", "AB", "SA", "SB") and name not in nodes:
-                nodes[name] = self.node_map.get(net.name, net.name)
-        if set(nodes) != {"AA", "AB", "SA", "SB"}:
+            if not name:
+                continue
+            if name in ("AA", "AB") or (
+                len(name) == 2 and name[0] == "S" and name[1] in "ABCDEFGH"
+            ):
+                present.add(name)
+                net = getattr(pin, "net", None)
+                if net is not None and name not in nodes:
+                    nodes[name] = self.node_map.get(net.name, net.name)
+        return present, nodes
+
+    def _transformer_shape(self, component):
+        """Winding topology from the symbol's pins -> ``(center_tap, n_sec)``.
+
+        ``center_tap`` True for a 1P_SS (two half-windings about the tap SC);
+        ``n_sec`` is the number of secondary windings the symbol carries (2 for a
+        center-tap, one per present SA/SB, SC/SD, ... pair otherwise). Returns None
+        with no live pin map (the caller then assumes a single secondary, the
+        1P_1S back-compat default).
+        """
+        scan = self._transformer_pin_scan(component)
+        if scan is None:
             return None
-        return nodes
+        present, _ = scan
+        if "SC" in present and "SB" in present and "SD" not in present:
+            return (True, 2)  # center-tapped secondary -> two half-windings
+        n = sum(1 for a, b in self._XFMR_SEC_PAIRS if a in present or b in present)
+        return (False, max(n, 1))
+
+    def _transformer_terminals(self, component):
+        """Resolve a transformer's winding SPICE nodes by pin name.
+
+        Supports ``Transformer_1P_1S`` (AA/AB, SA/SB), ``Transformer_1P_2S``
+        (adds an independent SC/SD secondary) and the center-tapped
+        ``Transformer_1P_SS`` (SA/SC/SB, SC = tap -> two half-windings SA->SC and
+        SC->SB). Returns
+        ``{"primary": (nAA, nAB), "secondaries": [(a, b), ...], "center_tap": bool}``
+        (dots at the first-named pin of each winding: AA, SA, and -- for the
+        center-tap second half -- SC), or None when the primary is incomplete, a
+        detected secondary winding is only half-connected (no half-wound windings),
+        or no live pin map is available.
+        """
+        scan = self._transformer_pin_scan(component)
+        if scan is None:
+            return None
+        present, nodes = scan
+        if "AA" not in nodes or "AB" not in nodes:
+            return None
+        primary = (nodes["AA"], nodes["AB"])
+        center_tap = "SC" in present and "SB" in present and "SD" not in present
+        if center_tap:
+            if not all(p in nodes for p in ("SA", "SB", "SC")):
+                return None
+            return {
+                "primary": primary,
+                "secondaries": [
+                    (nodes["SA"], nodes["SC"]),
+                    (nodes["SC"], nodes["SB"]),
+                ],
+                "center_tap": True,
+            }
+        secondaries = []
+        for a, b in self._XFMR_SEC_PAIRS:
+            if a not in present and b not in present:
+                continue
+            if a not in nodes or b not in nodes:
+                return None  # half-wound secondary
+            secondaries.append((nodes[a], nodes[b]))
+        if not secondaries:
+            return None
+        return {"primary": primary, "secondaries": secondaries, "center_tap": False}
+
+    def _transformer_missing_pins(self, component):
+        """Winding pins the symbol has but leaves unconnected (for validate()).
+
+        ``[]`` when every required winding end is connected or there is no live
+        pin map. Names the exact SA/SC/... a half-wound transformer is missing.
+        """
+        scan = self._transformer_pin_scan(component)
+        if scan is None:
+            return []
+        present, nodes = scan
+        required = set()
+        if "AA" in present or "AB" in present:
+            required |= {"AA", "AB"}
+        if "SC" in present and "SB" in present and "SD" not in present:
+            required |= {"SA", "SB", "SC"}  # center-tap
+        else:
+            for a, b in self._XFMR_SEC_PAIRS:
+                if a in present or b in present:
+                    required |= {a, b}
+        return sorted(p for p in required if p not in nodes)
 
     def _transformer_params(self, component) -> Optional[dict]:
-        """Winding params for a transformer, or None if LP / the ratio is missing.
+        """Winding params for a transformer, or None if LP / a ratio is missing.
 
-        ``LP`` (primary inductance) is required; the secondary comes from an
-        explicit ``LS`` or is derived as ``LP*N^2`` from the turns ratio ``N``
-        (Ns/Np). ``K`` is the coupling coefficient, default 0.999; a value outside
-        (0, 1] is rejected (ngspice requires it).
+        ``LP`` (primary inductance) is required. Each secondary's inductance is an
+        explicit ``LS``/``LS2``/``LS3``... or is derived as ``LP*Ni^2`` from that
+        winding's turns ratio ``N``/``N2``/``N3`` (Ns/Np); the first secondary uses
+        the unsuffixed ``LS``/``N``. **Center-tap semantics:** for a 1P_SS ``N`` is
+        the *per-half* turns ratio -- each half winding is ``LP*N^2`` -- and both
+        halves share ``N`` unless ``N2`` is given for the second half. ``K`` is the
+        coupling coefficient applied to every winding pair, default 0.999; a value
+        outside (0, 1] is rejected (ngspice requires it) and reported as ``K=None``.
+        Returns ``{"LP", "secondaries": [ls, ...], "K", "center_tap"}``.
         """
         raw = self._parse_sim_params(self._sim_props(component).get("params"))
         lp = self._parse_si_number(raw["LP"]) if "LP" in raw else None
         if not lp or lp <= 0:
             return None
-        ls = self._parse_si_number(raw["LS"]) if "LS" in raw else None
-        if ls is None:
-            n_ratio = self._parse_si_number(raw["N"]) if "N" in raw else None
+        shape = self._transformer_shape(component)
+        center_tap, n_sec = shape if shape is not None else (False, 1)
+
+        def ratio_ind(ls_key, n_key, fallback_n_key=None):
+            ls = self._parse_si_number(raw[ls_key]) if ls_key in raw else None
+            if ls is not None:
+                return ls if ls > 0 else None
+            n_ratio = self._parse_si_number(raw[n_key]) if n_key in raw else None
+            if n_ratio is None and fallback_n_key and fallback_n_key in raw:
+                n_ratio = self._parse_si_number(raw[fallback_n_key])
             if not n_ratio or n_ratio <= 0:
                 return None
-            ls = lp * n_ratio * n_ratio
-        if ls <= 0:
-            return None
+            return lp * n_ratio * n_ratio
+
+        secondaries = []
+        for i in range(1, n_sec + 1):
+            if center_tap:
+                # Per-half: half 1 uses N (LS), half 2 uses N2 (LS2) or falls
+                # back to N (both halves the same ratio unless N2 is given).
+                ls_key = "LS" if i == 1 else f"LS{i}"
+                n_key = "N" if i == 1 else f"N{i}"
+                ls = ratio_ind(ls_key, n_key, fallback_n_key="N")
+            else:
+                suffix = "" if i == 1 else str(i)
+                ls = ratio_ind(f"LS{suffix}", f"N{suffix}")
+            if ls is None:
+                return None
+            secondaries.append(ls)
+
         k = self._parse_si_number(raw["K"]) if "K" in raw else 0.999
         if k is None or not (0 < k <= 1):
-            return {"LP": lp, "LS": ls, "K": None}  # bad k -> validate() names it
-        return {"LP": lp, "LS": ls, "K": k}
+            # bad k -> validate() names it
+            return {"LP": lp, "secondaries": secondaries, "K": None,
+                    "center_tap": center_tap}
+        return {"LP": lp, "secondaries": secondaries, "K": k,
+                "center_tap": center_tap}
 
     def _add_transformer(self, component, ref: str, value: str):
-        """Emit a transformer as two coupled inductors + a ``K`` card (raw_spice).
+        """Emit a transformer as N coupled inductors + pairwise ``K`` cards.
 
-        Node order follows the KiCad symbol's dots (AA first, SA first), so the
-        SPICE dot convention matches the printed dots and winding polarity is set
-        entirely by user wiring -- a flyback ties the secondary dot (SA) to the
-        secondary return and feeds the rectifier from SB. Winding currents are
-        readable via ``branch_current("<ref>_P")`` / ``("<ref>_S")``.
+        One ``L`` per winding and a ``K`` card for *every* winding pair
+        (primary<->secondary and secondary<->secondary -- the sec<->sec coupling
+        is what makes a center-tapped/full-wave secondary behave correctly). Node
+        order follows the KiCad symbol's dots (AA first, SA first, and SC first for
+        the center-tap second half), so the SPICE dot convention matches the
+        printed dots and winding polarity is set entirely by user wiring.
+
+        Naming: the single-secondary (1P_1S) case emits ``L<ref>_P`` / ``L<ref>_S``
+        / ``K<ref>`` -- **byte-identical to the pre-multi-winding output** (a hard
+        backward-compat requirement). Multi-winding emits ``L<ref>_S1``,
+        ``L<ref>_S2``, ... and ``K<ref>_PS1`` / ``K<ref>_S1S2`` / ... Winding
+        currents are readable via ``branch_current("<ref>_P")`` etc.
 
         Simulation caveat (SPICE, not the design): every node needs a DC path to
         ground, so a galvanically isolated secondary must share the sim's GND net
-        (or bridge to it through a large resistor).
+        (or bridge to it through a large resistor); a center-tap grounds via the
+        tap.
         """
         term = self._transformer_terminals(component)
         if term is None:
             logger.warning(
-                f"transformer {ref}: needs all of AA/AB/SA/SB connected - skipping"
+                f"transformer {ref}: winding ends unconnected - skipping "
+                f"(need AA/AB + each secondary pair, or SA/SC/SB for a center-tap)"
             )
             return
         params = self._transformer_params(component)
@@ -1721,19 +1853,58 @@ class SpiceConverter:
             )
             return
         n = self._fmt_num
-        lp, ls, k = n(params["LP"]), n(params["LS"]), n(params["K"])
-        lines = [
-            f"L{ref}_P {term['AA']} {term['AB']} {lp}",
-            f"L{ref}_S {term['SA']} {term['SB']} {ls}",
-            f"K{ref} L{ref}_P L{ref}_S {k}",
-        ]
+        lp, k = n(params["LP"]), n(params["K"])
+        sec_nodes = term["secondaries"]
+        sec_ind = params["secondaries"]
+        if len(sec_nodes) != len(sec_ind):
+            # Winding count from terminals vs. params disagree (a param supplied
+            # for a winding the symbol lacks, or vice versa) -- refuse to guess.
+            logger.warning(
+                f"transformer {ref}: {len(sec_nodes)} secondary winding(s) but "
+                f"{len(sec_ind)} inductance(s) resolved - skipping"
+            )
+            return
+
+        if len(sec_nodes) == 1:
+            # Single-secondary: preserve the exact legacy emission (byte-identical).
+            ls = n(sec_ind[0])
+            lines = [
+                f"L{ref}_P {term['primary'][0]} {term['primary'][1]} {lp}",
+                f"L{ref}_S {sec_nodes[0][0]} {sec_nodes[0][1]} {ls}",
+                f"K{ref} L{ref}_P L{ref}_S {k}",
+            ]
+            self.spice_circuit.raw_spice += "\n" + "\n".join(lines)
+            self.model_provenance[ref] = ResolvedModel(
+                ref, "transformer", "sim_params", f"xfmr(lp={lp}, ls={ls}, k={k})"
+            )
+            logger.info(
+                f"{ref}: transformer as coupled inductors (lp={lp}, ls={ls}, "
+                f"k={k}); dots at AA/SA per the KiCad symbol"
+            )
+            return
+
+        # Multi-winding: L<ref>_P + L<ref>_S1.. and a K card per winding pair.
+        lnames = [f"L{ref}_P"]
+        tags = ["P"]
+        lines = [f"L{ref}_P {term['primary'][0]} {term['primary'][1]} {lp}"]
+        for i, (pair, ls) in enumerate(zip(sec_nodes, sec_ind), start=1):
+            lname = f"L{ref}_S{i}"
+            lnames.append(lname)
+            tags.append(f"S{i}")
+            lines.append(f"{lname} {pair[0]} {pair[1]} {n(ls)}")
+        for (ia, la), (ib, lb) in combinations(list(enumerate(lnames)), 2):
+            lines.append(f"K{ref}_{tags[ia]}{tags[ib]} {la} {lb} {k}")
         self.spice_circuit.raw_spice += "\n" + "\n".join(lines)
+        ls_str = ", ".join(n(x) for x in sec_ind)
+        shape = "center-tap" if term.get("center_tap") else f"{len(sec_nodes)}-sec"
         self.model_provenance[ref] = ResolvedModel(
-            ref, "transformer", "sim_params", f"xfmr(lp={lp}, ls={ls}, k={k})"
+            ref, "transformer", "sim_params",
+            f"xfmr_{shape}(lp={lp}, ls=[{ls_str}], k={k})",
         )
         logger.info(
-            f"{ref}: transformer as coupled inductors (lp={lp}, ls={ls}, k={k}); "
-            f"dots at AA/SA per the KiCad symbol"
+            f"{ref}: {shape} transformer as {len(lnames)} coupled inductors "
+            f"(lp={lp}, ls=[{ls_str}], k={k}); pairwise K; dots at first-named "
+            f"pin of each winding"
         )
 
     # ------------------------------------------------------------------ #
@@ -2938,15 +3109,21 @@ class SpiceConverter:
                 getattr(component, "_pins", None) is not None
                 and self._transformer_terminals(component) is None
             ):
+                missing = self._transformer_missing_pins(component)
+                where = (
+                    f" (unconnected: {', '.join(missing)})" if missing else ""
+                )
                 problems.append(
-                    f"{ref}: transformer needs all of AA/AB/SA/SB pins connected "
-                    f"(no half-wound transformers)"
+                    f"{ref}: transformer winding ends must all be connected -- "
+                    f"AA/AB + each secondary pair (SA/SB, SC/SD, ...), or SA/SC/SB "
+                    f"for a center-tapped 1P_SS{where}"
                 )
             params = self._transformer_params(component)
             if params is None:
                 problems.append(
-                    f"{ref}: transformer needs Sim.Params with LP and N (or LS), "
-                    f'e.g. Sim.Params="lp=100u n=0.5"'
+                    f"{ref}: transformer needs Sim.Params with LP and a turns "
+                    f"ratio N (or LS) per winding, e.g. Sim.Params=\"lp=100u n=0.5\" "
+                    f'(two secondaries: "lp=25u n=0.5 n2=0.1")'
                 )
             elif params["K"] is None:
                 problems.append(f"{ref}: transformer coupling k must be in (0, 1]")
