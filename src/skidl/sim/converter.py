@@ -366,6 +366,8 @@ class SpiceConverter:
         "BUCK": "buck",
         "BOOST": "boost",
         "FLYBACK": "flyback",
+        "HALFBRIDGE": "halfbridge",
+        "LLC": "halfbridge",
         "TRANSFORMER": "transformer",
         "XFMR": "transformer",
     }
@@ -466,6 +468,7 @@ class SpiceConverter:
             "buck": self._add_buck,
             "boost": self._add_boost,
             "flyback": self._add_flyback,
+            "halfbridge": self._add_halfbridge,
             "transformer": self._add_transformer,
             "bjt": self._add_bjt_transistor,
             "mosfet": self._add_mosfet,
@@ -2229,6 +2232,111 @@ class SpiceConverter:
             f"~{self._fmt_hz(fsw / 2)} (FSW/2) are not physical (averaging breaks)."
         )
 
+    # ------------------------------------------------------------------ #
+    # Half-bridge / resonant switch stage (Stage 26 Phase B)              #
+    # ------------------------------------------------------------------ #
+
+    def _halfbridge_params(self, component) -> Optional[dict]:
+        """Params for a half-bridge switch stage, or None if unusable.
+
+        ``FSW`` (switching frequency) is required -- it is the control variable
+        for an open-loop resonant converter (the gain is swept by FSW, not set by
+        a duty computation). ``DT`` (deadtime, default 100 ns) and ``RON`` (switch
+        on-resistance, default 0.1 Ohm) take defaults. Returns None when FSW is
+        missing/invalid or the deadtime is >= half the period (no conduction time
+        left) -- validate() reports which.
+        """
+        raw = self._parse_sim_params(self._sim_props(component).get("params"))
+        fsw = self._parse_si_number(raw["FSW"]) if "FSW" in raw else None
+        if not fsw or fsw <= 0:
+            return None
+
+        def g(key, default):
+            v = self._parse_si_number(raw[key]) if key in raw else None
+            return v if v is not None else default
+
+        dt = g("DT", 100e-9)
+        ron = g("RON", 0.1)
+        if dt < 0 or dt >= 0.5 / fsw:
+            return None
+        return {"FSW": fsw, "DT": dt, "RON": ron}
+
+    def _add_halfbridge(self, component, ref: str, value: str):
+        """Emit an open-loop half-bridge switch stage (Sim.Device=HALFBRIDGE/LLC).
+
+        Replaces ONLY the two switches of a half/resonant bridge -- the user's
+        Cr/Lr/transformer/rectifier stay real parts. A complementary S-switch pair
+        runs at a fixed 50 % duty (minus deadtime) driven from FSW; the gain curve
+        of a resonant tank is obtained by sweeping FSW across `.tran` runs (there
+        is no VOUT/duty computation, which is what makes the model robust).
+
+        Each switch carries a **mandatory antiparallel diode**: during the
+        deadtime the resonant-tank current must have a path or the switch node
+        rings to kV and the transient fails to converge -- and the diode is what
+        lets a ZVS-shaped V(sw) emerge naturally (the device-level twin in Phase C
+        checks this). Built from the buck's proven S-switch + PULSE machinery
+        (real current paths through the off state), not a stiff behavioral source.
+        """
+        term = self._switcher_terminals(component)
+        if term is None:
+            logger.warning(
+                f"halfbridge {ref}: could not resolve SW/VIN/GND terminals - skipping"
+            )
+            return
+        params = self._halfbridge_params(component)
+        if params is None:
+            logger.warning(
+                f"halfbridge {ref}: no usable FSW/DT resolved - skipping "
+                f'(set Sim.Params="fsw=100k")'
+            )
+            return
+
+        # Give cap-only unmodeled pins (BOOT/EN/VDD...) a DC path so the op-point
+        # solves, exactly like the switching-regulator handler.
+        self._stub_unmodeled_pins(
+            component,
+            ref,
+            {term["sw"], term["vin"], term["gnd"], term["fb"]},
+            term["gnd"],
+        )
+
+        sw, vin, gnd = str(term["sw"]), str(term["vin"]), str(term["gnd"])
+        n = self._fmt_num
+        fsw, dt, ron = params["FSW"], params["DT"], n(params["RON"])
+        per = 1.0 / fsw
+        half = per / 2.0
+        on = half - dt  # conduction time per switch (guaranteed > 0 by params)
+        edge = per / 200.0
+        ghs, gls = f"{ref}_ghs", f"{ref}_gls"
+
+        lines = [
+            # Complementary gate drives with a deadtime gap: high-side on for the
+            # first (half - DT), low-side on for the second (half - DT); both off
+            # during the two DT windows.
+            f"V{ref}_ghs {ghs} {gnd} PULSE(0 5 0 "
+            f"{edge:.6g} {edge:.6g} {on:.6g} {per:.6g})",
+            f"V{ref}_gls {gls} {gnd} PULSE(0 5 {half:.6g} "
+            f"{edge:.6g} {edge:.6g} {on:.6g} {per:.6g})",
+            f"S{ref}_hs {vin} {sw} {ghs} {gnd} SW{ref}",
+            f"S{ref}_ls {sw} {gnd} {gls} {gnd} SW{ref}",
+            f".model SW{ref} SW(Ron={ron} Roff=1e6 Vt=2.5 Vh=0.2)",
+            # Antiparallel diodes (high-side sw->vin, low-side gnd->sw): the tank
+            # freewheel path during deadtime and the ZVS clamp.
+            f"D{ref}_hs {sw} {vin} DFW{ref}",
+            f"D{ref}_ls {gnd} {sw} DFW{ref}",
+            f".model DFW{ref} D(IS=1e-9 N=1.05 CJO=100p)",
+        ]
+        self.spice_circuit.raw_spice += "\n" + "\n".join(lines)
+        self.model_provenance[ref] = ResolvedModel(
+            ref, "halfbridge", "sim_params",
+            f"halfbridge_openloop(fsw={self._fmt_hz(fsw)}, dt={n(dt)})",
+        )
+        logger.info(
+            f"{ref}: half-bridge switch stage (open-loop, fsw={self._fmt_hz(fsw)}, "
+            f"dt={n(dt)}, ron={ron}); FSW-swept for the resonant gain curve; "
+            f"antiparallel diodes give the tank a deadtime freewheel path (ZVS)"
+        )
+
     @staticmethod
     def _parse_frequency(value) -> Optional[float]:
         """Parse a GBW/frequency string ('1.4G', '10MEG', '1k', '5e5', '2MHz') to Hz.
@@ -3096,6 +3204,37 @@ class SpiceConverter:
                     problems.append(
                         f"{ref}: {kind} needs Sim.Params with VOUT and FSW, e.g. "
                         f'Sim.Params="fsw=500k vout=3.3"'
+                    )
+
+        # 4c-hb. Half-bridge / resonant switch stage: SW/VIN/GND + FSW required,
+        #        deadtime must leave conduction time.
+        for component in self._iter_components():
+            if self._sim_excluded(component):
+                continue
+            if self._kind(component) != "halfbridge":
+                continue
+            ref = self._attr(component, "ref", None) or "?"
+            if (
+                getattr(component, "_pins", None) is not None
+                and self._switcher_terminals(component) is None
+            ):
+                problems.append(
+                    f"{ref}: halfbridge needs connected SW, VIN and GND pins "
+                    f"(resolved by pin name)"
+                )
+            raw = self._parse_sim_params(self._sim_props(component).get("params"))
+            fsw = self._parse_si_number(raw["FSW"]) if "FSW" in raw else None
+            if not fsw or fsw <= 0:
+                problems.append(
+                    f"{ref}: halfbridge needs Sim.Params with FSW, e.g. "
+                    f'Sim.Params="fsw=100k"'
+                )
+            else:
+                dt = self._parse_si_number(raw["DT"]) if "DT" in raw else 100e-9
+                if dt is not None and dt >= 0.5 / fsw:
+                    problems.append(
+                        f"{ref}: halfbridge deadtime DT ({self._fmt_num(dt)}s) must "
+                        f"be < 1/(2*FSW) = {0.5 / fsw:.3g}s"
                     )
 
         # 4d. Transformers: all four winding ends connected + resolvable params.

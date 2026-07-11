@@ -559,6 +559,20 @@ class CircuitSimulator:
     # this flag lets the next default-mode run unset it (see _make_simulator).
     _ngbehavior_set = False
 
+    # Convergence recipe for stiff switching transients (Stage 26 Phase E),
+    # merged by ``transient_analysis(stiff=True)`` under any explicit ``options``.
+    # Gear integration damps the ringing of a switched L-C tank; the loosened
+    # reltol + small abstol/gmin and the higher itl4 (transient Newton iteration
+    # limit) let ngspice take the hard timepoints instead of aborting. Tuned on
+    # the LLC resonant canary (F1) -- this is the set that actually converges it.
+    _STIFF_TRAN_OPTIONS = {
+        "method": "gear",
+        "reltol": 3e-3,
+        "abstol": 1e-10,
+        "gmin": 1e-12,
+        "itl4": 100,
+    }
+
     def __init__(self, circuit_synth_circuit, compat=None):
         """Build a simulator for a circuit.
 
@@ -609,6 +623,19 @@ class CircuitSimulator:
         self.spice_circuit = converter.convert()
         self.model_provenance = converter.model_provenance
         self._compat_hint = getattr(converter, "compat_hint", None)
+
+    @classmethod
+    def _merge_stiff_options(cls, options: Optional[Dict]) -> Dict:
+        """Merge the stiff-transient recipe under any explicit ``options``.
+
+        Returns a new dict = :attr:`_STIFF_TRAN_OPTIONS` overlaid with ``options``
+        (so an explicit knob wins over the recipe default). ``None`` yields the
+        recipe unchanged.
+        """
+        merged = dict(cls._STIFF_TRAN_OPTIONS)
+        if options:
+            merged.update(options)
+        return merged
 
     def _make_simulator(self, temperature: float, options: Optional[Dict] = None):
         """Build a PySpice simulator with temperature and optional ngspice options.
@@ -720,6 +747,7 @@ class CircuitSimulator:
         max_time: Optional[float] = None,
         use_initial_condition: bool = False,
         initial_conditions: Optional[Dict[str, float]] = None,
+        stiff: bool = False,
     ) -> SimulationResult:
         """Run transient analysis.
 
@@ -736,20 +764,32 @@ class CircuitSimulator:
             start_time: Discard results before this time (``tstart``) -- smaller
                 result arrays; the run still integrates from t=0.
             max_time: Cap the internal timestep (``tmax``) for accuracy on stiff
-                circuits; ``None`` lets ngspice choose.
+                circuits; ``None`` lets ngspice choose. For a resonant/switching
+                tank keep it <= per/50 (per = 1/FSW) or the switch edges alias.
             use_initial_condition: Emit ``uic`` -- skip the DC operating point and
                 start from device/``.ic`` initial conditions. Required when the op
-                point does not converge (common with vendor switcher models).
+                point does not converge (common with vendor switcher models). For
+                a resonant start-up seed the output discharged
+                (``initial_conditions={"VOUT": 0}``).
             initial_conditions: ``{net_name: volts}`` emitted as ``.ic
                 v(net)=volts``. Pass the circuit-synth **net name** (e.g. ``"VOUT"``,
                 ``"OUT"``); it is used verbatim as the node name and ngspice matches
                 it case-insensitively. For a soft-start from a discharged output use
                 ``use_initial_condition=True, initial_conditions={"VOUT": 0}``.
+            stiff: Merge the :attr:`_STIFF_TRAN_OPTIONS` convergence recipe
+                (gear/reltol/abstol/gmin/itl4) for a hard switched-tank transient
+                (half-bridge, LLC resonant). Any key in an explicit ``options``
+                wins over the recipe, so callers can still override individual
+                knobs. If a stubborn switch node still fails to converge, add an
+                RC snubber across it or shorten ``end_time`` with a UIC-seeded
+                start.
 
         Note:
             ``.nodeset`` is not exposed (no PySpice API surface); use
             ``initial_conditions`` instead.
         """
+        if stiff:
+            options = self._merge_stiff_options(options)
         simulator = self._make_simulator(temperature, options)
         if initial_conditions:
             # PySpice's initial_condition(**kwargs) maps node_name -> value; the
