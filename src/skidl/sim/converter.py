@@ -928,6 +928,31 @@ class SpiceConverter:
                     out[str(num)] = self.node_map.get(name, name)
         return out
 
+    def _subckt_pin_mismatch_message(
+        self, ref, name, component, subckt_nodes, mapped_nodes
+    ) -> str:
+        """A clear Sim.Pins-mismatch error (subckt nodes vs the symbol's pins)."""
+        pins = []
+        nums = []
+        pin_map = getattr(component, "_pins", None)
+        if isinstance(pin_map, dict):
+            for num, pin in sorted(
+                pin_map.items(), key=lambda kv: self._pin_sort_key(kv[0])
+            ):
+                pn = (getattr(pin, "name", "") or "").strip()
+                pins.append(f"{num}/{pn}" if pn else str(num))
+                nums.append(str(num))
+        pin_list = ", ".join(pins) if pins else "(none connected)"
+        example = f"{nums[0]}={subckt_nodes[0]}" if nums else "1=<node>"
+        return (
+            f"{ref}: Sim.Pins maps {len(mapped_nodes)} of subckt '{name}''s "
+            f"{len(subckt_nodes)} nodes -- ngspice would fail with 'Too few "
+            f"parameters'. This symbol's pins are: {pin_list} (number/name). "
+            f"The subckt's nodes (in order) are: {' '.join(subckt_nodes)}. Set "
+            f'Sim.Pins="<symbol pin NUMBER>=<subckt node>" for each node, e.g. '
+            f'Sim.Pins="{example} ...".'
+        )
+
     def _external_nodes(self, component, pins_spec, subckt_nodes) -> List[str]:
         """Order a component's nets to match an external subckt's node order.
 
@@ -1043,9 +1068,13 @@ class SpiceConverter:
                 component, self._sim_props(component).get("pins"), subckt_nodes
             )
             if subckt_nodes and len(nodes) != len(subckt_nodes):
-                logger.warning(
-                    f"{ref}: subckt '{name}' takes {len(subckt_nodes)} nodes but "
-                    f"{len(nodes)} were mapped (check Sim.Pins)"
+                # A wrong/short Sim.Pins mapping would emit an X line with the
+                # wrong node count -> a cryptic ngspice "Too few parameters for
+                # subcircuit" crash. Fail here with the actual pin/node lists so
+                # the user can fix the mapping (E2E finding M2).
+                raise SimulationValidationError(
+                    [self._subckt_pin_mismatch_message(
+                        ref, name, component, subckt_nodes, nodes)]
                 )
             # Pass Sim.Params through as subckt parameters (X ... NAME p=v). A
             # Sim.Library part has no other Sim.Params consumer (the derived-model
