@@ -486,6 +486,17 @@ class SpiceConverter:
             self._add_store_model(component, ref, store_path)
             return
 
+        # A model discovered in a configured external library index (e.g. the
+        # KiCad-Spice-Library) is attached like an implicit Sim.Library. It sits
+        # BELOW curated datasheet_fit (the corpus is broad but unvetted) and only
+        # fires for real named parts we'd otherwise model with a generic/ideal;
+        # Sim.Prefer="library" flips it above the built-ins. Inert when no
+        # SKIDL_SPICE_LIB_PATH is configured.
+        index_hit = self._library_index_hit(component)
+        if index_hit is not None:
+            self._add_index_model(component, ref, index_hit)
+            return
+
         handlers = {
             "resistor": self._add_resistor,
             "capacitor": self._add_capacitor,
@@ -1097,6 +1108,61 @@ class SpiceConverter:
             return get_model_store().lookup(mpn)
         except Exception:  # pragma: no cover
             return None
+
+    def _library_index_hit(self, component):
+        """A ModelHit for this device from the configured library index, or None.
+
+        Gated so it never silently overrides better/intended behavior:
+          * active devices only (diode/BJT/MOSFET/op-amp);
+          * needs a real model name (Sim.Name, else mpn/value) that isn't a bare
+            type keyword;
+          * defers to a curated ``datasheet_fit`` card unless Sim.Prefer=library;
+          * a ``.subckt`` hit auto-resolves only with Sim.Pins present (so node
+            order is explicit) or Sim.Prefer=library -- otherwise fall through,
+            since guessing subckt node order from symbol pins is unsafe. Bare
+            ``.model`` hits (the common diode/BJT/MOSFET case) need no mapping.
+        """
+        kind = self._kind(component)
+        if kind not in ("diode", "bjt", "mosfet", "opamp"):
+            return None
+        sim = self._sim_props(component)
+        name = sim.get("name") or self._component_mpn(component)
+        if not name:
+            return None
+        name = str(name).strip()
+        if not name or name.lower() in self._TYPE_KEYWORD_MODELS:
+            return None
+        prefer = str(sim.get("prefer", "")).strip().lower()
+        if prefer != "library" and kind in ("diode", "bjt", "mosfet"):
+            _spec, tier, _res = self._lookup_model_spec(name, kind)
+            if tier == "datasheet_fit":
+                return None  # curated card wins over the unvetted corpus
+        try:
+            from .library_index import get_library_index
+
+            index = get_library_index()
+            if index is None:
+                return None
+            hit = index.resolve(name)
+        except Exception:  # pragma: no cover - index/init failure is non-fatal
+            return None
+        if hit is None:
+            return None
+        if hit.kind == "subckt" and not sim.get("pins") and prefer != "library":
+            logger.debug(
+                f"{getattr(component, 'ref', '?')}: library index has subckt "
+                f"'{hit.name}' but no Sim.Pins; not auto-resolving (run "
+                f"find_spice_model to get the pin mapping, or set "
+                f"Sim.Prefer=library)"
+            )
+            return None
+        return hit
+
+    def _add_index_model(self, component, ref, hit) -> None:
+        """Attach a model resolved from the external library index."""
+        self._emit_external(
+            component, ref, hit.path, hit.name, hit.kind, hit.nodes, "library_index"
+        )
 
     def _emit_models(self):
         """Emit a ``.model`` card for each referenced built-in and derived model.
@@ -3453,6 +3519,8 @@ class SpiceConverter:
                 continue
             if self._store_lib_for(component):
                 continue  # resolved from the local MPN store (tier vendor_lib)
+            if self._library_index_hit(component) is not None:
+                continue  # resolved from the external library index (tier vendor_lib)
             model = self._device_model_name(component)
             if model is None:
                 continue
