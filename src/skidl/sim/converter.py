@@ -76,6 +76,11 @@ class SpiceConverter:
         "DefaultPNP": ("PNP", {"BF": 100, "IS": 1e-14, "VAF": 100}),
         "DefaultNMOS": ("NMOS", {"VTO": 1.0, "KP": 2e-5, "LAMBDA": 0.02}),
         "DefaultPMOS": ("PMOS", {"VTO": -1.0, "KP": 2e-5, "LAMBDA": 0.02}),
+        # A generic power NMOS: higher VTO/KP than the small-signal DefaultNMOS,
+        # for a switch that must actually pass amps. No body-diode/Coss metadata
+        # (those live on the curated datasheet-fit entries, or Sim.Params
+        # COSS=/BODY=1) -- this is just the conduction model.
+        "DefaultPowerNMOS": ("NMOS", {"VTO": 3.5, "KP": 20.0, "LAMBDA": 0.01}),
     }
 
     # Per-kind generic fallback: an unresolved model NAME carrying Sim.Params
@@ -94,6 +99,7 @@ class SpiceConverter:
         "pnp": "DefaultPNP",
         "nmos": "DefaultNMOS",
         "pmos": "DefaultPMOS",
+        "powernmos": "DefaultPowerNMOS",
         "diode": "DefaultDiode",
     }
 
@@ -2442,10 +2448,75 @@ class SpiceConverter:
         model_name = self._resolve_device_model(component, ref) or "DefaultNMOS"
 
         self.spice_circuit.M(ref, d_node, g_node, s_node, b_node, model=model_name)
+        # Emit the intrinsic body diode + Coss for a curated power part (or when
+        # Sim.Params forces them) -- a Level-1 .model can't carry either.
+        self._emit_mosfet_companions(component, ref, d_node, s_node)
         logger.debug(
             f"Added MOSFET {ref}: D={d_node}, G={g_node}, S={s_node}, B={b_node}, "
             f"model={model_name}"
         )
+
+    def _emit_mosfet_companions(self, component, ref, d_node, s_node) -> None:
+        """Emit an antiparallel body diode + a drain-source Coss for a power MOSFET.
+
+        Fires when the resolved model carries ``body_diode``/``coss`` metadata (a
+        curated ModelLibrary power part), or when ``Sim.Params`` supplies
+        ``COSS=<F>`` / ``BODY=1``. A Level-1 ``.model`` card cannot express either,
+        so the composite (M + D + C) is what gives a switch its reverse-conduction
+        and switch-node capacitance -- required for ZVS / hard-switching fidelity.
+
+        Body-diode polarity: for an NMOS the intrinsic diode's anode is at the
+        source (conducts S->D on a negative Vds); for a PMOS it is reversed.
+        Provenance name is annotated ``+body``/``+coss`` so the composite is never
+        silent.
+        """
+        base = self._device_model_name(component)
+        if base is None:
+            return
+        entry, _ = self._resolve_library_model(base, "mosfet")
+        body = (
+            dict(entry.body_diode)
+            if entry is not None and getattr(entry, "body_diode", None)
+            else None
+        )
+        coss = getattr(entry, "coss", None) if entry is not None else None
+
+        # Sim.Params can override Coss or force a default body diode onto any part.
+        overrides = self._parse_sim_params(self._sim_props(component).get("params"))
+        if "COSS" in overrides:
+            c = self._parse_si_number(overrides["COSS"])
+            if c is not None and c > 0:
+                coss = c
+        if (
+            str(overrides.get("BODY", "")).strip().lower() in ("1", "true", "yes", "on")
+            and body is None
+        ):
+            body = {"IS": 1e-9, "RS": 0.02, "CJO": 500e-12, "BV": 60}
+
+        if body is None and coss is None:
+            return  # a plain small-signal/generic MOSFET -- no companions
+
+        spec, _tier, _resolved = self._lookup_model_spec(base, "mosfet")
+        mtype = spec[0].upper() if spec else "NMOS"
+        n = self._fmt_num
+        lines = []
+        notes = []
+        if body is not None:
+            dmodel = f"DBODY{ref}"
+            pstr = " ".join(f"{k}={n(v)}" for k, v in body.items())
+            anode, cathode = (
+                (d_node, s_node) if mtype == "PMOS" else (s_node, d_node)
+            )
+            lines.append(f"D{ref}_body {anode} {cathode} {dmodel}")
+            lines.append(f".model {dmodel} D({pstr})")
+            notes.append("+body")
+        if coss is not None:
+            lines.append(f"C{ref}_oss {d_node} {s_node} {n(coss)}")
+            notes.append("+coss")
+        self.spice_circuit.raw_spice += "\n" + "\n".join(lines)
+        prov = self.model_provenance.get(ref)
+        if prov is not None and notes:
+            prov.name = f"{prov.name} {''.join(notes)}"
 
     def _add_voltage_source(self, component, ref: str, value: str):
         """Add voltage source to SPICE circuit.

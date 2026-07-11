@@ -21,7 +21,15 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class SpiceModel:
-    """Container for SPICE model parameters."""
+    """Container for SPICE model parameters.
+
+    ``body_diode`` and ``coss`` are optional companion metadata for power
+    MOSFETs: a Level-1 ``.model`` card cannot express an intrinsic body diode or
+    output capacitance, so the converter emits an antiparallel diode + a D-S cap
+    alongside the ``M`` device when they are present (needed for ZVS / hard-
+    switching behaviour). ``body_diode`` is a diode ``.model`` param dict
+    (IS/RS/CJO/BV...); ``coss`` is the output capacitance in farads.
+    """
 
     name: str
     model_type: str  # D, NPN, PNP, NMOS, PMOS, etc.
@@ -29,6 +37,8 @@ class SpiceModel:
     description: str = ""
     manufacturer: str = ""
     datasheet_url: str = ""
+    body_diode: Optional[Dict[str, float]] = None
+    coss: Optional[float] = None
 
 
 class ModelLibrary:
@@ -287,6 +297,59 @@ class ModelLibrary:
             },
             description="Power MOSFET, 100V 33A",
             manufacturer="International Rectifier",
+        )
+
+        # Power MOSFETs (Level-1 fit + body-diode / Coss companion metadata).
+        # A Level-1 .model cannot express the intrinsic body diode or output
+        # capacitance, so the converter emits an antiparallel D + a D-S cap
+        # alongside the M device (needed for ZVS / hard-switching fidelity). The
+        # RD/RS approximate Rds(on); body-diode BV = the part's Vds rating.
+        self.models["IRFZ44N"] = SpiceModel(
+            name="IRFZ44N",
+            model_type="NMOS",
+            parameters={
+                "VTO": 4.0,
+                "KP": 15.0,
+                "LAMBDA": 0.01,
+                "RD": 0.0175,  # ~Rds(on) 17.5 mOhm
+                "RS": 0.005,
+            },
+            description="55 V 49 A power NMOS (standard-level gate)",
+            manufacturer="International Rectifier",
+            body_diode={"IS": 1e-9, "RS": 0.02, "CJO": 500e-12, "BV": 55},
+            coss=300e-12,
+        )
+
+        self.models["IRF540N"] = SpiceModel(
+            name="IRF540N",
+            model_type="NMOS",
+            parameters={
+                "VTO": 3.9,
+                "KP": 20.0,
+                "LAMBDA": 0.005,
+                "RD": 0.044,
+                "RS": 0.01,
+            },
+            description="100 V 33 A power NMOS (standard-level gate)",
+            manufacturer="International Rectifier",
+            body_diode={"IS": 1e-9, "RS": 0.02, "CJO": 800e-12, "BV": 100},
+            coss=250e-12,
+        )
+
+        self.models["IRLZ44N"] = SpiceModel(
+            name="IRLZ44N",
+            model_type="NMOS",
+            parameters={
+                "VTO": 2.0,  # logic-level gate
+                "KP": 18.0,
+                "LAMBDA": 0.01,
+                "RD": 0.022,
+                "RS": 0.005,
+            },
+            description="55 V 47 A logic-level power NMOS",
+            manufacturer="International Rectifier",
+            body_diode={"IS": 1e-9, "RS": 0.02, "CJO": 600e-12, "BV": 55},
+            coss=350e-12,
         )
 
         # Default/Generic Models
