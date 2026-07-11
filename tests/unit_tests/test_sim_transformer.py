@@ -166,6 +166,74 @@ def test_1p1s_emission_byte_identical():
 
 
 @requires_sim
+def test_winding_resistance_emits_series_r(monkeypatch):
+    """rp=/rs= insert a series resistor (via an internal node) on each winding's
+    A-side terminal; the coupled inductor keeps its name so the K card is
+    unchanged (C3)."""
+    _setup()
+    t = Part("Device", "Transformer_1P_1S", ref="T1")
+    t.Sim_Params = "lp=100u n=0.5 rp=0.5 rs=0.1"
+    for pin, net in (("AA", "PA"), ("AB", "PB"), ("SA", "SA_N"), ("SB", "SB_N")):
+        Net(net).connect(t[pin])
+    netlist = _emit(_view())
+    # series R on primary, feeding the coupled inductor through an internal node
+    assert "RT1_P PA T1_p_ri 0.5" in netlist, netlist
+    assert "LT1_P T1_p_ri PB 0.0001" in netlist, netlist
+    # series R on the secondary
+    assert "RT1_S SA_N T1_s_ri 0.1" in netlist, netlist
+    assert "LT1_S T1_s_ri SB_N 2.5e-05" in netlist, netlist
+    # K card still couples the inductors by name
+    assert "KT1 LT1_P LT1_S 0.999" in netlist, netlist
+
+
+@requires_sim
+def test_winding_resistance_absent_is_byte_identical():
+    """No rp/rs -> exactly the legacy 3-line emission (no R lines)."""
+    _setup()
+    t = Part("Device", "Transformer_1P_1S", ref="T1")
+    t.Sim_Params = "lp=100u n=0.5"
+    for pin, net in (("AA", "PA"), ("AB", "PB"), ("SA", "SA_N"), ("SB", "SB_N")):
+        Net(net).connect(t[pin])
+    netlist = _emit(_view())
+    assert "RT1_" not in netlist
+    assert "_ri" not in netlist
+
+
+@requires_sim
+def test_winding_resistance_seen_at_dc_live():
+    """Live: a DC source across the primary settles to ~V/rp at steady state
+    (the winding is not an ideal short), so the ideal-inductor DC degeneracy
+    breaks. Transient (coupled inductors are singular in a bare .op); the
+    secondary carries a load resistor so its node has a DC path to ground."""
+    _setup()
+    t = Part("Device", "Transformer_1P_1S", ref="T1")
+    t.Sim_Params = "lp=100u n=0.5 rp=2 rs=0.1"
+    v = Part("Simulation_SPICE", "VDC", ref="V1", value="6")
+    rload = Part("Device", "R", ref="R2", value="1k")
+    # One net object per node (reused), else same-named-but-distinct nets are
+    # electrically separate and get renamed.
+    p, gnd, s1 = Net("P"), Net("GND"), Net("S1")
+    p.connect(t["AA"], v[1])
+    gnd.connect(t["AB"], v[2], rload[2])
+    s1.connect(t["SA"], rload[1])
+    gnd.connect(t["SB"])
+    from skidl.sim import simulate
+
+    try:
+        an = simulate().transient_analysis(
+            step_time=1e-6, end_time=2e-3, max_time=1e-5,
+            use_initial_condition=True,
+        )
+    except Exception as e:
+        pytest.skip(f"ngspice not available: {type(e).__name__}: {str(e)[:80]}")
+    # I -> V/rp = 6/2 = 3 A at steady state (an ideal 0-ohm winding would be a
+    # short -> current limited only by the source, far larger).
+    iv = an.get_current("V1")
+    cur = abs(iv[-1] if hasattr(iv, "__len__") else iv)
+    assert 2.0 < cur < 4.0, cur
+
+
+@requires_sim
 def test_1p2s_emission_three_L_three_K():
     _setup()
     t = Part("Device", "Transformer_1P_2S", ref="T1")

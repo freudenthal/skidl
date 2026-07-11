@@ -2066,7 +2066,15 @@ class SpiceConverter:
                 return None
             return lp * n_ratio * n_ratio
 
+        def winding_res(key):
+            """Optional series winding resistance in ohms (>0), else 0.0."""
+            if key not in raw:
+                return 0.0
+            r = self._parse_si_number(raw[key])
+            return r if (r is not None and r > 0) else 0.0
+
         secondaries = []
+        sec_res = []
         for i in range(1, n_sec + 1):
             if center_tap:
                 # Per-half: half 1 uses N (LS), half 2 uses N2 (LS2) or falls
@@ -2080,14 +2088,20 @@ class SpiceConverter:
             if ls is None:
                 return None
             secondaries.append(ls)
+            sec_res.append(winding_res("RS" if i == 1 else f"RS{i}"))
+
+        # Optional winding DCR (C3): a real winding's series resistance breaks the
+        # ideal-inductor DC degeneracy (a Royer tap settling below Vin). Absent ->
+        # 0.0 -> byte-identical emission to the pre-DCR output.
+        rp = winding_res("RP")
 
         k = self._parse_si_number(raw["K"]) if "K" in raw else 0.999
         if k is None or not (0 < k <= 1):
             # bad k -> validate() names it
             return {"LP": lp, "secondaries": secondaries, "K": None,
-                    "center_tap": center_tap}
+                    "center_tap": center_tap, "RP": rp, "sec_res": sec_res}
         return {"LP": lp, "secondaries": secondaries, "K": k,
-                "center_tap": center_tap}
+                "center_tap": center_tap, "RP": rp, "sec_res": sec_res}
 
     def _add_transformer(self, component, ref: str, value: str):
         """Emit a transformer as N coupled inductors + pairwise ``K`` cards.
@@ -2128,6 +2142,8 @@ class SpiceConverter:
         lp, k = n(params["LP"]), n(params["K"])
         sec_nodes = term["secondaries"]
         sec_ind = params["secondaries"]
+        rp = params.get("RP", 0.0) or 0.0
+        sec_res = params.get("sec_res") or [0.0] * len(sec_ind)
         if len(sec_nodes) != len(sec_ind):
             # Winding count from terminals vs. params disagree (a param supplied
             # for a winding the symbol lacks, or vice versa) -- refuse to guess.
@@ -2137,14 +2153,33 @@ class SpiceConverter:
             )
             return
 
+        def winding_lines(lname, tag, node_a, node_b, ind, res):
+            """The L line for a winding, prefixed by a series R when res>0.
+
+            A series winding resistance (C3) is inserted on the A-side terminal
+            through an internal node; the coupled inductor keeps its name (so the
+            K cards are unchanged). res==0 -> a single L line, byte-identical to
+            the pre-DCR emission.
+            """
+            if res and res > 0:
+                internal = f"{ref}_{tag.lower()}_ri"
+                return [
+                    f"R{ref}_{tag} {node_a} {internal} {n(res)}",
+                    f"{lname} {internal} {node_b} {n(ind)}",
+                ]
+            return [f"{lname} {node_a} {node_b} {n(ind)}"]
+
         if len(sec_nodes) == 1:
-            # Single-secondary: preserve the exact legacy emission (byte-identical).
+            # Single-secondary: preserve the exact legacy emission (byte-identical
+            # when rp/rs are absent).
             ls = n(sec_ind[0])
-            lines = [
-                f"L{ref}_P {term['primary'][0]} {term['primary'][1]} {lp}",
-                f"L{ref}_S {sec_nodes[0][0]} {sec_nodes[0][1]} {ls}",
-                f"K{ref} L{ref}_P L{ref}_S {k}",
-            ]
+            lines = (
+                winding_lines(f"L{ref}_P", "P", term["primary"][0],
+                              term["primary"][1], params["LP"], rp)
+                + winding_lines(f"L{ref}_S", "S", sec_nodes[0][0],
+                                sec_nodes[0][1], sec_ind[0], sec_res[0])
+                + [f"K{ref} L{ref}_P L{ref}_S {k}"]
+            )
             self.spice_circuit.raw_spice += "\n" + "\n".join(lines)
             self.model_provenance[ref] = ResolvedModel(
                 ref, "transformer", "sim_params", f"xfmr(lp={lp}, ls={ls}, k={k})"
@@ -2158,12 +2193,14 @@ class SpiceConverter:
         # Multi-winding: L<ref>_P + L<ref>_S1.. and a K card per winding pair.
         lnames = [f"L{ref}_P"]
         tags = ["P"]
-        lines = [f"L{ref}_P {term['primary'][0]} {term['primary'][1]} {lp}"]
+        lines = list(winding_lines(f"L{ref}_P", "P", term["primary"][0],
+                                   term["primary"][1], params["LP"], rp))
         for i, (pair, ls) in enumerate(zip(sec_nodes, sec_ind), start=1):
             lname = f"L{ref}_S{i}"
             lnames.append(lname)
             tags.append(f"S{i}")
-            lines.append(f"{lname} {pair[0]} {pair[1]} {n(ls)}")
+            lines += winding_lines(lname, f"S{i}", pair[0], pair[1], ls,
+                                   sec_res[i - 1])
         for (ia, la), (ib, lb) in combinations(list(enumerate(lnames)), 2):
             lines.append(f"K{ref}_{tags[ia]}{tags[ib]} {la} {lb} {k}")
         self.spice_circuit.raw_spice += "\n" + "\n".join(lines)
