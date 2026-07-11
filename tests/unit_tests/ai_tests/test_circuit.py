@@ -355,19 +355,18 @@ class TestERCFunctionality:
         # Mock the logger stack operations
         mock_active_logger.push = Mock()
         mock_active_logger.pop = Mock()
-        mock_active_logger.error.reset = Mock()
-        mock_active_logger.warning.reset = Mock()
+        # ERC resets ALL counters through one call (incl. bare_*; LLC E2E R4).
+        mock_active_logger.reset_counters = Mock()
         mock_active_logger.report_summary = Mock()
         mock_active_logger.stop_file_output = Mock()
-        
+
         # Run ERC
         circuit.ERC()
-        
+
         # Verify logger operations
         mock_active_logger.push.assert_called_once_with(mock_erc_logger)
         mock_active_logger.pop.assert_called_once()
-        mock_active_logger.error.reset.assert_called_once()
-        mock_active_logger.warning.reset.assert_called_once()
+        mock_active_logger.reset_counters.assert_called_once()
         mock_active_logger.report_summary.assert_called_once_with("running ERC")
 
     def test_erc_with_no_files(self):

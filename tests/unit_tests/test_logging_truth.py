@@ -109,16 +109,26 @@ def test_reset_counters_clears_bare_counters_too(skidl_log):
 def test_sim_only_part_missing_footprint_is_not_an_error(tmp_path, skidl_log):
     """A Simulation_SPICE source with no footprint logs a warning, not an error,
     during netlist generation -- the exact 'N errors found' phantom class."""
+    import builtins
+
+    import skidl as skidl_pkg
+    from skidl.part import default_empty_footprint_handler
+
     _setup()
     v1 = Part("Simulation_SPICE", "VDC", value="5")  # sim-only: no footprint
     r1 = Part("Device", "R", value="1k", footprint="Resistor_SMD:R_0603_1608Metric")
     Net("VIN").connect(v1[1], r1[1])
     Net("0").connect(v1[2], r1[2])
-    import builtins
-
-    builtins.default_circuit.generate_netlist(
-        tool=KICAD10, file_=str(tmp_path / "t.net")
-    )
+    # Pin the DEFAULT handler: other test modules (test_erc.py) replace the
+    # skidl.empty_footprint_handler global for the whole process.
+    saved_handler = skidl_pkg.empty_footprint_handler
+    skidl_pkg.empty_footprint_handler = default_empty_footprint_handler
+    try:
+        builtins.default_circuit.generate_netlist(
+            tool=KICAD10, file_=str(tmp_path / "t.net")
+        )
+    finally:
+        skidl_pkg.empty_footprint_handler = saved_handler
     assert active_logger.error.count + active_logger.bare_error.count == 0
     warns = [r.getMessage() for r in skidl_log.records if r.levelno == logging.WARNING]
     assert any("sim-only" in m and "VDC" in m for m in warns), warns
