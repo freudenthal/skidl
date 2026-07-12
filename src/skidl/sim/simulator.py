@@ -26,7 +26,7 @@ _CODEMODELS_LOADED = False
 try:
     import PySpice
     from PySpice.Spice.Netlist import Circuit as SpiceCircuit
-    from PySpice.Spice.NgSpice.Shared import NgSpiceShared
+    from PySpice.Spice.NgSpice.Shared import NgSpiceCommandError, NgSpiceShared
     from PySpice.Unit import *
 
     PYSPICE_AVAILABLE = True
@@ -164,6 +164,79 @@ def _ensure_codemodels(shared) -> None:
             logger.debug(f"Could not load ngspice codemodel {cm}: {exc}")
     if loaded:
         logger.debug(f"Loaded ngspice codemodels: {', '.join(loaded)}")
+
+
+# SI-suffix -> multiplier for time arguments (E2E finding B3). Covers bare SI
+# prefixes ("5u") and the same with a trailing 's' unit ("5us"/"10ms"/"1ns").
+_SI_TIME_MULT = {
+    "": 1.0, "s": 1.0,
+    "ms": 1e-3, "us": 1e-6, "µs": 1e-6, "ns": 1e-9, "ps": 1e-12, "fs": 1e-15,
+    "k": 1e3, "m": 1e-3, "u": 1e-6, "µ": 1e-6, "n": 1e-9, "p": 1e-12,
+}
+
+
+def _parse_si_time(raw):
+    """Parse a time argument (float or SI-suffix string like ``'5u'``/``'10ms'``)
+    to seconds, or ``None`` if unparseable. Plain floats/decimals pass through."""
+    if raw is None:
+        return None
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    s = str(raw).strip().lower().replace(" ", "")
+    if not s:
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        pass
+    m = re.match(r"^([+-]?[0-9]*\.?[0-9]+(?:e[+-]?[0-9]+)?)([a-zµ]+)$", s)
+    if not m:
+        return None
+    mult = _SI_TIME_MULT.get(m.group(2))
+    if mult is None:
+        return None
+    return float(m.group(1)) * mult
+
+
+def _to_seconds(value, name):
+    """Coerce a transient time argument to a float in seconds; raise on garbage."""
+    parsed = _parse_si_time(value)
+    if parsed is None:
+        raise ValueError(
+            f"transient_analysis {name}={value!r}: expected a number of seconds or "
+            f"an SI-suffix time string (e.g. 5u, 10ms, 1ns, 2.5)"
+        )
+    return parsed
+
+
+def _augment_ngspice_error(simulator, exc):
+    """Return ``exc`` unchanged, or -- best effort -- a same-typed copy with the
+    tail of ngspice's captured console output appended (E2E finding B1).
+
+    A failed ``.op``/``.tran`` surfaces only as ``NgSpiceCommandError: Command
+    'run' failed``; the actual reason (``No convergence in dc analysis``,
+    ``Timestep too small ... trouble with xq1:dmos-instance``) lives in the
+    shared ngspice instance's stdout/stderr, retained until the next command
+    clears it. Any failure to read it returns ``exc`` unchanged.
+    """
+    try:
+        shared = getattr(simulator, "ngspice", None)
+        if shared is None:
+            return exc
+        streams = [getattr(shared, "stderr", "") or "",
+                   getattr(shared, "stdout", "") or ""]
+        text = "\n".join(s for s in streams if s.strip()).strip()
+        if not text:
+            return exc
+        tail = "\n".join(text.splitlines()[-15:])
+        msg = f"{exc}\n--- ngspice output (tail) ---\n{tail}"
+        try:
+            new = type(exc)(msg)
+        except Exception:
+            new = RuntimeError(msg)
+        return new
+    except Exception:
+        return exc
 
 
 class SimulationResult:
@@ -744,12 +817,27 @@ class CircuitSimulator:
             simulator.options(**options)
         return simulator
 
+    @staticmethod
+    def _run_analysis(simulator, thunk):
+        """Run one PySpice analysis, surfacing ngspice's failure reason (B1).
+
+        On ``NgSpiceCommandError`` (the opaque ``Command 'run' failed``) the tail
+        of ngspice's captured console output is appended to the message; the
+        exception type is preserved so existing ``except`` clauses still catch."""
+        try:
+            return thunk()
+        except NgSpiceCommandError as exc:
+            augmented = _augment_ngspice_error(simulator, exc)
+            if augmented is exc:
+                raise
+            raise augmented from exc
+
     def operating_point(
         self, temperature: float = 25, options: Optional[Dict] = None
     ) -> SimulationResult:
         """Run DC operating point analysis."""
         simulator = self._make_simulator(temperature, options)
-        analysis = simulator.operating_point()
+        analysis = self._run_analysis(simulator, simulator.operating_point)
 
         return SimulationResult(analysis, "dc_op")
 
@@ -764,7 +852,8 @@ class CircuitSimulator:
     ) -> SimulationResult:
         """Run DC sweep analysis."""
         simulator = self._make_simulator(temperature, options)
-        analysis = simulator.dc(**{source: slice(start, stop, step)})
+        analysis = self._run_analysis(
+            simulator, lambda: simulator.dc(**{source: slice(start, stop, step)}))
 
         return SimulationResult(analysis, "dc_sweep")
 
@@ -795,12 +884,12 @@ class CircuitSimulator:
                 f"model (Sim.Params MODE=avg)."
             )
         simulator = self._make_simulator(temperature, options)
-        analysis = simulator.ac(
+        analysis = self._run_analysis(simulator, lambda: simulator.ac(
             start_frequency=start_freq @ u_Hz,
             stop_frequency=stop_freq @ u_Hz,
             number_of_points=points,
             variation="dec",
-        )
+        ))
 
         return SimulationResult(analysis, "ac")
 
@@ -819,7 +908,8 @@ class CircuitSimulator:
     ) -> SimulationResult:
         """Run transient analysis.
 
-        Times are in seconds. The keyword-only controls below are the standard
+        Times are in seconds and accept either a float or an SI-suffix string
+        (``"5u"``, ``"10ms"``, ``"1ns"``). The keyword-only controls below are the standard
         ngspice ``.tran``/``.ic`` knobs that power-supply (soft-start, stiff
         vendor-model) simulations need; with none supplied the call is identical
         to the legacy two-argument form.
@@ -856,6 +946,12 @@ class CircuitSimulator:
             ``.nodeset`` is not exposed (no PySpice API surface); use
             ``initial_conditions`` instead.
         """
+        # Accept SI-suffix strings ("5u"/"10ms") as well as float seconds (B3).
+        step_time = _to_seconds(step_time, "step_time")
+        end_time = _to_seconds(end_time, "end_time")
+        start_time = _to_seconds(start_time, "start_time") if start_time else 0
+        if max_time is not None:
+            max_time = _to_seconds(max_time, "max_time")
         if stiff:
             options = self._merge_stiff_options(options)
         simulator = self._make_simulator(temperature, options)
@@ -872,7 +968,7 @@ class CircuitSimulator:
             kwargs["max_time"] = max_time @ u_s
         if use_initial_condition:
             kwargs["use_initial_condition"] = True
-        analysis = simulator.transient(**kwargs)
+        analysis = self._run_analysis(simulator, lambda: simulator.transient(**kwargs))
 
         return SimulationResult(analysis, "transient")
 
