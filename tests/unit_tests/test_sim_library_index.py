@@ -69,7 +69,17 @@ def test_search_and_type_filter(index):
     names = {h.name for h in index.search("my")}
     assert {"MYD", "MYLED"} <= names
     diodes = index.search("", device_types=["D"])
-    assert all(h.device_type.upper() == "D" for h in diodes)
+    # A device-type filter classifies only bare .model entries; a subckt carries
+    # no device_type and must NOT be excluded (E2E A2 -- real HV MOSFETs ship as
+    # subckts). So: every .model hit is type D, and subckts pass through.
+    assert all(h.device_type.upper() == "D" for h in diodes if h.kind == "model")
+    assert any(h.kind == "model" for h in diodes)
+
+
+def test_device_type_filter_keeps_subckts(index):
+    # A subckt must survive a device-type filter that cannot classify it.
+    hits = index.search("opa", device_types=["NMOS", "VDMOS"])
+    assert any(h.kind == "subckt" and h.name == "OPA5" for h in hits)
 
 
 def test_cache_roundtrip_and_determinism(index):

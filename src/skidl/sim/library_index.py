@@ -266,7 +266,13 @@ class SpiceLibraryIndex:
             best = hits[0]
             if kind and best.kind != kind:
                 continue
-            if dts and best.device_type.upper() not in dts:
+            # A device-type filter (e.g. ["NMOS","VDMOS"] for --type mosfet)
+            # classifies only bare ``.model`` entries -- a ``.subckt`` carries no
+            # device_type. Excluding subckts here silently drops the ENTIRE
+            # population of real HV power MOSFETs (they ship as subckts), so a
+            # device-type filter must never exclude a name-matching subckt; it is
+            # kept and the caller tags it as type-unverified (E2E finding A2/A4).
+            if dts and best.kind == "model" and best.device_type.upper() not in dts:
                 continue
             out.append(best)
         # exact match first, then prefix, then precedence, then name

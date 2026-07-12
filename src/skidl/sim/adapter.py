@@ -94,6 +94,36 @@ def _pin_net(pin):
     return None
 
 
+# Waveform-param kwargs the converter's source specs read via ``_pick``
+# (SpiceConverter._voltage_source_spec / _current_source_spec). Bare kwargs with
+# these names on a ``Simulation_SPICE`` source part must reach ``_extra_fields``
+# or ngspice gets symbol defaults (E2E finding B2: a kwargs VPULSE emitted
+# ``pulse(0 vpulse ...)`` and failed to parse). Kept in sync with converter.py
+# (the union of every key list passed to ``_pick`` across V*/I* specs).
+_WAVEFORM_KWARGS = frozenset({
+    # VPULSE / IPULSE
+    "v1", "initial", "low", "v2", "pulsed", "high", "amplitude",
+    "td", "delay", "tr", "rise", "tf", "fall", "pw", "width", "per", "period",
+    "i1", "i2",
+    # VSIN / ISIN
+    "offset", "dc", "voffset", "ioffset", "ampl", "amp",
+    "frequency", "freq", "f", "theta", "damping", "ac", "ac_mag", "acmag",
+    # VPWL / IPWL
+    "points",
+})
+
+
+def _is_spice_source(part) -> bool:
+    """True if ``part`` is a ``Simulation_SPICE`` library part (a stimulus source).
+
+    Scoping the bare-kwargs waveform sweep to these parts means arbitrary attrs
+    on ordinary parts (a stray ``f=`` on a resistor) are never collected.
+    """
+    if _lib_nickname(part).upper() == "SIMULATION_SPICE":
+        return True
+    return _part_symbol(part).upper().startswith("SIMULATION_SPICE:")
+
+
 def _extra_fields(part):
     """Collect the ``Sim.*`` fields (and any ``fields`` dict) off a skidl part.
 
@@ -104,6 +134,13 @@ def _extra_fields(part):
     ``_sim_props`` lowercases the key and strips a ``sim.``/``sim_`` prefix, so
     the underscore spelling is picked up unchanged. A ``fields`` dict (as produced
     by ``netlist_to_skidl``) is merged in too.
+
+    Additionally, on a ``Simulation_SPICE`` source part, bare waveform kwargs
+    (``v1=``/``v2=``/``tr=``/``frequency=`` ...) are collected from the instance
+    dict so the SKILL-documented ``Part("Simulation_SPICE","VPULSE", v1=..., ...)``
+    form actually reaches the source spec (E2E finding B2). ``Sim_Params="..."``
+    still works and is the base; explicit kwargs win over it (as "explicit fields"
+    in ``_source_params``).
     """
     extra = {}
 
@@ -111,11 +148,16 @@ def _extra_fields(part):
     if isinstance(fields, dict):
         extra.update(fields)
 
-    # Instance attributes whose name looks like a Sim.* field. Use the instance
-    # __dict__ so we do not sweep in class-level machinery.
+    is_source = _is_spice_source(part)
+
+    # Instance attributes whose name looks like a Sim.* field, plus -- for a
+    # Simulation_SPICE source only -- allowlisted bare waveform kwargs. Use the
+    # instance __dict__ so we do not sweep in class-level machinery.
     for key, val in list(vars(part).items()):
         low = str(key).lower()
         if low.startswith("sim_") or low.startswith("sim."):
+            extra[key] = val
+        elif is_source and low in _WAVEFORM_KWARGS:
             extra[key] = val
 
     return extra

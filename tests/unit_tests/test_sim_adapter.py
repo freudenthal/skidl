@@ -261,6 +261,60 @@ def test_vpulse_negative_levels_survive():
 
 
 @requires_sim
+def test_vpulse_bare_kwargs_reach_spec():
+    """Bare waveform kwargs on a Simulation_SPICE VPULSE (the SKILL-documented
+    form) must reach the source spec -- not be dropped for symbol defaults (B2)."""
+    _setup()
+    v1 = Part("Simulation_SPICE", "VPULSE",
+              v1="0", v2="12", td="0", tr="200n", tf="200n", pw="9.3u", per="10u")
+    r1 = Part("Device", "R", value="1k")
+    Net("N").connect(v1[1], r1[1])
+    Net("0").connect(v1[2], r1[2])
+    netlist = str(SpiceConverter(skidl_flat_view()).convert(strict=True))
+    pulse = next(ln for ln in netlist.splitlines() if "PULSE(" in ln.upper())
+    # PULSE(v1 v2 td tr tf pw per)
+    assert "PULSE(0 12 0 200n 200n 9.3u 10u)" in pulse, pulse
+
+
+@requires_sim
+def test_vpulse_kwargs_override_sim_params():
+    """An explicit kwarg wins over a Sim_Params base value (explicit fields
+    override, matching _source_params merge order)."""
+    _setup()
+    v1 = Part("Simulation_SPICE", "VPULSE", v2="20")
+    v1.Sim_Params = "v1=0 v2=5 per=1m"
+    r1 = Part("Device", "R", value="1k")
+    Net("N").connect(v1[1], r1[1])
+    Net("0").connect(v1[2], r1[2])
+    netlist = str(SpiceConverter(skidl_flat_view()).convert(strict=True))
+    pulse = next(ln for ln in netlist.splitlines() if "PULSE(" in ln.upper())
+    assert "PULSE(0 20 " in pulse, pulse  # kwarg v2=20 beat Sim_Params v2=5
+
+
+@requires_sim
+def test_vsin_amplitude_frequency_kwargs():
+    """VSIN amplitude/frequency bare kwargs flow into the SIN() spec."""
+    _setup()
+    v1 = Part("Simulation_SPICE", "VSIN", amplitude="2", frequency="1k")
+    r1 = Part("Device", "R", value="1k")
+    Net("N").connect(v1[1], r1[1])
+    Net("0").connect(v1[2], r1[2])
+    netlist = str(SpiceConverter(skidl_flat_view()).convert(strict=True))
+    sin = next(ln for ln in netlist.splitlines() if "SIN(" in ln.upper())
+    assert " 2 1k " in sin.replace(",", " "), sin
+
+
+@requires_sim
+def test_stray_waveform_kwarg_on_resistor_ignored():
+    """A stray ``v1=`` on a non-source part must NOT be swept as a waveform param
+    (the sweep is scoped to Simulation_SPICE sources)."""
+    _setup()
+    r1 = Part("Device", "R", value="1k", v1="99")
+    from skidl.sim.adapter import _extra_fields
+    assert "v1" not in {k.lower() for k in _extra_fields(r1)}
+
+
+@requires_sim
 def test_unparseable_source_value_raises():
     """An unparseable *source* value is a correctness trap -- it must raise, not
     silently substitute 1.0 (same defect class as the sign drop)."""
