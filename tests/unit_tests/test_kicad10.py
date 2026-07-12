@@ -357,3 +357,71 @@ def test_kicad10_schematic_passes_save_gate(tmp_path):
     for f in sch_files:
         ok, detail = _save_gate_ok(f)
         assert ok, f"{f.name} failed save gate: {detail}"
+
+
+def _divider_wire_count(tmp_path, top, **opts):
+    """Render the stock divider and return (wire_count, schematic_text)."""
+    from skidl import generate_schematic
+
+    set_default_tool(KICAD10)
+    lib_search_paths["kicad10"] = ["."] + __import__(
+        "skidl.tools.kicad10.lib", fromlist=["default_lib_paths"]
+    ).default_lib_paths()
+    import builtins
+
+    builtins.default_circuit.mini_reset()
+    _build_divider()
+    out = tmp_path / top
+    out.mkdir()
+    generate_schematic(tool=KICAD10, filepath=str(out), top_name=top, **opts)
+    text = sorted(out.glob("*.kicad_sch"))[0].read_text(encoding="utf-8")
+    return text.count("(wire"), text
+
+
+@requires_kicad10
+def test_default_render_is_deconflict_stub(tmp_path):
+    """The flipped default: a BARE generate_schematic() renders the render-occupancy
+    render -- every pin gets its own deconflicted stub wire and power symbols sit on
+    stub-wire ends -- NOT the legacy on-pin snap render. The divider gets >1 wire and
+    at least one dedicated power-symbol stub."""
+    n_wires, text = _divider_wire_count(tmp_path, "def_render")
+    assert n_wires > 1, f"bare default did not produce deconflict stubs ({n_wires} wires)"
+    # A power symbol pulled onto a stub => a power lib_id present AND stub wires.
+    assert '(lib_id "power:' in text
+
+
+@requires_kicad10
+def test_legacy_render_escape_hatch(tmp_path):
+    """SKIDL_LEGACY_RENDER=1 and skidl.config.default_render='legacy' each restore the
+    pre-flip legacy render (on-pin snap, far fewer wires) without touching call sites."""
+    # Baseline: the flipped default packs the divider with stub wires.
+    n_default, _ = _divider_wire_count(tmp_path, "esc_default")
+
+    # (a) env-var hatch.
+    prev_env = os.environ.get("SKIDL_LEGACY_RENDER")
+    os.environ["SKIDL_LEGACY_RENDER"] = "1"
+    try:
+        n_env, _ = _divider_wire_count(tmp_path, "esc_env")
+    finally:
+        if prev_env is None:
+            os.environ.pop("SKIDL_LEGACY_RENDER", None)
+        else:
+            os.environ["SKIDL_LEGACY_RENDER"] = prev_env
+
+    # (b) config hatch.
+    prev_cfg = getattr(skidl.config, "default_render", None)
+    skidl.config.default_render = "legacy"
+    try:
+        n_cfg, _ = _divider_wire_count(tmp_path, "esc_cfg")
+    finally:
+        if prev_cfg is None:
+            try:
+                del skidl.config["default_render"]
+                del skidl.config.__dict__["default_render"]
+            except KeyError:
+                pass
+        else:
+            skidl.config.default_render = prev_cfg
+
+    assert n_env < n_default, (n_env, n_default)
+    assert n_cfg < n_default, (n_cfg, n_default)

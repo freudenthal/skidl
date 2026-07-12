@@ -206,9 +206,10 @@ def test_wired_render_power_nets_not_routed(tmp_path):
 def test_power_stubs_option_offsets_symbol_onto_stub_wire(tmp_path):
     """With power_stubs=True every power symbol is pulled one grid step off its
     pin onto a short stub WIRE (the classic pin -> wire -> power-symbol look),
-    and the render stays ERC-clean. Default (OFF) keeps symbols on the pin."""
-    # Default: power symbols coincident with pins (no dedicated stub wire).
-    out0, text0 = _render(_divider, "pwr0", tmp_path)
+    and the render stays ERC-clean. With power_stubs=False symbols stay on the
+    pin. (power_stubs is now ON by default, so the OFF baseline is explicit.)"""
+    # power_stubs OFF: power symbols coincident with pins (no dedicated stub wire).
+    out0, text0 = _render(_divider, "pwr0", tmp_path, power_stubs=False)
     # power_stubs ON: symbols offset, each sitting on a wire endpoint.
     out1, text1 = _render(_divider, "pwr1", tmp_path, power_stubs=True)
 
@@ -349,10 +350,13 @@ def _hier_build(ckt):
 
 
 @requires_kicad10
-def test_hier_sheet_pins_default_off_is_clean(tmp_path):
-    """By default boundary nets connect by global_label name -- no hierarchical
-    labels or sheet pins are emitted, and the render is ERC-clean."""
-    out, text = _render(_hier_build, "hspoff", tmp_path)
+def test_hier_sheet_pins_opt_out_is_clean(tmp_path):
+    """The legacy global-label boundary path stays available and ERC-clean when a
+    caller opts OUT with hierarchical_sheet_pins=False: boundary nets connect by
+    global_label name -- no hierarchical labels or sheet pins are emitted.
+    (hierarchical_sheet_pins is now ON by default; see
+    test_hier_sheet_pins_default_on_emits_interconnect for the default.)"""
+    out, text = _render(_hier_build, "hspoff", tmp_path, hierarchical_sheet_pins=False)
     assert "(hierarchical_label" not in text
     # No sheet pins (a sheet pin is `(pin NAME bidirectional ...)`; the shape of a
     # global_label is `(shape bidirectional)`, which must NOT be mistaken for one).
@@ -360,6 +364,20 @@ def test_hier_sheet_pins_default_off_is_clean(tmp_path):
     # Boundary net B (s1->s2) connects by global label.
     assert 'global_label "B"' in text
     types = _erc_error_types(out, "hspoff")
+    assert types.get("label_dangling", 0) == 0, types
+    assert types.get("pin_not_connected", 0) == 0, types
+
+
+@requires_kicad10
+def test_hier_sheet_pins_default_on_emits_interconnect(tmp_path):
+    """Locks the flipped default: with NO render opts the KiCad hierarchical
+    interconnect is emitted (hierarchical_label on the boundary net, redundant
+    global_label gone) and ERC is clean -- i.e. hierarchical_sheet_pins defaults
+    ON now, matching skidl_eda.project.generate()."""
+    out, text = _render(_hier_build, "hspdef", tmp_path)
+    assert "(hierarchical_label" in text, "hier interconnect not emitted by default"
+    assert 'global_label "B"' not in text, "redundant global_label survived by default"
+    types = _erc_error_types(out, "hspdef")
     assert types.get("label_dangling", 0) == 0, types
     assert types.get("pin_not_connected", 0) == 0, types
 

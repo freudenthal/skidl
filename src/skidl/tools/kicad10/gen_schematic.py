@@ -751,6 +751,18 @@ def gen_schematic(
         retries (int, optional): Number of times to re-try if routing fails. Defaults to 2.
         options (dict, optional): Dict of options and values, usually for drawing/debugging.
 
+    Default render (KiCad 10 backend):
+        With no render options passed, this backend now defaults to the
+        render-occupancy render -- ``seed_placement``, ``deconflict_stubs`` (which
+        also enables ``constructive_relax``), ``power_stubs``, and
+        ``hierarchical_sheet_pins`` are all ON. This is the clean, deterministic,
+        fusion-free sheet that ``skidl_eda.project.generate()`` has always requested
+        explicitly. Every one of these is applied via ``setdefault``, so any explicit
+        option a caller passes (including the legacy modes below) always wins. To
+        restore the pre-flip legacy defaults process-wide without editing call sites,
+        set ``SKIDL_LEGACY_RENDER=1`` in the environment or
+        ``skidl.config.default_render = "legacy"``.
+
     Auto-stub options (pass as keyword arguments):
         auto_stub (bool): Enable auto-stubbing for large/complex circuits. Converts nets that
             would fail routing into global labels, and runs a KiCad ERC correction loop to
@@ -788,13 +800,13 @@ def gen_schematic(
         hierarchical_sheet_pins (bool): When True, emit the KiCad
             hierarchical-interconnect surface — a hierarchical_label per boundary
             net inside each child sheet and a matching sheet pin on the parent's
-            sheet symbol. Default False: boundary (cross-sheet) nets connect by
-            NAME through the global_label each of their pins already carries,
-            which is ERC-clean today. The sheet-pin path is preserved but NOT yet
-            fully wired (labels/pins sit at sheet-edge slots, not yet tied to the
-            net inside the child nor to the parent net), so turning it on
-            currently produces label_dangling / pin_not_connected until that
-            wiring lands — see sexp_schematic._EMIT_HIER_SHEET_PINS.
+            sheet symbol, each WIRED to the net (Tiers 1+2: the interconnect is
+            complete and ERC-clean; the redundant global_label is dropped). **Now
+            ON by default** (see "Default render" above). Set
+            ``hierarchical_sheet_pins=False`` to opt out: boundary (cross-sheet)
+            nets then connect by NAME through the global_label each of their pins
+            carries, which is also ERC-clean. On a flat (single-sheet) circuit this
+            option is a no-op.
 
     Tips for best results with auto_stub:
         - Use @subcircuit to group related parts (e.g. power supply, MCU, amplifier).
@@ -845,6 +857,31 @@ def gen_schematic(
     options["rotate_parts"] = True
     options["pt_to_pt_mult"] = 5
     options["pin_normalize"] = True
+
+    # Default render = the render-occupancy render (constructive seed + deconflicted
+    # stubs + power symbols pulled onto stub wires + hierarchical sheet pins). This
+    # is exactly the option set skidl_eda.project.generate() has always passed
+    # explicitly, promoted to the fork default so a BARE circuit.generate_schematic()
+    # renders the same clean, deterministic, fusion-free sheet. Every key is a
+    # setdefault, so any explicit caller opt (including the legacy modes -- auto_stub,
+    # snap, plain labels -- and skidl-eda's own explicit render_opts) always wins;
+    # legacy renders remain fully supported by opting in per call. A process-wide
+    # escape hatch (SKIDL_LEGACY_RENDER=1, or skidl.config.default_render="legacy")
+    # restores the pre-flip legacy defaults without touching call sites.
+    import skidl as _skidl
+
+    _legacy_render = (
+        os.environ.get("SKIDL_LEGACY_RENDER") == "1"
+        or getattr(_skidl.config, "default_render", "occupancy") == "legacy"
+    )
+    if not _legacy_render:
+        # snap is mutually exclusive with deconflict (see the guard below); never
+        # force the deconflict default onto a caller who asked for snap.
+        if not options.get("snap_before_route", False):
+            options.setdefault("deconflict_stubs", True)
+        options.setdefault("seed_placement", True)
+        options.setdefault("power_stubs", True)
+        options.setdefault("hierarchical_sheet_pins", True)
 
     # Stage-25 deconflict-stub mode is mutually exclusive with snap: it retires
     # snap entirely (every pin gets a deconflicted on-grid stub wire instead of
