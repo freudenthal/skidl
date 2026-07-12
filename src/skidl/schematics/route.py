@@ -493,6 +493,7 @@ class Router:
         """
         from skidl.net import NCNet
         from skidl.schematics.net_terminal import NetTerminal
+        from skidl.schematics.occupancy import SheetOccupancy
 
         grid = float(GRID)
 
@@ -526,16 +527,33 @@ class Router:
                 pin_recs.append((sort_key, pin, net, id(net) in internal_ids))
         pin_recs.sort(key=lambda r: r[0])
 
-        # Occupancy: grid cell -> owning net. Seed with EVERY part pin (world,
-        # grid-rounded) of EVERY net so a stub end never lands on a pin.
-        def cell(x, y):
-            return (round(x / grid) * grid, round(y / grid) * grid)
+        # Unified per-sheet occupancy registry (render-occupancy plan). Single
+        # source of truth for cell ownership + part-body blocking, built here and
+        # threaded to the emitter on node._occupancy (replaces the ad-hoc dicts
+        # that add_deconflicted_stubs / A* / the label deconflicter each derived).
+        # Seed with EVERY part pin (world, grid-rounded) of EVERY net -- power
+        # nets included -- so a stub end never lands on any pin.
+        occ = SheetOccupancy(grid)
 
-        occupied = {}
+        def cell(x, y):
+            return occ.cell(x, y)
+
         for part in node.parts:
             for pin in part:
                 wp = (pin.pt * part.tx).round()
-                occupied.setdefault(cell(wp.x, wp.y), getattr(pin, "net", None))
+                occ.seed(cell(wp.x, wp.y), getattr(pin, "net", None))
+
+        # Register each real part's labeled body so stub ends can avoid part
+        # interiors. Populated now; the stub-end search starts consulting it in
+        # the collision-checked-stubs phase (respect_blocked), so this is inert
+        # (behavior-preserving) until then.
+        for part in node.parts:
+            if isinstance(part, NetTerminal):
+                continue
+            try:
+                occ.block_bbox((part.lbl_bbox * part.tx).round())
+            except Exception:  # noqa: BLE001 - blocking is best-effort geometry
+                pass
 
         from skidl.logger import active_logger
 
@@ -599,8 +617,7 @@ class Router:
             tries = 0
             while tries < 8:
                 c = cell(end_x, end_y)
-                owner = occupied.get(c)
-                if owner is None or owner is net:
+                if occ.is_free_for(c, net):
                     break
                 end_v += sign * grid
                 end_x = fixed if axis == "y" else end_v
@@ -618,7 +635,7 @@ class Router:
                 continue
 
             end_w = Point(round(end_x), round(end_y))
-            occupied[cell(end_w.x, end_w.y)] = net
+            occ.set(cell(end_w.x, end_w.y), net)
             node._stub_ends[id(pin)] = end_w
             # Protect the stub END from cleanup's trim_stubs: when A* routes
             # collinearly with a stub, split_segments cuts at the pin and the
@@ -642,8 +659,11 @@ class Router:
                 node._stub_wire_nets[id(net)].append(seg)
 
         # Publish the full occupancy so the A* router avoids every pin + stub
-        # end of every net (routed and label-only alike).
-        node._deconflict_occupied = {k: v for k, v in occupied.items() if v is not None}
+        # end of every net (routed and label-only alike). node._occupancy carries
+        # the whole registry (blocking + segment claims) to the emitter; the
+        # dict view stays for the A* router's existing consumer.
+        node._occupancy = occ
+        node._deconflict_occupied = occ.published()
 
     def cleanup_wires(node):
         """Try to make wire segments look prettier."""
