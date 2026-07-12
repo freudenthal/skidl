@@ -328,7 +328,14 @@ def _render_and_scan(refiner_on, monkeypatch=None):
             place_mod.push_and_pull = lambda *a, **k: None
     d = tempfile.mkdtemp(prefix="skidl_occ_")
     try:
-        ckt.generate_schematic(filepath=d, top_name="postreg_canary", **_RENDER_OPTS)
+        # Force the FORCE-DIRECTED path (constructive_relax=False): since Phase 4
+        # deconflict_stubs defaults constructive_relax ON, these refiner-on/off
+        # probes must opt out to actually exercise the force refiner (Phase 2's
+        # fix must hold there too, independent of the relaxation pass).
+        ckt.generate_schematic(
+            filepath=d, top_name="postreg_canary",
+            constructive_relax=False, **_RENDER_OPTS,
+        )
         return sheet_fusions(d)
     finally:
         if monkeypatch is None and not refiner_on:

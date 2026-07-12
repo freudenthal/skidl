@@ -857,6 +857,15 @@ def gen_schematic(
             "deconflict_stubs retires snap. Pass exactly one."
         )
 
+    # Constructive relaxation is the default spacing mechanism in deconflict-stub
+    # mode (render-occupancy plan Phase 4): the constructive seed + the occupancy
+    # registry make the force-directed refiner unnecessary AND its perturbation of
+    # the pin-face arrangement harmful, so retire it there unless the caller
+    # explicitly opts out (constructive_relax=False keeps the force refiner). The
+    # pure-A* / snap paths are unaffected -- they keep force-directed placement.
+    if options.get("deconflict_stubs", False):
+        options.setdefault("constructive_relax", True)
+
     # Power-symbol-first rendering: classify + stub power nets on EVERY path so
     # they never enter the A* router and render as KiCad power symbols (one per
     # pin), with a PWR_FLAG per undriven rail. This runs BEFORE auto_stub_nets so
