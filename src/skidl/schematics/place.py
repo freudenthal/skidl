@@ -1549,9 +1549,15 @@ class Placer:
             # Absolute import: place()'s constant-injection (line ~1709)
             # overwrites this module's __package__ with the tool module's, so a
             # relative import here would resolve under skidl.tools.kicad9.
-            from skidl.schematics.seed_place import seed_placement
+            # constructive_relax seeds with a wider relaxation gap and then skips
+            # the force-directed refiner (below) -- deterministic spacing that
+            # preserves the seed's directional arrangement.
+            if options.get("constructive_relax"):
+                from skidl.schematics.relax_place import relax_placement as _seed
+            else:
+                from skidl.schematics.seed_place import seed_placement as _seed
 
-            seed_placement(
+            _seed(
                 parts,
                 nets,
                 skip=is_net_terminal,
@@ -1583,23 +1589,38 @@ class Placer:
         net_terminals = [part for part in parts if is_net_terminal(part)]
         real_parts = [part for part in parts if not is_net_terminal(part)]
 
-        # Do the first trial placement.
-        evolve_placement([], real_parts, nets, total_part_force, **options)
+        if options.get("constructive_relax") and options.get("seed_placement"):
+            # Constructive relaxation: the seed already placed every real part in
+            # its pin-face direction with relaxation spacing. Skip the
+            # force-directed refiner entirely -- it re-mixes the arrangement and
+            # its incidental spacing is now provided by the relax gap. The seed
+            # already snaps to grid (choose_slot); nothing else to do for real
+            # parts. (The seed also fixed orientations, so adjust_orientations is
+            # deliberately skipped too.) Still snap to grid -- evolve_placement
+            # did this at its tail, and the deconflict router expects on-grid
+            # part snap points.
+            for part in real_parts:
+                snap_to_grid(part)
+        else:
+            # Do the first trial placement.
+            evolve_placement([], real_parts, nets, total_part_force, **options)
 
-        if options.get("rotate_parts"):
-            # Adjust part orientations after first trial placement is done.
-            # Label-aware term is OFF here by default (connected parts) to avoid
-            # pushing a stub label onto an adjacent power node; opt in via
-            # label_aware_connected.
-            conn_opts = dict(options)
-            conn_opts["_label_aware_scope"] = options.get(
-                "label_aware_connected", False
-            )
-            if adjust_orientations(real_parts, **conn_opts):
-                # Some part orientations were changed, so re-do placement.
-                evolve_placement([], real_parts, nets, total_part_force, **options)
+            if options.get("rotate_parts"):
+                # Adjust part orientations after first trial placement is done.
+                # Label-aware term is OFF here by default (connected parts) to
+                # avoid pushing a stub label onto an adjacent power node; opt in
+                # via label_aware_connected.
+                conn_opts = dict(options)
+                conn_opts["_label_aware_scope"] = options.get(
+                    "label_aware_connected", False
+                )
+                if adjust_orientations(real_parts, **conn_opts):
+                    # Some part orientations were changed, so re-do placement.
+                    evolve_placement([], real_parts, nets, total_part_force, **options)
 
-        # Place NetTerminals after all the other parts.
+        # Place NetTerminals after all the other parts. Under constructive_relax
+        # the real parts are anchored (immobile) here, so the terminal placement's
+        # bounded force never perturbs the constructive arrangement.
         place_net_terminals(
             net_terminals, real_parts, nets, total_part_force, **options
         )
@@ -1621,11 +1642,16 @@ class Placer:
             # Abort if nothing to place.
             return
 
-        # For large numbers of floating parts, skip the O(n^2) similarity
-        # computation and force-directed evolution. Just grid-place them.
-        # This avoids the 100+ second penalty for 60+ identical decoupling caps.
+        # Deterministic grid layout for floating parts instead of the O(n^2)
+        # similarity + force-directed evolution:
+        #  * large counts with auto_stub -- avoids the 100+ second penalty for
+        #    60+ identical decoupling caps;
+        #  * constructive_relax -- force-free, deterministic placement (the force
+        #    pass is retired on this path; a grid keeps the caps tidy and stable).
         _FLOAT_GRID_THRESHOLD = 20
-        if len(parts) > _FLOAT_GRID_THRESHOLD and options.get("auto_stub", False):
+        if (
+            len(parts) > _FLOAT_GRID_THRESHOLD and options.get("auto_stub", False)
+        ) or options.get("constructive_relax"):
             add_placement_bboxes(parts)
             # Simple grid layout for floating parts.
             cols = max(1, int(len(parts) ** 0.5))
@@ -1635,6 +1661,9 @@ class Placer:
                 w = bbox.w if bbox.w > 0 else 200
                 h = bbox.h if bbox.h > 0 else 200
                 part.tx = Tx().move(Point(col * w * 1.2, row * h * 1.2))
+                # Snap so the parts' pins land on the connection grid (the raw
+                # col*w*1.2 origin is otherwise off-grid -> endpoint_off_grid).
+                snap_to_grid(part)
             return
 
         # Add bboxes with surrounding area so parts are not butted against each other.

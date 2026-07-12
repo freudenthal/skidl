@@ -434,3 +434,103 @@ def test_refiner_off_no_fusion():
     force-directed refiner provably not running."""
     fusions = _render_and_scan(refiner_on=False)
     assert fusions == {}, f"refiner-OFF render fused nets: {fusions}"
+
+
+def _render_constructive_relax(spy=None):
+    """Render the packed canary with ``constructive_relax=True`` (the option
+    itself retires the refiner -- no monkeypatch). Returns the fusions dict."""
+    import skidl.schematics.place as place_mod
+
+    _use_kicad10()
+    ckt = _build_packed_canary()
+    if spy is not None:
+        orig = place_mod.push_and_pull
+
+        def _spy(anchored, mobile, nets, force_func, **o):
+            spy(mobile)
+            return orig(anchored, mobile, nets, force_func, **o)
+
+        saved = place_mod.push_and_pull
+        place_mod.push_and_pull = _spy
+    d = tempfile.mkdtemp(prefix="skidl_relax_")
+    try:
+        ckt.generate_schematic(
+            filepath=d, top_name="postreg_canary",
+            constructive_relax=True, **_RENDER_OPTS,
+        )
+        return sheet_fusions(d)
+    finally:
+        if spy is not None:
+            place_mod.push_and_pull = saved
+        shutil.rmtree(d, ignore_errors=True)
+
+
+@requires_kicad10
+def test_constructive_relax_no_fusion_and_no_real_part_force():
+    """Phase 3: with constructive_relax the render is fusion-free AND the
+    force-directed refiner never moves a real Part (blocks/terminals may still be
+    arranged, but the constructive intra-group arrangement is untouched)."""
+    from skidl import Part
+
+    forced_real = []
+
+    def spy(mobile):
+        reals = [p for p in mobile if isinstance(p, Part)]
+        if reals:
+            forced_real.append([getattr(p, "ref", "?") for p in reals])
+
+    fusions = _render_constructive_relax(spy=spy)
+    assert fusions == {}, f"constructive_relax render fused nets: {fusions}"
+    assert not forced_real, (
+        f"push_and_pull moved real parts under constructive_relax: {forced_real}"
+    )
+
+
+@requires_kicad10
+def test_constructive_relax_deterministic():
+    """Phase 3: constructive_relax is byte-deterministic across separate
+    processes with different PYTHONHASHSEEDs (force off + deterministic floating
+    grid -> the documented dense-sheet jitter is gone)."""
+    import re
+    import subprocess
+    import sys
+
+    script = (
+        "import sys, tempfile, glob, os, re, hashlib\n"
+        "from skidl import KICAD10, set_default_tool, lib_search_paths, Net, Part, POWER, Circuit\n"
+        "set_default_tool(KICAD10)\n"
+        "lib_search_paths['kicad10'] = ['.'] + __import__('skidl.tools.kicad10.lib', fromlist=['default_lib_paths']).default_lib_paths()\n"
+        "import builtins; builtins.default_circuit.mini_reset()\n"
+        "FP_R='Resistor_SMD:R_0805_2012Metric'; FP_C='Capacitor_SMD:C_0805_2012Metric'\n"
+        "ckt=Circuit(name='c')\n"
+        "with ckt:\n"
+        "    vin=Net('VIN'); vin.drive=POWER; rail=Net('RAIL'); rail.drive=POWER; gnd=Net('GND'); gnd.drive=POWER\n"
+        "    vout=Net('VOUT'); VREF=Net('VREF10'); VSET=Net('VSET'); GATE=Net('GATE_P'); FB=Net('FB_OUT')\n"
+        "    rref=Part('Device','R',ref='R7',value='470',footprint=FP_R); vin+=rref[1]; VREF+=rref[2]\n"
+        "    dref=Part('Reference_Voltage','LM4040DBZ-10',ref='D2'); VREF+=dref[1]; gnd+=dref[2]\n"
+        "    cref=Part('Device','C',ref='C5',value='100nF',footprint=FP_C); VREF+=cref[1]; gnd+=cref[2]\n"
+        "    pot=Part('Device','R_Potentiometer',ref='RV1',value='10k'); VREF+=pot[1]; VSET+=pot[2]; gnd+=pot[3]\n"
+        "    u1=Part('Amplifier_Operational','MCP6001R',ref='U1'); u1[1]+=GATE; u1[3]+=VSET; u1[4]+=FB; u1[2]+=rail; u1[5]+=gnd\n"
+        "    rg=Part('Device','R',ref='R8',value='100',footprint=FP_R); u1[1]+=rg[1]; rg[2]+=GATE\n"
+        "    q2=Part('Transistor_FET','IRF740',ref='Q3',value='IRF740'); q2[2]+=rail; q2[1]+=GATE; q2[3]+=vout\n"
+        "    rd1=Part('Device','R',ref='R9',value='190k',footprint=FP_R); rd2=Part('Device','R',ref='R10',value='10k',footprint=FP_R)\n"
+        "    vout+=rd1[1]; FB+=rd1[2],rd2[1]; gnd+=rd2[2]\n"
+        "    c6=Part('Device','C',ref='C6',value='10uF',footprint=FP_C); vout+=c6[1]; gnd+=c6[2]\n"
+        "    c7=Part('Device','C',ref='C7',value='100nF',footprint=FP_C); vout+=c7[1]; gnd+=c7[2]\n"
+        "d=tempfile.mkdtemp()\n"
+        "ckt.generate_schematic(filepath=d, top_name='c', seed_placement=True, auto_stub=False, deconflict_stubs=True, power_stubs=True, constructive_relax=True)\n"
+        "t=open(glob.glob(os.path.join(d,'*.kicad_sch'))[0],encoding='utf-8').read()\n"
+        "toks=sorted(re.findall(r'\\(xy [-\\d. ]+\\)',t))+sorted(re.findall(r'\\(at [-\\d. ]+\\)',t))\n"
+        "print(hashlib.sha256('\\n'.join(toks).encode()).hexdigest())\n"
+    )
+
+    def run(seed):
+        env = dict(os.environ, PYTHONHASHSEED=seed, PYTHONUTF8="1")
+        out = subprocess.run(
+            [sys.executable, "-c", script], capture_output=True, text=True, env=env
+        )
+        m = re.search(r"^[0-9a-f]{64}$", out.stdout, re.M)
+        assert m, f"no digest emitted (seed {seed}): {out.stdout[-500:]}\n{out.stderr[-500:]}"
+        return m.group(0)
+
+    assert run("1") == run("999"), "constructive_relax not deterministic across hashseeds"
