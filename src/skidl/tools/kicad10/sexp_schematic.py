@@ -44,6 +44,17 @@ _NAMESPACE_UUID = uuid.UUID("7026fcc6-e1a0-409e-aaf4-6a17ea82654f")
 # symbols. Do not change these without re-rendering the vertical + mirrored cases.
 _PIN_LABEL_ANGLE = {"R": 180, "L": 0, "U": 270, "D": 90}
 
+# Curated sourcing-identity kwargs that pass through from a bare ``Part(...)``
+# kwarg to a same-named schematic property (E2E finding A5) -- so they reach the
+# BOM. lower(attr) -> canonical property name. Arbitrary instance attributes are
+# NOT swept (skidl parts carry machinery attrs); use ``fields={...}`` for others.
+_SOURCING_FIELD_KWARGS = {
+    "mpn": "MPN",
+    "manufacturer": "Manufacturer",
+    "distributor": "Distributor",
+    "distributorpn": "DistributorPN",
+}
+
 
 def _lib_nickname(part):
     """Return the library NICKNAME for a part's lib_id (e.g. "Connector_Generic").
@@ -737,35 +748,45 @@ def part_to_sexp(part, uuid_path, tx=Tx()):
         )
     )
 
-    # Custom fields from part.fields dict.
-    y_offset = 5.08
-    if hasattr(part, "fields") and part.fields:
+    # Extra properties: curated sourcing-identity kwargs passed as bare Part
+    # kwargs (MPN/Manufacturer/Distributor/DistributorPN -> BOM, E2E A5) plus any
+    # explicit part.fields dict (which wins over a same-named kwarg).
+    extra_props = OrderedDict()
+    for attr_name, attr_val in vars(part).items():
+        canon = _SOURCING_FIELD_KWARGS.get(str(attr_name).lower())
+        if canon and attr_val is not None and str(attr_val).strip():
+            extra_props[canon] = str(attr_val)
+    if hasattr(part, "fields") and isinstance(part.fields, dict):
         for field_name, field_value in part.fields.items():
-            if field_name.lower() in (
-                "reference",
-                "value",
-                "footprint",
-                "datasheet",
-                "description",
-            ):
-                continue
-            if field_value and str(field_value).strip():
-                symbol.append(
-                    Sexp(
-                        [
-                            "property",
-                            field_name,
-                            str(field_value),
-                            ["at", origin.x, origin.y + y_offset, angle],
-                            [
-                                "effects",
-                                ["font", ["size", 1.27, 1.27]],
-                                ["hide", "yes"],
-                            ],
-                        ]
-                    )
-                )
-                y_offset += 1.27
+            if field_value is not None and str(field_value).strip():
+                extra_props[str(field_name)] = str(field_value)
+
+    y_offset = 5.08
+    for field_name, field_value in extra_props.items():
+        if field_name.lower() in (
+            "reference",
+            "value",
+            "footprint",
+            "datasheet",
+            "description",
+        ):
+            continue
+        symbol.append(
+            Sexp(
+                [
+                    "property",
+                    field_name,
+                    field_value,
+                    ["at", origin.x, origin.y + y_offset, angle],
+                    [
+                        "effects",
+                        ["font", ["size", 1.27, 1.27]],
+                        ["hide", "yes"],
+                    ],
+                ]
+            )
+        )
+        y_offset += 1.27
 
     # Pin entries (required by KiCad 8/9 for connectivity tracking).
     for pin in part.pins:

@@ -301,6 +301,42 @@ def test_kicad10_in_bom_false_renders_no(tmp_path):
     assert r_blocks and all("(in_bom yes)" in b for b in r_blocks), "R1 not in_bom yes"
 
 
+def test_kicad10_sourcing_kwargs_render_as_properties(tmp_path):
+    """MPN/Manufacturer bare kwargs (and a fields={} dict) pass through to
+    schematic properties so they reach the BOM (E2E A5)."""
+    from skidl import Net, Part, generate_schematic
+
+    set_default_tool(KICAD10)
+    lib_search_paths["kicad10"] = ["."] + __import__(
+        "skidl.tools.kicad10.lib", fromlist=["default_lib_paths"]
+    ).default_lib_paths()
+    import builtins
+
+    builtins.default_circuit.mini_reset()
+    q1 = Part("Device", "R", ref="Q1", value="IRF740",
+              Manufacturer="Vishay", MPN="IRF740PBF",
+              fields={"Distributor": "DigiKey"},
+              footprint="Package_TO_SOT_THT:TO-220-3_Vertical")
+    r1 = Part("Device", "R", ref="R1", value="10k")  # no sourcing kwargs
+    Net("A").connect(q1[1], r1[1])
+    Net("0").connect(q1[2], r1[2])
+
+    out = tmp_path / "src"
+    out.mkdir()
+    generate_schematic(tool=KICAD10, filepath=str(out), top_name="src")
+    text = sorted(out.glob("*.kicad_sch"))[0].read_text(encoding="utf-8")
+    blocks = text.split("(symbol")
+    q = [b for b in blocks if '"Q1"' in b and "lib_id" in b]
+    assert q, "Q1 symbol instance not found"
+    qb = "".join(q)
+    assert '(property "MPN" "IRF740PBF"' in qb, qb
+    assert '(property "Manufacturer" "Vishay"' in qb
+    assert '(property "Distributor" "DigiKey"' in qb
+    # a part without sourcing kwargs emits none of them
+    r_blocks = "".join(b for b in blocks if '"R1"' in b and "lib_id" in b)
+    assert '(property "MPN"' not in r_blocks
+
+
 @requires_kicad10
 def test_kicad10_schematic_passes_save_gate(tmp_path):
     """A KICAD10-generated schematic (stamp 20230409) passes the hardened save
