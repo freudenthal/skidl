@@ -557,6 +557,79 @@ class Router:
 
         from skidl.logger import active_logger
 
+        def _seg_free_for(moving_pin, fixed, axis, sign, end_v, net, respect_blocked=False):
+            """True if every cell of the axial pin->end stub (interior + end) is
+            free for ``net`` -- so the stub wire never crosses a foreign net's
+            cell (the T-junction fusion) and, optionally, no part body."""
+            n = int(round(abs(end_v - moving_pin) / grid))
+            for i in range(1, n + 1):
+                mv = moving_pin + sign * grid * i
+                ex = fixed if axis == "y" else mv
+                ey = fixed if axis == "x" else mv
+                if not occ.is_free_for(cell(ex, ey), net, respect_blocked=respect_blocked):
+                    return False
+            return True
+
+        # Power-first (render-occupancy plan Phase 2): with power_stubs the power
+        # symbol sits one stub off its pin. That offset was chosen at EMIT time,
+        # blind to the occupancy, so it could land on a signal pin -> KiCad fuses
+        # them (the GND/VREF10 hole). Decide the power stub end HERE instead,
+        # deconflicting it against the seeded pin cells, claim its whole segment,
+        # and record it on the pin so the emitter draws exactly this geometry.
+        # Runs before the signal-stub loop so signal stubs also see power cells.
+        node._power_stub_plan = {}
+        if options.get("power_stubs", False):
+            pstub = 2 * grid  # matches the emitter's _POWER_STUB_LEN (2 grid)
+            pwr_recs = []
+            for part in node.parts:
+                if isinstance(part, NetTerminal):
+                    continue
+                for pin in part:
+                    if not pin.is_connected():
+                        continue
+                    pnet = pin.net
+                    if isinstance(pnet, NCNet) or not getattr(
+                        pnet, "_is_power_net", False
+                    ):
+                        continue
+                    ref = str(getattr(part, "ref", "") or "")
+                    pwr_recs.append(((ref, str(pin.num), id(pin)), pin, pnet))
+            pwr_recs.sort(key=lambda r: r[0])
+            for _pk, pin, pnet in pwr_recs:
+                part = pin.part
+                pin_w = (pin.pt * part.tx).round()
+                pdx, pdy = _world_outward_dir(pin)
+                if abs(pdx) + abs(pdy) != 1:
+                    continue
+                if pdx != 0:
+                    paxis, psign = "x", float(pdx)
+                    pfixed, pmoving = pin_w.y, pin_w.x
+                else:
+                    paxis, psign = "y", float(pdy)
+                    pfixed, pmoving = pin_w.x, pin_w.y
+                end_v = pmoving + psign * pstub
+                tries = 0
+                while tries < 12 and not _seg_free_for(
+                    pmoving, pfixed, paxis, psign, end_v, pnet
+                ):
+                    end_v += psign * grid
+                    tries += 1
+                if not _seg_free_for(pmoving, pfixed, paxis, psign, end_v, pnet):
+                    # No clear stub: pin the symbol ON its own pin (a same-net,
+                    # already-seeded cell -> fusion-safe). Record the pin itself as
+                    # the plan so the emitter uses the on-pin position and does NOT
+                    # fall through to the blind bbox-center offset (which was the
+                    # original fusion source).
+                    pin._pwr_stub_end = Point(pin_w.x, pin_w.y)
+                    node._power_stub_plan[id(pin)] = pin._pwr_stub_end
+                    continue
+                end_x = pfixed if paxis == "y" else end_v
+                end_y = pfixed if paxis == "x" else end_v
+                end_w = Point(round(end_x), round(end_y))
+                occ.claim_segment((pin_w.x, pin_w.y), (end_w.x, end_w.y), pnet)
+                pin._pwr_stub_end = end_w
+                node._power_stub_plan[id(pin)] = end_w
+
         for _key, pin, net, is_routed in pin_recs:
             part = pin.part
             pin_w = (pin.pt * part.tx).round()
@@ -609,21 +682,18 @@ class Router:
             if abs(end_v - moving_pin) < grid:
                 end_v = moving_pin + sign * grid
 
-            # Deconflict: step one grid further out until the cell is free (or
-            # already owned by this same net). Bounded; on exhaustion fall back
-            # to the pin (no stub) with a warning -- the audit remains the net.
-            end_x = fixed if axis == "y" else end_v
-            end_y = fixed if axis == "x" else end_v
+            # Deconflict: step one grid further out until the WHOLE pin->end stub
+            # segment is clear for this net (not just the end cell -- a foreign
+            # net's endpoint could otherwise land on the stub's interior, a KiCad
+            # T-junction fusion). Bounded; on exhaustion fall back to the pin (no
+            # stub) with a warning -- the on-pin label is same-net, fusion-safe.
             tries = 0
-            while tries < 8:
-                c = cell(end_x, end_y)
-                if occ.is_free_for(c, net):
-                    break
+            while tries < 12 and not _seg_free_for(
+                moving_pin, fixed, axis, sign, end_v, net
+            ):
                 end_v += sign * grid
-                end_x = fixed if axis == "y" else end_v
-                end_y = fixed if axis == "x" else end_v
                 tries += 1
-            else:
+            if not _seg_free_for(moving_pin, fixed, axis, sign, end_v, net):
                 active_logger.warning(
                     "deconflict_stubs: could not place a clear stub end for "
                     "pin %s of net %r; labelling on the pin instead",
@@ -633,9 +703,13 @@ class Router:
                 node._stub_ends[id(pin)] = Point(pin_w.x, pin_w.y)
                 pin.route_pt = copy.copy(pin.pt)
                 continue
+            end_x = fixed if axis == "y" else end_v
+            end_y = fixed if axis == "x" else end_v
 
             end_w = Point(round(end_x), round(end_y))
-            occ.set(cell(end_w.x, end_w.y), net)
+            # Register the whole stub segment (interior + end) so no foreign net
+            # can route through it or end on it (T-junction fusion).
+            occ.claim_segment((pin_w.x, pin_w.y), (end_w.x, end_w.y), net)
             node._stub_ends[id(pin)] = end_w
             # Protect the stub END from cleanup's trim_stubs: when A* routes
             # collinearly with a stub, split_segments cuts at the pin and the

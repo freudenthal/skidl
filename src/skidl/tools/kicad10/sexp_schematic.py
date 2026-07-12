@@ -302,30 +302,46 @@ def _power_symbol_to_sexp(pin, net_name, tx, uuid_path=None):
     # rendered (mm, Y-down) space via the linear part of combined_tx.
     x, y = px, py
     if _EMIT_POWER_STUBS:
-        # Offset the symbol one grid step AWAY FROM THE PART BODY, then wire it
-        # back to the pin. Direction = from the part's rendered bbox CENTER toward
-        # the pin, snapped to the dominant axis. This is robust for any rotation /
-        # mirror and sidesteps the calc_pin_dir sign convention (which, mapped
-        # through the sheet Y-flip, points INTO the body -- it inverted the stub
-        # for every axis-aligned part).
-        _ux = _uy = 0.0
-        try:
-            _bb = pin.part.bbox
-            _cen = Point((_bb.ll.x + _bb.ur.x) / 2.0, (_bb.ll.y + _bb.ur.y) / 2.0) * combined_tx
-            _ox, _oy = pt.x - _cen.x, pt.y - _cen.y
-            if abs(_ox) >= abs(_oy):
-                _ux = 1.0 if _ox >= 0 else -1.0
-            else:
-                _uy = 1.0 if _oy >= 0 else -1.0
-        except Exception:  # noqa: BLE001 - never break emission over geometry
-            _ux = _uy = 0.0
-        if (_ux, _uy) != (0.0, 0.0):
-            x = _snap_grid(px + _POWER_STUB_LEN * _ux)
-            y = _snap_grid(py + _POWER_STUB_LEN * _uy)
+        # Prefer the routing-time power-stub plan (render-occupancy plan Phase 2):
+        # add_deconflicted_stubs already chose this stub end deconflicted against
+        # the sheet occupancy (so it cannot land on a signal pin -> the GND/VREF10
+        # fusion) and claimed its cells. The stored end is a WORLD point; render =
+        # world * tx (the same relation as pt = pin_w * tx). Consume it verbatim
+        # so the emitted symbol/stub match exactly what routing reserved.
+        _planned = getattr(pin, "_pwr_stub_end", None)
+        if _planned is not None:
+            _sp = _planned * tx
+            x = _snap_grid(_round_mm(_sp.x))
+            y = _snap_grid(_round_mm(_sp.y))
             if (x, y) != (px, py):
                 _power_stub_wires.append(
                     _sheet_stub_wire_sexp(px, py, x, y, f"pwrstub:{net_name}:{px}:{py}:{x}:{y}")
                 )
+        else:
+            # No routing plan (non-deconflict power_stubs path): fall back to the
+            # blind bbox-center offset -- one grid step AWAY FROM THE PART BODY,
+            # then wire it back to the pin. Direction = from the part's rendered
+            # bbox CENTER toward the pin, snapped to the dominant axis (robust for
+            # any rotation/mirror; sidesteps the calc_pin_dir sign convention that,
+            # mapped through the sheet Y-flip, points INTO the body).
+            _ux = _uy = 0.0
+            try:
+                _bb = pin.part.bbox
+                _cen = Point((_bb.ll.x + _bb.ur.x) / 2.0, (_bb.ll.y + _bb.ur.y) / 2.0) * combined_tx
+                _ox, _oy = pt.x - _cen.x, pt.y - _cen.y
+                if abs(_ox) >= abs(_oy):
+                    _ux = 1.0 if _ox >= 0 else -1.0
+                else:
+                    _uy = 1.0 if _oy >= 0 else -1.0
+            except Exception:  # noqa: BLE001 - never break emission over geometry
+                _ux = _uy = 0.0
+            if (_ux, _uy) != (0.0, 0.0):
+                x = _snap_grid(px + _POWER_STUB_LEN * _ux)
+                y = _snap_grid(py + _POWER_STUB_LEN * _uy)
+                if (x, y) != (px, py):
+                    _power_stub_wires.append(
+                        _sheet_stub_wire_sexp(px, py, x, y, f"pwrstub:{net_name}:{px}:{py}:{x}:{y}")
+                    )
 
     # Power symbol angle: align the symbol body with the schematic pin's
     # outward stub direction.  ``calc_pin_dir`` gives the world-space

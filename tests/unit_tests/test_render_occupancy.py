@@ -367,18 +367,70 @@ def test_refiner_on_no_fusion():
     assert fusions == {}, f"refiner-ON render fused nets: {fusions}"
 
 
+def _routed_node_kicad10(circuit, monkeypatch, refiner_off=True):
+    """Drive the kicad10 place+route pipeline (refiner optionally off) and return
+    the routed root node so tests can read the occupancy + power-stub plan."""
+    from skidl import get_default_tool
+    from skidl.tools import tool_modules
+    from skidl.tools.kicad10.gen_schematic import (
+        mark_power_nets,
+        preprocess_circuit,
+        _place_and_classify,
+    )
+    from skidl.schematics.sch_node import SchNode
+    import skidl.schematics.place as place_mod
+
+    if refiner_off:
+        monkeypatch.setattr(place_mod, "push_and_pull", lambda *a, **k: None)
+    opts = dict(_RENDER_OPTS, use_push_pull=True, rotate_parts=True,
+                pt_to_pt_mult=5, pin_normalize=True)
+    mark_power_nets(circuit, **opts)
+    preprocess_circuit(circuit, **opts)
+    node = SchNode(circuit, tool_modules[get_default_tool()], ".", "c", "t", 0.0)
+    _place_and_classify(node, circuit, 1.0, **opts)
+    node.route(**opts)
+    return node
+
+
 @requires_kicad10
-@pytest.mark.xfail(
-    strict=True,
-    reason="Structural hole (root causes #1-#3): power-symbol/stub cells are "
-    "decided at EMIT time and never enter the router's deconflict occupancy, so "
-    "the constructive seed alone lets a GND power symbol land on a VREF10 stub -> "
-    "KiCad fuses them. The force-directed refiner only accidentally masks this by "
-    "spreading parts out. Phase 2 (unified SheetOccupancy: power + stub segments) "
-    "closes it independent of spacing, at which point this flips to PASS.",
-)
+def test_power_stub_deconfliction_engaged(monkeypatch):
+    """Phase 2 mechanism: with power_stubs the routing pass plans a power-stub
+    end for the power pins (deconflicted against the seeded occupancy), and no
+    planned power-stub end lands on a cell the occupancy owns for a DIFFERENT
+    net. Proves the fix engaged, not merely that placement happened to be clean.
+    """
+    _use_kicad10()
+    ckt = _build_packed_canary()
+    node = _routed_node_kicad10(ckt, monkeypatch, refiner_off=True)
+
+    plan = getattr(node, "_power_stub_plan", None)
+    occ = getattr(node, "_occupancy", None)
+    assert plan is not None and occ is not None
+    assert plan, "power-stub plan is empty -- the Phase 2 power pass did not run"
+
+    # Map each planned pin id -> its power net, then check every planned end cell
+    # is owned (in the registry) by that same power net, never a foreign net.
+    pin_net = {}
+    for part in node.parts:
+        for pin in part:
+            pin_net[id(pin)] = getattr(pin, "net", None)
+    for pid, end in plan.items():
+        net = pin_net.get(pid)
+        c = occ.cell(end.x, end.y)
+        owner = occ.owner(c)
+        assert owner is net, (
+            f"planned power-stub end {c} owned by {getattr(owner,'name','?')}, "
+            f"not its own net {getattr(net,'name','?')}"
+        )
+
+
+@requires_kicad10
 def test_refiner_off_no_fusion():
     """With the refiner OFF (constructive seed only) the render must NOT fuse
-    nets. It does today (GND/VREF10), so this is xfail until Phase 2."""
+    nets. Phase 2 closed the GND/VREF10 hole independent of spacing: power
+    symbols/stubs claim their cells at routing time (deconflicted against the
+    seeded pins) and signal stubs register their full segment, so nothing can
+    land on a foreign net's cell. This asserts the fix holds with the
+    force-directed refiner provably not running."""
     fusions = _render_and_scan(refiner_on=False)
     assert fusions == {}, f"refiner-OFF render fused nets: {fusions}"
