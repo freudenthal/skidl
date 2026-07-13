@@ -590,6 +590,51 @@ def _gen_uuid(name=""):
     return str(uuid.uuid5(_NAMESPACE_UUID, name))
 
 
+def _top_level_uuid(elem):
+    """Return a top-level element's own ``uuid`` value, or None.
+
+    Only the element's DIRECT ``(uuid ...)`` child is considered -- nested uuids
+    (a symbol's per-pin uuids, a sheet's pin uuids) are left alone.
+    """
+    if not isinstance(elem, (list, Sexp)) or not len(elem):
+        return None
+    for sub in elem:
+        if isinstance(sub, (list, Sexp)) and len(sub) >= 2 and sub[0] == "uuid":
+            return str(sub[1])
+    return None
+
+
+def _dedupe_elements_by_uuid(elements):
+    """Drop later top-level elements whose ``uuid`` already appeared on the sheet.
+
+    Element uuids are deterministic uuid5(kind:net:coords) hashes, so a repeated
+    uuid means the identical element (wire/label/junction) was emitted twice --
+    typically from coincident same-net pins double-drawing a stub wire or a stub
+    end being labelled as both an island anchor and a leaf. The duplicates are
+    visually identical; keeping one is faithful and avoids a duplicate-uuid error
+    in any consumer that keys a unique index on uuid (kicad-sch-api / ERC autofix).
+    Elements without a top-level uuid are always kept.
+    """
+    seen = set()
+    out = []
+    dropped = 0
+    for elem in elements:
+        u = _top_level_uuid(elem)
+        if u is not None:
+            if u in seen:
+                dropped += 1
+                continue
+            seen.add(u)
+        out.append(elem)
+    if dropped:
+        from skidl.logger import active_logger
+
+        active_logger.info(
+            "render: collapsed %d duplicate coincident element(s) by uuid", dropped
+        )
+    return out
+
+
 def _round_mm(val, ndigits=2):
     """Round a value to *ndigits* decimal places for mm output.
 
@@ -2649,6 +2694,17 @@ def node_to_sexp_schematic(node, uuid_path, sheet_tx=Tx(), version=20230409):
     # fusion mechanism Blocker B fixed). Enforcement is the downstream
     # equivalence gate + native fallback; this just localizes a regression.
     _audit_sheet_connectivity(node, elements, _backend, tx)
+
+    # Collapse byte-identical duplicate elements by UUID before writing. Every
+    # element UUID is a deterministic uuid5 of (kind, net, coords), so two elements
+    # carrying the SAME uuid are the SAME wire/label/junction drawn twice -- e.g.
+    # two coincident same-net pins each draw their pin->stub-end wire, and the
+    # closure labeller labels a shared stub end once as an island anchor and again
+    # as a leaf. Coincident same-net geometry is visually identical whether emitted
+    # once or twice, but a repeated UUID is a hard error for any consumer that keys
+    # a unique index on uuid (kicad-sch-api, and thus the ERC autofix). Keep the
+    # first occurrence; drop later top-level elements whose uuid already appeared.
+    elements = _dedupe_elements_by_uuid(elements)
 
     # Add all the collected elements of the schematic.
     for elem in elements:
