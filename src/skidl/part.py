@@ -1438,10 +1438,54 @@ def default_empty_footprint_handler(part):
         By default, this function logs an error message if the footprint is missing.
         Override this function if you want to try and set some default footprint
         for particular types of parts (such as using an 0805 footprint for a resistor).
+        Simulation-only parts (KiCad's ``Simulation_SPICE`` library -- sources,
+        probes) never have footprints, so they log a warning instead of an error
+        (LLC E2E R4: they counted as phantom "errors" beside a clean ERC gate).
     """
 
+    import os as _os
+
     from .logger import active_logger
+
+    lib_name = str(getattr(getattr(part, "lib", None), "filename", "") or "")
+    if "simulation_spice" in _os.path.basename(lib_name).lower():
+        active_logger.bare_warning(
+            f"No footprint for sim-only part {part.name}/{part.ref} (expected)."
+        )
+        return
+
+    # A part carrying Sim.* modeling fields (e.g. a Device:Transformer_1P_SS with
+    # Sim_Params, or any device given a Sim_Device/Sim_Library) is sim-modeled;
+    # a missing footprint is benign for simulation, so warn rather than emit a red
+    # ERROR that reads like a failure beside a clean footprint gate (C8). It still
+    # needs a footprint before fab.
+    if _part_is_sim_modeled(part):
+        active_logger.bare_warning(
+            f"No footprint for sim-modeled part {part.name}/{part.ref} "
+            f"(fine for simulation; add one before fab)."
+        )
+        return
 
     active_logger.bare_error(
         f"No footprint for {part.name}/{part.ref} added at {part.src_line(True)}."
     )
+
+
+def _part_is_sim_modeled(part) -> bool:
+    """True if a part carries any ``Sim.*`` modeling field.
+
+    Handles both the live-attribute form (``part.Sim_Params``, set in skidl
+    source) and the ``_extra_fields``/``fields`` dict form (parts loaded from a
+    schematic, where the native ``Sim.Params`` dotted key lands).
+    """
+    for attr in ("Sim_Params", "Sim_Device", "Sim_Library", "Sim_Name"):
+        if getattr(part, attr, None):
+            return True
+    for holder in ("_extra_fields", "fields"):
+        d = getattr(part, holder, None)
+        if isinstance(d, dict):
+            for k, v in d.items():
+                kl = str(k).lower()
+                if (kl.startswith("sim.") or kl.startswith("sim_")) and v:
+                    return True
+    return False

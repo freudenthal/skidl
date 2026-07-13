@@ -1,0 +1,11 @@
+* Lower-precedence duplicate of DUP (uncategorized/ path)
+.subckt DUP 9 8 7
+r1 9 7 2k
+.ends
+* An op-amp-style subckt with a continuation line and an INTERNAL model that
+* must NOT be indexed as a top-level name.
+.subckt OPA5 1 2 3
++ 4 5 PARAMS: gain=1e5
+e1 6 0 1 2 100k
+.model DX D (IS=1e-14)
+.ends OPA5

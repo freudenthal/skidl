@@ -1,0 +1,7 @@
+* Vendor library fixture (highest precedence via Manufacturer/ path)
+* connections: in+ in- out
+.subckt DUP 1 2 3
+r1 1 3 1k
+r2 2 3 1k
+.ends DUP
+.model VNMOS NMOS (VTO=2 KP=20u)
