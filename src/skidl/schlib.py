@@ -27,6 +27,24 @@ from .utilities import (
 )
 
 
+def _unbound_kicad_lib_hint(tool, paths):
+    """One-line hint when a KiCad-tool library lookup fails with no real symbol
+    library paths bound -- the classic 'forgot setup_kicad10()' case (HV LLC N2).
+
+    Returns "" for a non-KiCad tool, or when ``paths`` holds at least one real
+    directory (a genuine missing-file error, which must not be masked).
+    """
+    if not str(tool or "").lower().startswith("kicad"):
+        return ""
+    real = [p for p in (paths or []) if p and str(p).strip() not in (".", "")]
+    if real:
+        return ""
+    return (
+        " (no KiCad symbol libraries are bound -- if using skidl-eda, call "
+        "setup_kicad10() before creating Parts)"
+    )
+
+
 @export_to_all
 class SchLib(object):
     """
@@ -108,9 +126,20 @@ class SchLib(object):
                 ValueError,
                 f"Unsupported ECAD tool library: {tool}.",
             )
-        abs_filename = get_abs_filename(
-            filename, paths, exts, allow_failure=False, descend=-1
-        )
+        try:
+            abs_filename = get_abs_filename(
+                filename, paths, exts, allow_failure=False, descend=-1
+            )
+        except FileNotFoundError as exc:
+            # Append a pointed hint when a KiCad backend was asked for a library
+            # with no real symbol paths bound (forgot setup_kicad10()); the raw
+            # "Can't open file: <lib>" otherwise names a random lib, not the
+            # cause (HV LLC N2). A genuine missing file with paths bound is
+            # re-raised unchanged.
+            hint = _unbound_kicad_lib_hint(tool, paths)
+            if hint:
+                raise FileNotFoundError(f"{exc}{hint}") from exc
+            raise
 
         # Don't pickle files stored in remote repos because it's difficult to
         # get their modification times to compare against the local pickled library
