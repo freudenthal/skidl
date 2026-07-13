@@ -905,6 +905,88 @@ class SpiceConverter:
         return None, None, None, ""
 
     @staticmethod
+    def _norm_node_name(s) -> str:
+        """Normalize a subckt node / symbol pin name for name-matching (S1):
+        strip the KiCad overbar wrapper ``~{...}``, a leading ``/``, underscores
+        and whitespace, then casefold. ``~{SD}``/``SD``/``sd`` compare equal."""
+        s = str(s or "").strip()
+        s = s.replace("~{", "").replace("}", "").replace("~", "")
+        return s.lstrip("/").replace("_", "").strip().casefold()
+
+    def _warn_crossed_sim_pins(self, ref, component, pins_spec, subckt_nodes):
+        """Heuristic guard: warn when a ``Sim.Pins`` mapping looks *swapped* (S1).
+
+        For a driver/IC subckt whose node names are self-descriptive (``VCC IN SD
+        com VB HO VS LO``), a user who pasted a *positional* mapping (assuming the
+        symbol's pin numbering matches the subckt's node order) silently
+        cross-wires pairs. We can't error -- vendor node names may legitimately
+        differ from a symbol's pin names -- but a clean swap (>=2 pins whose own
+        NAME equals some node X, yet are mapped to a different node Y, with X
+        assigned to another pin) is almost always a mistake. Numeric node names
+        are exempt (no name to match). One warning per (ref) per run.
+        """
+        mapping = self._parse_sim_pins(pins_spec)
+        if not mapping or not subckt_nodes:
+            return
+        warned = getattr(self, "_crossed_pins_warned", None)
+        if warned is None:
+            warned = self._crossed_pins_warned = set()
+        if ref in warned:
+            return
+        # symbol pin number -> pin name
+        pin_names = {}
+        pin_map = getattr(component, "_pins", None)
+        if isinstance(pin_map, dict):
+            for num, pin in pin_map.items():
+                pin_names[str(num)] = (getattr(pin, "name", "") or "").strip()
+        # nodes that carry a matchable (alphabetic) name -> normalized -> node
+        norm_node = {}
+        for n in subckt_nodes:
+            if any(c.isalpha() for c in n):
+                norm_node[self._norm_node_name(n)] = n
+        # the node name each symbol pin is actually mapped to
+        assigned = {}
+        for sym_pin, target in mapping.items():
+            if target in subckt_nodes:
+                assigned[str(sym_pin)] = target
+            else:
+                try:
+                    idx = int(target)
+                except (TypeError, ValueError):
+                    continue
+                if 1 <= idx <= len(subckt_nodes):
+                    assigned[str(sym_pin)] = subckt_nodes[idx - 1]
+        assigned_norms = {self._norm_node_name(v) for v in assigned.values()}
+        crossed = []
+        for num, name in pin_names.items():
+            if not name or not any(c.isalpha() for c in name):
+                continue
+            nn = self._norm_node_name(name)
+            if nn not in norm_node:
+                continue  # this pin's name isn't one of the subckt's node names
+            got = assigned.get(num)
+            if got is None or self._norm_node_name(got) == nn:
+                continue  # not assigned, or assigned to its own-named node (fine)
+            # pin's name matches node `nn`, but it's mapped elsewhere -- and `nn`
+            # is claimed by some other pin => a genuine cross, not just a rename.
+            if nn in assigned_norms:
+                crossed.append((num, name, got, norm_node[nn]))
+        if len(crossed) >= 2:
+            warned.add(ref)
+            details = "; ".join(
+                f"pin {num} (name {name!r}) -> node '{got}' but its name matches "
+                f"node '{exp}'"
+                for num, name, got, exp in crossed
+            )
+            logger.warning(
+                f"{ref}: Sim.Pins may be CROSSED -- {len(crossed)} pins are mapped "
+                f"to a node other than the one matching their own name "
+                f"({details}). If you pasted a positional mapping, note the "
+                f"subckt's node ORDER need not match your symbol's pin numbering; "
+                f"map each pin to the node whose NAME is that pin's role."
+            )
+
+    @staticmethod
     def _parse_sim_pins(spec) -> dict:
         """Parse KiCad ``Sim.Pins`` (``"1=out 2=inp"``) -> {symbol_pin: target}."""
         out = {}
@@ -1064,9 +1146,11 @@ class SpiceConverter:
         base = os.path.basename(str(path))
 
         if kind_in_file == "subckt":
-            nodes = self._external_nodes(
-                component, self._sim_props(component).get("pins"), subckt_nodes
-            )
+            pins_spec = self._sim_props(component).get("pins")
+            nodes = self._external_nodes(component, pins_spec, subckt_nodes)
+            # Warn (never error) if the mapping looks like a positional-paste swap
+            # for a named-node subckt (S1).
+            self._warn_crossed_sim_pins(ref, component, pins_spec, subckt_nodes)
             if subckt_nodes and len(nodes) != len(subckt_nodes):
                 # A wrong/short Sim.Pins mapping would emit an X line with the
                 # wrong node count -> a cryptic ngspice "Too few parameters for
