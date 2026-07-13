@@ -52,7 +52,7 @@ from .circuit import Circuit  # Circuit management
 from .node import Group, SubCircuit, subcircuit  # Grouping related components
 from .interface import Interface  # Standardized connections between subcircuits
 from .logger import erc_logger  # Logger for ERC (Electrical Rule Checking)
-from .net import Net  # Class for electrical connections between pins
+from .net import NCNet, Net  # Nets; NCNet marks a pin as an intentional no-connect
 from .design_class import PartClass  # Class for assigning properties to groups of parts
 from .design_class import NetClass  # Class for assigning properties to groups of nets
 from .netlist_to_skidl import netlist_to_skidl  # Function to import netlists
