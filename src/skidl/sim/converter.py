@@ -3226,6 +3226,57 @@ class SpiceConverter:
         multiplier = multipliers.get(suffix, 1.0)
         return numeric_part * multiplier
 
+    def _active_driver_net_names(self) -> set:
+        """Net names already driven by a real ``OUTPUT``/``PWROUT`` pin.
+
+        The net-name supply heuristic must skip these: an op-amp/regulator output
+        already sources the net, and a phantom rail stacked on top would fight the
+        real driver (E2E D1 -- a net named ``VIN_SS`` driven by an op-amp output
+        silently got a 5 V supply, corrupting the whole VCO). Derived from the
+        *component* side because the flat-view nets don't carry pin funcs; each
+        live component exposes a ``{pin_num: Pin}`` map whose pins carry both
+        ``.net`` and ``.func``. A ``Sim.Enable=0`` part drives nothing in sim, so
+        it is skipped. Best-effort: pins without a usable ``func`` are ignored, so
+        a genuine undriven rail is never mis-skipped.
+        """
+        # Live Pin objects carry ``func`` as a ``pin_types`` IntEnum; the flat
+        # view's AdaptedComponent stores it as a lowercase string ("output"/
+        # "pwrout"). Accept both forms.
+        driving_names = {"output", "pwrout"}
+        try:
+            from skidl.pin import pin_types
+
+            driving_vals = {int(pin_types.OUTPUT), int(pin_types.PWROUT)}
+        except Exception:  # noqa: BLE001 - pin metadata unavailable
+            driving_vals = set()
+
+        def _is_driver(func) -> bool:
+            if func is None:
+                return False
+            if isinstance(func, str):
+                return func.strip().lower() in driving_names
+            try:
+                if int(func) in driving_vals:
+                    return True
+            except (TypeError, ValueError):
+                pass
+            nm = getattr(func, "name", None)
+            return isinstance(nm, str) and nm.lower() in driving_names
+
+        driven = set()
+        for component in self._iter_components():
+            if self._sim_excluded(component):
+                continue
+            pin_map = getattr(component, "_pins", None)
+            if not isinstance(pin_map, dict):
+                continue
+            for pin in pin_map.values():
+                if _is_driver(getattr(pin, "func", None)):
+                    name = getattr(getattr(pin, "net", None), "name", None)
+                    if name:
+                        driven.add(name)
+        return driven
+
     def _add_power_sources(self):
         """Add power sources needed for simulation."""
         # Check if we need to add power sources based on net names
@@ -3239,6 +3290,8 @@ class SpiceConverter:
         else:
             return
 
+        active_drivers = self._active_driver_net_names()
+
         for net in nets_to_process:
             orig_name = getattr(net, "name", str(net))
             # An explicit source component already drives this net; don't add a
@@ -3247,8 +3300,19 @@ class SpiceConverter:
             if orig_name in self.driven_nets:
                 continue
             voltage = self._heuristic_source_voltage(orig_name)
-            if voltage is not None:
-                power_nets.append((orig_name, voltage))
+            if voltage is None:
+                continue
+            # A net already driven by a real OUTPUT/PWROUT pin (op-amp/regulator
+            # output) must not get a heuristic supply stacked on it (E2E D1).
+            if orig_name in active_drivers:
+                logger.warning(
+                    f"Net '{orig_name}': name matches the supply heuristic "
+                    f"({voltage} V) but it is already driven by an OUTPUT/PWROUT "
+                    f"pin -- NOT injecting a supply (a phantom rail would fight the "
+                    f"real driver). Rename the net if you did want a bare rail here."
+                )
+                continue
+            power_nets.append((orig_name, voltage))
 
         # Add voltage sources
         for i, (net_name, voltage) in enumerate(power_nets):
@@ -3257,7 +3321,7 @@ class SpiceConverter:
             self.spice_circuit.V(
                 source_name, spice_node, self.spice_circuit.gnd, voltage @ u_V
             )
-            logger.info(
+            logger.warning(
                 f"Net '{net_name}': injecting heuristic {voltage} V supply "
                 f"{source_name} from its NAME. If unintended, rename the net or "
                 f"drive it with an explicit Simulation_SPICE:VDC (explicit "
@@ -3309,8 +3373,10 @@ class SpiceConverter:
         as a ``VIN`` rail -- that substring trap injected a phantom 5 V supply and
         clamped a 32.5 V boost output (bug #13). Known accepted limitation: a name
         like ``MAIN_VIN_SENSE`` still matches on the whole token ``VIN`` -- token
-        matching cannot tell it is a sense line; the INFO log in
-        ``_add_power_sources`` makes any such injection visible.
+        matching cannot tell it is a sense line. Two backstops make an unintended
+        match harmless: ``_add_power_sources`` skips the injection entirely when
+        the net is already driven by an ``OUTPUT``/``PWROUT`` pin (E2E D1), and it
+        logs any injection it does perform at WARNING (a circuit-mutating action).
         """
         upper = net_name.upper()
         tokens = {t for t in re.split(r"[^A-Z0-9+]+", upper) if t}
