@@ -22,6 +22,7 @@ from skidl.sim.simulator import (  # noqa: E402
     _augment_ngspice_error,
     _parse_si_time,
     _to_seconds,
+    _uic_collapse_hint,
 )
 
 
@@ -81,6 +82,50 @@ def test_augment_no_output_returns_same():
     exc = RuntimeError("Command 'run' failed")
     aug = _augment_ngspice_error(_FakeSim(_FakeShared()), exc)
     assert aug is exc
+
+
+# --- S4: driven-subckt UIC-collapse HINT (pure) ----------------------------
+
+_COLLAPSE = ('doing transient analysis\nTimestep too small; time=2.0e-10, '
+             'timestep=1.25e-19: trouble with node "xu1.md1_5"\nrun aborted\n')
+
+
+def test_uic_collapse_hint_present_when_uic():
+    hint = _uic_collapse_hint(_COLLAPSE, uic=True)
+    assert "HINT" in hint
+    assert "xu1" not in hint and "'u1'" in hint  # ref surfaced without the x prefix
+    assert "without use_initial_condition" in hint.lower()
+
+
+def test_uic_collapse_hint_absent_when_uic_off():
+    assert _uic_collapse_hint(_COLLAPSE, uic=False) == ""
+
+
+def test_uic_collapse_hint_absent_for_external_node():
+    # An *external* node ("sw", no x<ref>. prefix) is not the subckt-internal
+    # collapse signature -> no hint.
+    txt = ('Timestep too small; time=2.0e-10: trouble with node "sw"\n'
+           'run aborted\n')
+    assert _uic_collapse_hint(txt, uic=True) == ""
+
+
+def test_uic_collapse_hint_absent_when_time_large():
+    # A late-time timestep failure is a real switching-transient issue, not a
+    # t~=0 UIC-initialization collapse.
+    txt = ('Timestep too small; time=3.0e-3: trouble with node "xu1.md1_5"\n'
+           'run aborted\n')
+    assert _uic_collapse_hint(txt, uic=True) == ""
+
+
+def test_augment_includes_uic_hint():
+    exc = RuntimeError("Command 'run' failed")
+    aug = _augment_ngspice_error(_FakeSim(_FakeShared(stdout=_COLLAPSE)), exc,
+                                 uic=True)
+    assert "HINT" in str(aug) and "'u1'" in str(aug)
+    # without uic, only the tail is appended, no hint
+    aug2 = _augment_ngspice_error(_FakeSim(_FakeShared(stdout=_COLLAPSE)), exc,
+                                  uic=False)
+    assert "HINT" not in str(aug2) and "Timestep too small" in str(aug2)
 
 
 # --- B3 live: an SI-string transient actually runs -------------------------

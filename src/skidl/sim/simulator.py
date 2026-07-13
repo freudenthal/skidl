@@ -209,7 +209,49 @@ def _to_seconds(value, name):
     return parsed
 
 
-def _augment_ngspice_error(simulator, exc):
+_UIC_INTERNAL_NODE_RE = re.compile(
+    r'trouble with node\s+"x([^".]+)\.', re.IGNORECASE)
+_NGSPICE_TIME_RE = re.compile(r"time\s*=\s*([0-9.eE+-]+)")
+
+
+def _uic_collapse_hint(text, uic):
+    """Return a HINT string when ngspice's output is the classic *driven*-subckt
+    UIC-collapse signature (HV LLC S4), else "".
+
+    A vendor behavioral driver/controller subckt (internal ``.ic`` caps + ABM
+    ``VALUE{}`` nodes) can die at t~=0 under a whole-circuit ``use_initial_condition``
+    even though the circuit is DRIVEN and has a perfectly good DC operating point
+    (``Timestep too small; time=2e-10 ... trouble with node "xu1.md1_5"``). The
+    signature: ``Timestep too small`` + trouble with an *internal* subckt node
+    (``x<ref>.<node>``) + a reported time below ~1 us + ``uic`` was on.
+    """
+    if not uic or not text:
+        return ""
+    low = text.lower()
+    if "timestep too small" not in low:
+        return ""
+    m = _UIC_INTERNAL_NODE_RE.search(text)
+    if not m:
+        return ""
+    tm = _NGSPICE_TIME_RE.search(text)
+    if tm:
+        try:
+            if float(tm.group(1)) >= 1e-6:
+                return ""
+        except ValueError:
+            pass
+    ref = m.group(1)
+    return (
+        f"\nHINT: an internal node of vendor subckt '{ref}' collapsed at t~=0 "
+        f"under use_initial_condition. If this circuit is DRIVEN (it has a DC "
+        f"operating point -- e.g. a gate-driven bridge, not a self-oscillator), "
+        f"retry WITHOUT use_initial_condition: the op-point start initializes "
+        f"behavioral subckt internals consistently. Reserve uic for "
+        f"self-oscillating cores."
+    )
+
+
+def _augment_ngspice_error(simulator, exc, uic=False):
     """Return ``exc`` unchanged, or -- best effort -- a same-typed copy with the
     tail of ngspice's captured console output appended (E2E finding B1).
 
@@ -218,6 +260,9 @@ def _augment_ngspice_error(simulator, exc):
     ``Timestep too small ... trouble with xq1:dmos-instance``) lives in the
     shared ngspice instance's stdout/stderr, retained until the next command
     clears it. Any failure to read it returns ``exc`` unchanged.
+
+    When ``uic`` is True and the output is the driven-subckt UIC-collapse
+    signature, a fix HINT is appended too (S4).
     """
     try:
         shared = getattr(simulator, "ngspice", None)
@@ -230,6 +275,9 @@ def _augment_ngspice_error(simulator, exc):
             return exc
         tail = "\n".join(text.splitlines()[-15:])
         msg = f"{exc}\n--- ngspice output (tail) ---\n{tail}"
+        hint = _uic_collapse_hint(text, uic)
+        if hint:
+            msg += hint
         try:
             new = type(exc)(msg)
         except Exception:
@@ -818,16 +866,18 @@ class CircuitSimulator:
         return simulator
 
     @staticmethod
-    def _run_analysis(simulator, thunk):
+    def _run_analysis(simulator, thunk, uic=False):
         """Run one PySpice analysis, surfacing ngspice's failure reason (B1).
 
         On ``NgSpiceCommandError`` (the opaque ``Command 'run' failed``) the tail
         of ngspice's captured console output is appended to the message; the
-        exception type is preserved so existing ``except`` clauses still catch."""
+        exception type is preserved so existing ``except`` clauses still catch.
+        ``uic`` (True on a UIC transient) enables the driven-subckt collapse HINT
+        (S4)."""
         try:
             return thunk()
         except NgSpiceCommandError as exc:
-            augmented = _augment_ngspice_error(simulator, exc)
+            augmented = _augment_ngspice_error(simulator, exc, uic=uic)
             if augmented is exc:
                 raise
             raise augmented from exc
@@ -968,7 +1018,9 @@ class CircuitSimulator:
             kwargs["max_time"] = max_time @ u_s
         if use_initial_condition:
             kwargs["use_initial_condition"] = True
-        analysis = self._run_analysis(simulator, lambda: simulator.transient(**kwargs))
+        analysis = self._run_analysis(
+            simulator, lambda: simulator.transient(**kwargs),
+            uic=use_initial_condition)
 
         return SimulationResult(analysis, "transient")
 
