@@ -1320,14 +1320,32 @@ class SpiceConverter:
             return None
         if hit is None:
             return None
-        if hit.kind == "subckt" and not sim.get("pins") and prefer != "library":
-            logger.debug(
-                f"{getattr(component, 'ref', '?')}: library index has subckt "
-                f"'{hit.name}' but no Sim.Pins; not auto-resolving (run "
-                f"find_spice_model to get the pin mapping, or set "
-                f"Sim.Prefer=library)"
+        if hit.kind == "subckt" and prefer != "library":
+            # A subckt auto-resolves only when Sim.Pins actually pins ITS nodes.
+            # An absent map -- or a symbol-default map that names none of the
+            # subckt's nodes -- is not an explicit node order, so fall through to
+            # the built-in/generic model. This matters out of the box: a KiCad
+            # symbol carries a default Sim.Pins for the ngspice PRIMITIVE (a diode
+            # is "1=K 2=A"), which is meaningless to a same-named corpus .subckt
+            # whose nodes are e.g. "1 2". Treating that default as an explicit
+            # subckt map used to emit an invalid X-line and hard-fail; instead we
+            # keep the intended generic model. A partial-but-nonzero map still
+            # falls through to _emit_external's mismatch error (a real, loud
+            # signal that a user's explicit Sim.Pins is wrong). Sim.Prefer="library"
+            # opts a part into the corpus subckt regardless.
+            pins_spec = sim.get("pins")
+            mapped = (
+                self._external_nodes(component, pins_spec, hit.nodes)
+                if pins_spec else []
             )
-            return None
+            if not mapped:
+                logger.debug(
+                    f"{getattr(component, 'ref', '?')}: library index has subckt "
+                    f"'{hit.name}' but Sim.Pins does not map its nodes "
+                    f"({hit.nodes}); using the built-in model (set Sim.Pins to the "
+                    f"subckt's nodes, or Sim.Prefer=library, to use the corpus model)"
+                )
+                return None
         return hit
 
     def _add_index_model(self, component, ref, hit) -> None:

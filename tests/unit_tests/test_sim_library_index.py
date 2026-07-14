@@ -158,3 +158,40 @@ def test_converter_auto_resolves_model_from_index(monkeypatch):
     cache = os.path.join(FIXTURES, "_conv_cache.json")
     if os.path.exists(cache):
         os.remove(cache)
+
+
+@requires_sim
+def test_subckt_index_hit_without_usable_sim_pins_falls_through(monkeypatch):
+    """A same-named corpus .subckt must NOT hijack a generic part out of the box.
+
+    A KiCad diode symbol carries a default ``Sim.Pins="1=K 2=A"`` for the ngspice
+    diode PRIMITIVE. If a part's value happens to match a corpus ``.subckt`` (here
+    the 3-node ``DUP`` fixture), that symbol-default map names none of the subckt's
+    nodes -- so we must fall through to the built-in/generic model rather than emit
+    an invalid X-line and hard-fail (env-reinit ISSUE-3). Sim.Prefer="library" is
+    the explicit opt-in for the corpus subckt; absent it, generic wins.
+    """
+    monkeypatch.setenv("SKIDL_SPICE_LIB_PATH", FIXTURES)
+    monkeypatch.setenv(
+        "SKIDL_SPICE_LIB_CACHE", os.path.join(FIXTURES, "_conv_cache2.json"))
+    try:
+        _setup_kicad()
+        v = Part("Simulation_SPICE", "VDC", ref="V1", value="5")
+        r = Part("Device", "R", ref="R1", value="1k")
+        # value matches the DUP .subckt (3 nodes); only the symbol-default Sim.Pins
+        d = Part("Device", "D", ref="D1", value="DUP", Sim_Params="BV=12")
+    except Exception:
+        pytest.skip("KiCad symbol libs not available on this host")
+    Net("VIN").connect(v[1], r[1])
+    Net("VD").connect(r[2], d["A"])
+    Net("0").connect(v[2], d["K"])
+    conv = _conv()
+    conv.convert(strict=False)  # must NOT raise SimulationValidationError
+    prov = conv.model_provenance.get("D1")
+    # Fell through to the built-in generic diode, not the corpus subckt.
+    assert prov is None or prov.source != "library_index"
+    if prov is not None:
+        assert prov.tier == "generic"
+    cache = os.path.join(FIXTURES, "_conv_cache2.json")
+    if os.path.exists(cache):
+        os.remove(cache)
