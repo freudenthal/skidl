@@ -213,6 +213,15 @@ _UIC_INTERNAL_NODE_RE = re.compile(
     r'trouble with node\s+"x([^".]+)\.', re.IGNORECASE)
 _NGSPICE_TIME_RE = re.compile(r"time\s*=\s*([0-9.eE+-]+)")
 
+# Model-load tally (A5). Benign: ngspice drops PSpice-only .model params it does
+# not know and loads the card anyway. Hard: a model card ngspice could not use.
+_BENIGN_PARAM_RE = re.compile(r"unrecognized parameter.*ignored", re.IGNORECASE)
+_MODEL_LOAD_FAIL_RE = re.compile(
+    r"can't find.*model|unable to find.*model|no such.*model|"
+    r"undefined model|error on line",
+    re.IGNORECASE,
+)
+
 
 def _uic_collapse_hint(text, uic):
     """Return a HINT string when ngspice's output is the classic *driven*-subckt
@@ -251,6 +260,38 @@ def _uic_collapse_hint(text, uic):
     )
 
 
+_NO_DC_SOLUTION_RE = re.compile(
+    r"no convergence in dc analysis|singular matrix|"
+    r"gmin step(ping)? failed|source step(ping)? failed|"
+    r"iteration limit reached",
+    re.IGNORECASE,
+)
+
+
+def _no_dc_solution_hint(text):
+    """Return a HINT when ngspice found no DC operating point (E2E finding B3).
+
+    A self-oscillating circuit (ring/relaxation oscillator) or a feedback loop
+    that will not cold-start HAS no DC solution, so ``operating_point()``/``.op``
+    surfaces only an opaque ``Command 'run' failed``. The signature is a DC-solve
+    failure in the captured tail (``no convergence in dc analysis`` / ``singular
+    matrix`` / gmin- or source-stepping failure). Steer the user to a seeded stiff
+    transient (the complement of the driven-subckt UIC hint, which steers the
+    other way). Best-effort; empty string when the signature is absent.
+    """
+    if not text or not _NO_DC_SOLUTION_RE.search(text):
+        return ""
+    return (
+        "\nHINT: ngspice found no DC operating point. A self-oscillating circuit "
+        "(relaxation/ring oscillator) or a feedback loop that will not cold-start "
+        "has NO DC solution, so operating_point()/.op cannot converge. Run a "
+        "seeded transient instead: transient_analysis(stiff=True, "
+        "use_initial_condition=True, initial_conditions={<a ramp/timing node>: "
+        "0.0}); and for rail/regulation figures, op-point an ISOLATED DC "
+        "sub-block (e.g. the LDO + load alone), not the whole oscillating circuit."
+    )
+
+
 def _augment_ngspice_error(simulator, exc, uic=False):
     """Return ``exc`` unchanged, or -- best effort -- a same-typed copy with the
     tail of ngspice's captured console output appended (E2E finding B1).
@@ -276,6 +317,10 @@ def _augment_ngspice_error(simulator, exc, uic=False):
         tail = "\n".join(text.splitlines()[-15:])
         msg = f"{exc}\n--- ngspice output (tail) ---\n{tail}"
         hint = _uic_collapse_hint(text, uic)
+        if not hint:
+            # Complementary case: no DC operating point at all (self-oscillator /
+            # cold-start feedback loop) -> steer to a seeded stiff transient (B3).
+            hint = _no_dc_solution_hint(text)
         if hint:
             msg += hint
         try:
@@ -865,8 +910,7 @@ class CircuitSimulator:
             simulator.options(**options)
         return simulator
 
-    @staticmethod
-    def _run_analysis(simulator, thunk, uic=False):
+    def _run_analysis(self, simulator, thunk, uic=False):
         """Run one PySpice analysis, surfacing ngspice's failure reason (B1).
 
         On ``NgSpiceCommandError`` (the opaque ``Command 'run' failed``) the tail
@@ -875,12 +919,54 @@ class CircuitSimulator:
         ``uic`` (True on a UIC transient) enables the driven-subckt collapse HINT
         (S4)."""
         try:
-            return thunk()
+            result = thunk()
         except NgSpiceCommandError as exc:
             augmented = _augment_ngspice_error(simulator, exc, uic=uic)
             if augmented is exc:
                 raise
             raise augmented from exc
+        # One honest model-load summary per simulation (A5): fold ngspice's benign
+        # PSpice-dialect param chatter ("unrecognized parameter (iave/vpk) -
+        # ignored") into a counted bucket so a real load failure stands out.
+        self._emit_load_summary(simulator)
+        return result
+
+    def _emit_load_summary(self, simulator) -> None:
+        """Log ``N modelled, M benign PSpice param drop(s), K FAILED`` once (A5).
+
+        Reads ngspice's captured parse output (retained on the shared instance)
+        and tallies the harmless PSpice param drops separately from hard model
+        failures, so the benign chatter documented in the skill is visibly benign
+        rather than looking like a load error. Best-effort; never raises."""
+        if getattr(self, "_load_summary_emitted", False):
+            return
+        self._load_summary_emitted = True
+        try:
+            shared = getattr(simulator, "ngspice", None)
+            text = ""
+            if shared is not None:
+                text = "\n".join(
+                    s
+                    for s in (
+                        getattr(shared, "stdout", "") or "",
+                        getattr(shared, "stderr", "") or "",
+                    )
+                    if s
+                )
+            benign = len(_BENIGN_PARAM_RE.findall(text))
+            failed = len(_MODEL_LOAD_FAIL_RE.findall(text))
+            n = len(getattr(self, "model_provenance", {}) or {})
+            level = logging.WARNING if failed else logging.INFO
+            logger.log(
+                level,
+                "model load: %d modelled device(s); %d benign PSpice param "
+                "drop(s) (harmless); %d FAILED",
+                n,
+                benign,
+                failed,
+            )
+        except Exception:  # pragma: no cover - a summary must never break a run
+            pass
 
     def operating_point(
         self, temperature: float = 25, options: Optional[Dict] = None

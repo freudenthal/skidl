@@ -400,7 +400,26 @@ class SpiceConverter:
         "LLC": "halfbridge",
         "TRANSFORMER": "transformer",
         "XFMR": "transformer",
+        # Corpus-independent behavioral logic primitives (Stage: DPSG WS2). These
+        # give mixed-signal designs a simulatable digital path without depending
+        # on the un-runnable corpus digital models (XSPICE d_*, PSpice U-device);
+        # realized as ngspice-native B-sources + switch-held memory, no bridges.
+        "DFF": "dff",
+        "TFF": "tff",
+        "DLATCH": "dlatch",
+        "NOT": "gate",
+        "INV": "gate",
+        "BUF": "gate",
+        "AND": "gate",
+        "NAND": "gate",
+        "OR": "gate",
+        "NOR": "gate",
+        "XOR": "gate",
+        "XNOR": "gate",
     }
+
+    # ``Sim.Device`` tokens that map to the combinational-gate emitter.
+    _GATE_OPS = {"NOT", "INV", "BUF", "AND", "NAND", "OR", "NOR", "XOR", "XNOR"}
 
     @staticmethod
     def _sim_props(component) -> dict:
@@ -476,6 +495,21 @@ class SpiceConverter:
         # An external vendor model (Sim.Library) supersedes the built-in handlers:
         # attach the .lib/.subckt directly (Stage 9.3).
         if self._sim_props(component).get("library"):
+            lib = self._sim_props(component).get("library")
+            path = self._resolve_lib_path(lib)
+            if not path or not os.path.exists(path):
+                # A hardcoded (often absolute, cross-checkout) Sim.Library path
+                # that no longer exists must NOT hard-fail when the corpus can
+                # cover it (DPSG A4): warn and auto-resolve by value/Sim.Name.
+                hit = self._library_index_hit(component)
+                if hit is not None:
+                    logger.warning(
+                        f"{ref}: Sim.Library path not found ({lib}); "
+                        f"auto-resolved '{hit.name}' from the corpus instead. "
+                        f"Prefer value=\"{hit.name}\" (drop the hardcoded path)."
+                    )
+                    self._add_index_model(component, ref, hit)
+                    return
             self._add_external_model(component, ref)
             return
 
@@ -513,6 +547,10 @@ class SpiceConverter:
             "transformer": self._add_transformer,
             "bjt": self._add_bjt_transistor,
             "mosfet": self._add_mosfet,
+            "dff": self._add_dff,
+            "tff": self._add_tff,
+            "dlatch": self._add_dlatch,
+            "gate": self._add_gate,
         }
         handler = handlers.get(self._kind(component))
         if handler is None:
@@ -820,6 +858,22 @@ class SpiceConverter:
             if os.path.exists(cand):
                 return os.path.abspath(cand)
         return os.path.abspath(p)  # may not exist; validate() reports it
+
+    @staticmethod
+    def _model_simulatability(path, name):
+        """Classify the ``name`` model in ``path`` (dialect + simulatable verdict).
+
+        Part-agnostic: inspects the model *body* for structural signatures of a
+        class ngspice-in-KiCad cannot run (XSPICE digital, PSpice U-device,
+        encrypted). Returns a ``ModelClass`` or None if classification is
+        unavailable (import/read failure -> never blocks).
+        """
+        try:
+            from .simulatability import classify_model_file
+
+            return classify_model_file(path, name)
+        except Exception:  # pragma: no cover - classification never blocks
+            return None
 
     @staticmethod
     def _scan_lib(path, name):
@@ -2016,6 +2070,334 @@ class SpiceConverter:
             f"Added LDO {ref} (behavioral macromodel, tier={tier}): in={inn}, "
             f"out={nout}, gnd={gnd}, VOUT={vout}, VDROP={vdrop}, RSER={rser}, IQ={iq}"
         )
+
+    # ------------------------------------------------------------------ #
+    # Behavioral logic primitives (DPSG WS2): DFF / TFF / DLATCH / gates. #
+    # ------------------------------------------------------------------ #
+    #
+    # Corpus digital models don't run in ngspice (XSPICE d_* need adc/dac
+    # bridges; PSpice U-devices aren't implemented), so a design needing a
+    # flip-flop or gate had NO simulatable path (DPSG A1). These give it one the
+    # same way Sim.Device="LDO"/"BUCK" give a behavioral power block: an ngspice-
+    # native model attached to an ordinary symbol, with real analog I/O nodes.
+    #
+    # Logic levels are analog voltages: a node is HIGH above the switching
+    # threshold VM (default VDD/2, or (VIH+VIL)/2 if both given). Outputs are
+    # stiff B-sources (0 / VDD). A flip-flop's memory is a capacitor held by a
+    # voltage-controlled switch (transparent one clock phase, Roff-isolated the
+    # other) -- a behavioral master-slave latch, edge-triggered with no XSPICE.
+
+    # Terminal name-sets. KiCad 10 symbols write a complemented pin as ``~{Q}``
+    # and a clock as ``C``; ``_logic_pin_nodes`` normalizes the overbar wrapper so
+    # ``~{Q}``/``/Q`` both match the QN set.
+    _LOGIC_GND_NAMES = {"GND", "VSS", "VEE", "0"}
+    _LOGIC_CLK_NAMES = {"CLK", "CK", "CP", "CLOCK", "C", ">"}
+    _LOGIC_D_NAMES = {"D", "DATA", "DIN", "T"}
+    _LOGIC_EN_NAMES = {"EN", "E", "G", "LE", "GATE", "ENABLE"}
+    _LOGIC_Q_NAMES = {"Q", "QOUT"}
+    _LOGIC_QN_NAMES = {"QN", "QB", "NQ", "QBAR", "Q_BAR", "~Q", "/Q", "QNOT"}
+    _GATE_OUT_NAMES = {"Y", "Z", "O", "OUT", "OUTPUT", "Q"}
+
+    # Behavioral-logic param defaults. VDD is the logic swing; VM the switching
+    # threshold; TPD the propagation delay (folded into the memory/edge RC).
+    _LOGIC_PARAM_DEFAULTS = {"VDD": 5.0, "TPD": 10e-9}
+
+    def _logic_pin_nodes(self, component):
+        """``{ROLE(upper): node}`` for a component's connected pins, or None.
+
+        Behavioral logic resolves its terminals by pin NAME (like the LDO/switcher
+        macromodels), so a live ``_pins`` map is required; dict/JSON circuits
+        (no names) return None and are skipped by validate().
+
+        Many gate symbols carry meaningless pin names (KiCad writes ``~`` for a
+        generic gate pin), so an explicit ``Sim.Pins="3=Y 1=A 2=B"`` (pin NUMBER =
+        ROLE) overrides the name map -- letting a behavioral gate ride on any
+        symbol, exactly as a subckt's Sim.Pins pins its nodes."""
+        pin_map = getattr(component, "_pins", None)
+        if not isinstance(pin_map, dict):
+            return None
+        out = {}
+        # Explicit Sim.Pins role map (pin number -> role) wins when present.
+        spec = self._sim_props(component).get("pins")
+        if spec:
+            by_num = {str(num): pin for num, pin in pin_map.items()}
+            for pin_num, role in self._parse_sim_pins(spec).items():
+                pin = by_num.get(str(pin_num))
+                net = getattr(pin, "net", None) if pin is not None else None
+                if net is None:
+                    continue
+                out[str(role).strip().upper()] = self.node_map.get(net.name, net.name)
+            if out:
+                return out
+        for pin in pin_map.values():
+            net = getattr(pin, "net", None)
+            if net is None:
+                continue
+            name = self._norm_logic_pin_name(getattr(pin, "name", ""))
+            if not name:
+                continue
+            out.setdefault(name, self.node_map.get(net.name, net.name))
+        return out
+
+    @staticmethod
+    def _norm_logic_pin_name(name) -> str:
+        """Normalize a KiCad pin name for logic-role matching.
+
+        Unwraps the overbar spelling ``~{Q}`` -> ``~Q`` (KiCad 10 writes a
+        complemented pin that way) so it matches the QN name-set, and upper-cases."""
+        s = (name or "").strip().upper()
+        m = re.fullmatch(r"~\{(.+)\}", s)
+        if m:
+            return "~" + m.group(1)
+        return s
+
+    def _logic_gnd(self, nodes):
+        """The logic reference node: a connected GND-class pin, else ngspice ``0``."""
+        for name, node in nodes.items():
+            if name in self._LOGIC_GND_NAMES:
+                return str(node)
+        return "0"
+
+    def _logic_params(self, component) -> dict:
+        """Behavioral-logic params (VDD, VM threshold, TPD) with defaults.
+
+        ``Sim.Params`` may set ``vdd``, ``tpd``, and either ``vih``/``vil`` (the
+        threshold is their midpoint) or nothing (threshold = VDD/2)."""
+        raw = self._parse_sim_params(self._sim_props(component).get("params"))
+
+        def g(key, default):
+            v = self._parse_si_number(raw[key]) if key in raw else None
+            return v if v is not None else default
+
+        vdd = g("VDD", self._LOGIC_PARAM_DEFAULTS["VDD"])
+        vih = self._parse_si_number(raw["VIH"]) if "VIH" in raw else None
+        vil = self._parse_si_number(raw["VIL"]) if "VIL" in raw else None
+        if vih is not None and vil is not None:
+            vm = (vih + vil) / 2.0
+        else:
+            vm = vdd / 2.0
+        tpd = g("TPD", self._LOGIC_PARAM_DEFAULTS["TPD"])
+        if tpd <= 0:
+            tpd = self._LOGIC_PARAM_DEFAULTS["TPD"]
+        return {"VDD": vdd, "VM": vm, "TPD": tpd}
+
+    def _emit_ms_dff(self, ref, d_expr, clk, q, qn, gnd, params) -> None:
+        """Emit a behavioral rising-edge master-slave D flip-flop.
+
+        ``d_expr`` is the ngspice expression sampled onto the master (an external
+        D node for a DFF, the internal Q̄ for a toggle FF). Two switch-held caps
+        form the master (transparent while CLK low) and slave (transparent while
+        CLK high) latches; on CLK's rising edge the master freezes the last D and
+        the slave passes it through, so Q updates once per rising edge. Q/Q̄ are
+        stiff B-sources. The memory caps carry ``IC=0`` so a divider starts from a
+        defined state under ``use_initial_condition`` (self-oscillating start)."""
+        vdd = self._fmt_num(params["VDD"])
+        vm = self._fmt_num(params["VM"])
+        ron = 100.0
+        cmem = max(params["TPD"] / ron, 1e-12)
+        cm = self._fmt_num(cmem)
+        clkbar = f"{ref}_ckb"
+        dbuf, mnode, mbuf, qint = (
+            f"{ref}_db", f"{ref}_m", f"{ref}_mb", f"{ref}_qi",
+        )
+        model = f"SWL{ref}"
+        lines = [
+            f"B{ref}_ckb {clkbar} {gnd} V = V({clk}) > {vm} ? 0 : {vdd}",
+            f"B{ref}_db {dbuf} {gnd} V = {d_expr}",
+            f"S{ref}_m {dbuf} {mnode} {clkbar} {gnd} {model}",
+            f"C{ref}_m {mnode} {gnd} {cm} IC=0",
+            f"B{ref}_mb {mbuf} {gnd} V = V({mnode}) > {vm} ? {vdd} : 0",
+            f"S{ref}_s {mbuf} {qint} {clk} {gnd} {model}",
+            f"C{ref}_s {qint} {gnd} {cm} IC=0",
+            f".model {model} SW(Ron={ron:g} Roff=1e9 Vt={vm} Vh={self._fmt_num(params['VM'] * 0.1 or 0.05)})",
+            f"B{ref}_q {q} {gnd} V = V({qint}) > {vm} ? {vdd} : 0",
+        ]
+        if qn is not None:
+            lines.append(f"B{ref}_qn {qn} {gnd} V = V({qint}) > {vm} ? 0 : {vdd}")
+        self.spice_circuit.raw_spice += "\n" + "\n".join(lines)
+
+    def _add_dff(self, component, ref: str, value: str):
+        """Behavioral rising-edge D flip-flop (Sim.Device="DFF").
+
+        Resolves D / CLK / Q (and optional Q̄) by pin name; a ÷2 divider wires Q̄
+        back to D externally. No corpus model, no XSPICE bridge."""
+        nodes = self._logic_pin_nodes(component)
+        if nodes is None:
+            logger.warning(f"DFF {ref}: no live pin map; skipping")
+            return
+        gnd = self._logic_gnd(nodes)
+        clk = self._first_named(nodes, self._LOGIC_CLK_NAMES)
+        d = self._first_named(nodes, self._LOGIC_D_NAMES)
+        q = self._first_named(nodes, self._LOGIC_Q_NAMES)
+        qn = self._first_named(nodes, self._LOGIC_QN_NAMES)
+        if clk is None or d is None or (q is None and qn is None):
+            logger.warning(
+                f"DFF {ref}: needs connected D, CLK and Q (or QN) pins - skipping"
+            )
+            return
+        params = self._logic_params(component)
+        vm = self._fmt_num(params["VM"])
+        vdd = self._fmt_num(params["VDD"])
+        q_out = q if q is not None else f"{ref}_q"
+        self._emit_ms_dff(
+            ref, f"V({d}) > {vm} ? {vdd} : 0", clk, q_out, qn, gnd, params
+        )
+        self.model_provenance[ref] = ResolvedModel(
+            ref, "dff", "sim_params", "dff_behavioral"
+        )
+        logger.debug(f"Added behavioral DFF {ref}: d={d} clk={clk} q={q} qn={qn}")
+
+    def _add_tff(self, component, ref: str, value: str):
+        """Behavioral toggle flip-flop (Sim.Device="TFF"): ÷2 on each CLK edge.
+
+        Same master-slave core as the DFF, but D is the internal Q̄ (no external D
+        pin), so a single TFF divides its clock by two."""
+        nodes = self._logic_pin_nodes(component)
+        if nodes is None:
+            logger.warning(f"TFF {ref}: no live pin map; skipping")
+            return
+        gnd = self._logic_gnd(nodes)
+        clk = self._first_named(nodes, self._LOGIC_CLK_NAMES)
+        q = self._first_named(nodes, self._LOGIC_Q_NAMES)
+        qn = self._first_named(nodes, self._LOGIC_QN_NAMES)
+        if clk is None or (q is None and qn is None):
+            logger.warning(f"TFF {ref}: needs connected CLK and Q (or QN) - skipping")
+            return
+        params = self._logic_params(component)
+        vm = self._fmt_num(params["VM"])
+        vdd = self._fmt_num(params["VDD"])
+        q_out = q if q is not None else f"{ref}_q"
+        # D = internal Q̄: sample the complement of the held state each edge.
+        self._emit_ms_dff(
+            ref, f"V({ref}_qi) > {vm} ? 0 : {vdd}", clk, q_out, qn, gnd, params
+        )
+        self.model_provenance[ref] = ResolvedModel(
+            ref, "tff", "sim_params", "tff_behavioral"
+        )
+        logger.debug(f"Added behavioral TFF {ref}: clk={clk} q={q} qn={qn}")
+
+    def _add_dlatch(self, component, ref: str, value: str):
+        """Behavioral level-sensitive D latch (Sim.Device="DLATCH").
+
+        Q follows D while EN is high, holds when EN is low (one switch-held cap)."""
+        nodes = self._logic_pin_nodes(component)
+        if nodes is None:
+            logger.warning(f"DLATCH {ref}: no live pin map; skipping")
+            return
+        gnd = self._logic_gnd(nodes)
+        en = self._first_named(nodes, self._LOGIC_EN_NAMES | self._LOGIC_CLK_NAMES)
+        d = self._first_named(nodes, self._LOGIC_D_NAMES)
+        q = self._first_named(nodes, self._LOGIC_Q_NAMES)
+        qn = self._first_named(nodes, self._LOGIC_QN_NAMES)
+        if en is None or d is None or (q is None and qn is None):
+            logger.warning(
+                f"DLATCH {ref}: needs connected D, EN and Q (or QN) - skipping"
+            )
+            return
+        params = self._logic_params(component)
+        vdd = self._fmt_num(params["VDD"])
+        vm = self._fmt_num(params["VM"])
+        ron = 100.0
+        cm = self._fmt_num(max(params["TPD"] / ron, 1e-12))
+        dbuf, qint, model = f"{ref}_db", f"{ref}_qi", f"SWL{ref}"
+        lines = [
+            f"B{ref}_db {dbuf} {gnd} V = V({d}) > {vm} ? {vdd} : 0",
+            f"S{ref}_l {dbuf} {qint} {en} {gnd} {model}",
+            f"C{ref}_l {qint} {gnd} {cm} IC=0",
+            f".model {model} SW(Ron={ron:g} Roff=1e9 Vt={vm} Vh={self._fmt_num(params['VM'] * 0.1 or 0.05)})",
+        ]
+        if q is not None:
+            lines.append(f"B{ref}_q {q} {gnd} V = V({qint}) > {vm} ? {vdd} : 0")
+        if qn is not None:
+            lines.append(f"B{ref}_qn {qn} {gnd} V = V({qint}) > {vm} ? 0 : {vdd}")
+        self.spice_circuit.raw_spice += "\n" + "\n".join(lines)
+        self.model_provenance[ref] = ResolvedModel(
+            ref, "dlatch", "sim_params", "dlatch_behavioral"
+        )
+        logger.debug(f"Added behavioral DLATCH {ref}: d={d} en={en} q={q} qn={qn}")
+
+    def _gate_expr(self, op, his, vdd):
+        """ngspice B-source expression for a logic gate over input predicates ``his``.
+
+        Each entry of ``his`` is a ``(V(n) > VM)`` predicate evaluating to 1/0."""
+        if op in ("BUF",):
+            return f"{his[0]} ? {vdd} : 0"
+        if op in ("NOT", "INV"):
+            return f"{his[0]} ? 0 : {vdd}"
+        if op == "AND":
+            return f"({' && '.join(his)}) ? {vdd} : 0"
+        if op == "NAND":
+            return f"({' && '.join(his)}) ? 0 : {vdd}"
+        if op == "OR":
+            return f"({' || '.join(his)}) ? {vdd} : 0"
+        if op == "NOR":
+            return f"({' || '.join(his)}) ? 0 : {vdd}"
+        if op == "XOR":  # exactly-one-high (2-input); ngspice has no reliable %
+            return f"(({' + '.join(his)}) == 1) ? {vdd} : 0"
+        if op == "XNOR":
+            return f"(({' + '.join(his)}) == 1) ? 0 : {vdd}"
+        return None
+
+    def _add_gate(self, component, ref: str, value: str):
+        """Behavioral combinational gate (Sim.Device in AND/OR/XOR/NOT/... ).
+
+        Output resolves by name (Y/Z/OUT/Q); every other connected non-ground pin
+        is an input. A TPD RC low-pass gives the output a finite edge."""
+        op = str(self._sim_props(component).get("device", "")).strip().upper()
+        nodes = self._logic_pin_nodes(component)
+        if nodes is None:
+            logger.warning(f"gate {ref} ({op}): no live pin map; skipping")
+            return
+        gnd = self._logic_gnd(nodes)
+        out = self._first_named(nodes, self._GATE_OUT_NAMES)
+        # Inputs = connected pins that are neither the output nor a ground pin.
+        skip = self._LOGIC_GND_NAMES | self._GATE_OUT_NAMES
+        ins = [node for name, node in nodes.items() if name not in skip]
+        if out is None or not ins:
+            logger.warning(
+                f"gate {ref} ({op}): needs an output (Y/OUT/Q) and >=1 input pin "
+                f"- skipping"
+            )
+            return
+        if op in ("NOT", "INV", "BUF") and len(ins) > 1:
+            ins = ins[:1]
+        if op in ("XOR", "XNOR") and len(ins) != 2:
+            if len(ins) < 2:
+                logger.warning(f"gate {ref} ({op}): needs 2 inputs - skipping")
+                return
+            logger.warning(
+                f"gate {ref} ({op}): behavioral XOR is 2-input; using the first two"
+            )
+            ins = ins[:2]
+        params = self._logic_params(component)
+        vdd = self._fmt_num(params["VDD"])
+        vm = self._fmt_num(params["VM"])
+        his = [f"(V({n}) > {vm})" for n in ins]
+        expr = self._gate_expr(op, his, vdd)
+        if expr is None:
+            logger.warning(f"gate {ref}: unsupported op '{op}' - skipping")
+            return
+        raw = f"{ref}_raw"
+        ron = 1e3
+        ctp = self._fmt_num(max(params["TPD"] / ron, 1e-13))
+        lines = [
+            f"B{ref}_g {raw} {gnd} V = {expr}",
+            f"R{ref}_tp {raw} {out} {ron:g}",
+            f"C{ref}_tp {out} {gnd} {ctp}",
+        ]
+        self.spice_circuit.raw_spice += "\n" + "\n".join(lines)
+        self.model_provenance[ref] = ResolvedModel(
+            ref, "gate", "sim_params", f"{op.lower()}_behavioral"
+        )
+        logger.debug(f"Added behavioral {op} gate {ref}: out={out} ins={ins}")
+
+    @staticmethod
+    def _first_named(nodes, names):
+        """First node whose (upper-cased) pin name is in ``names``, else None."""
+        for name, node in nodes.items():
+            if name in names:
+                return str(node)
+        return None
 
     # ------------------------------------------------------------------ #
     # Transformers: coupled inductors via a K element (Stage 21.1)        #
@@ -3379,10 +3761,47 @@ class SpiceConverter:
                         driven.add(name)
         return driven
 
+    def _series_reachable_net_names(self) -> set:
+        """Nets DC-reachable from an explicit source through series R/L passives.
+
+        A net downstream of a ``Simulation_SPICE`` source via a resistor/inductor
+        is ALREADY driven (the op-point sees the source through the passive), so
+        the rail-name heuristic must not stack a phantom ideal supply on it and
+        short the series element (E2E B2 -- a net named ``VIN`` behind a 10 Ohm
+        input resistor got a second 5 V supply across the resistor). Capacitors
+        are excluded: they carry no DC, so a net behind a series cap is NOT
+        source-driven at the operating point. Returns only the ADDITIONAL nets
+        reached (the directly-driven ones are already handled by driven_nets)."""
+        adj = {}
+        for component in self._iter_components():
+            if self._sim_excluded(component):
+                continue
+            if self._kind(component) not in ("resistor", "inductor"):
+                continue
+            names = list(self._component_net_names(component))
+            if len(names) != 2:
+                continue  # only a plain 2-terminal series element bridges DC
+            a, b = names
+            adj.setdefault(a, set()).add(b)
+            adj.setdefault(b, set()).add(a)
+        seed = set(self.driven_nets)
+        seen = set(seed)
+        stack = list(seed)
+        while stack:
+            cur = stack.pop()
+            for nbr in adj.get(cur, ()):
+                if nbr not in seen:
+                    seen.add(nbr)
+                    stack.append(nbr)
+        return seen - seed
+
     def _add_power_sources(self):
         """Add power sources needed for simulation."""
         # Check if we need to add power sources based on net names
         power_nets = []
+        # Nets driven from an explicit source through a series R/L (E2E B2): the
+        # rail heuristic must not re-supply these and short the series element.
+        series_reachable = self._series_reachable_net_names()
 
         # Handle both dict and list formats for nets
         if hasattr(self.circuit.nets, "values"):
@@ -3412,6 +3831,18 @@ class SpiceConverter:
                     f"({voltage} V) but it is already driven by an OUTPUT/PWROUT "
                     f"pin -- NOT injecting a supply (a phantom rail would fight the "
                     f"real driver). Rename the net if you did want a bare rail here."
+                )
+                continue
+            # A net driven from an explicit source THROUGH a series R/L is already
+            # supplied; a phantom ideal rail would short the series element (E2E
+            # B2 -- an input-protection resistor silently bypassed).
+            if orig_name in series_reachable:
+                logger.warning(
+                    f"Net '{orig_name}': name matches the supply heuristic "
+                    f"({voltage} V) but it is driven from an explicit source "
+                    f"through a series R/L -- NOT injecting (a phantom rail would "
+                    f"short the series element). Rename the net if you did want a "
+                    f"bare rail here."
                 )
                 continue
             power_nets.append((orig_name, voltage))
@@ -3806,6 +4237,58 @@ class SpiceConverter:
             elif params["K"] is None:
                 problems.append(f"{ref}: transformer coupling k must be in (0, 1]")
 
+        # 4d. Behavioral logic primitives need their terminals resolvable by pin
+        #     name (skipped for dict/JSON circuits that carry no live pin names).
+        for component in self._iter_components():
+            if self._sim_excluded(component):
+                continue
+            kind = self._kind(component)
+            if kind not in ("dff", "tff", "dlatch", "gate"):
+                continue
+            ref = self._attr(component, "ref", None) or "?"
+            nodes = self._logic_pin_nodes(component)
+            if nodes is None:
+                continue  # no live pin map -> can't check (lenient path skips it)
+            if kind == "gate":
+                op = str(self._sim_props(component).get("device", "")).strip().upper()
+                out = self._first_named(nodes, self._GATE_OUT_NAMES)
+                ins = [
+                    n for nm, n in nodes.items()
+                    if nm not in (self._LOGIC_GND_NAMES | self._GATE_OUT_NAMES)
+                ]
+                need = 1 if op in ("NOT", "INV", "BUF") else 2
+                if out is None or len(ins) < need:
+                    problems.append(
+                        f"{ref}: {op} gate needs an output (Y/OUT/Q) and >={need} "
+                        f"input pin(s), resolved by pin name"
+                    )
+            elif kind == "dlatch":
+                if (
+                    self._first_named(nodes, self._LOGIC_EN_NAMES | self._LOGIC_CLK_NAMES)
+                    is None
+                    or self._first_named(nodes, self._LOGIC_D_NAMES) is None
+                    or (
+                        self._first_named(nodes, self._LOGIC_Q_NAMES) is None
+                        and self._first_named(nodes, self._LOGIC_QN_NAMES) is None
+                    )
+                ):
+                    problems.append(
+                        f"{ref}: D latch needs connected D, EN and Q (or QN) pins"
+                    )
+            else:  # dff / tff
+                clk = self._first_named(nodes, self._LOGIC_CLK_NAMES)
+                has_q = (
+                    self._first_named(nodes, self._LOGIC_Q_NAMES) is not None
+                    or self._first_named(nodes, self._LOGIC_QN_NAMES) is not None
+                )
+                need_d = kind == "dff"
+                d = self._first_named(nodes, self._LOGIC_D_NAMES)
+                if clk is None or not has_q or (need_d and d is None):
+                    terms = "D, CLK and Q (or QN)" if need_d else "CLK and Q (or QN)"
+                    problems.append(
+                        f"{ref}: {kind.upper()} needs connected {terms} pins"
+                    )
+
         # 5. Every diode/BJT/MOSFET must reference a model that resolves to a
         #    built-in generic (otherwise ngspice errors on an undefined model).
         for component in self._iter_components():
@@ -3863,6 +4346,11 @@ class SpiceConverter:
                 continue
             path = self._resolve_lib_path(sim.get("library"))
             if not path or not os.path.exists(path):
+                # A missing hardcoded path that the corpus can auto-resolve is a
+                # convert-time WARNING (see _add_component), not a hard failure
+                # (DPSG A4): only flag it when there is no corpus fallback.
+                if self._library_index_hit(component) is not None:
+                    continue
                 problems.append(
                     f"{ref}: Sim.Library file not found: {sim.get('library')}"
                 )
@@ -3872,6 +4360,33 @@ class SpiceConverter:
                 problems.append(
                     f"{ref}: Sim.Name '{name}' is neither a .subckt nor a .model in "
                     f"{os.path.basename(str(path))}"
+                )
+                continue
+            # The named model may resolve to a class ngspice cannot run (XSPICE
+            # digital, PSpice U-device, encrypted). Flag it by class here, naming
+            # the reason, instead of dying on a dead node / opaque run later (A1).
+            mc = self._model_simulatability(path, name)
+            if mc is not None and mc.simulatable == "no":
+                problems.append(
+                    f"{ref}: Sim.Name '{name}' resolves to a non-simulatable model "
+                    f"class ({mc.dialect}) -- {mc.reason}"
+                )
+
+        # 6b. A corpus/index-resolved model may likewise be a non-simulatable
+        #     class. Classify auto-resolved subckt hits (the digital corpus lands
+        #     here when Sim.Prefer=library or Sim.Pins name the subckt's nodes).
+        for component in self._iter_components():
+            if self._sim_excluded(component) or self._has_external_lib(component):
+                continue
+            hit = self._library_index_hit(component)
+            if hit is None or not getattr(hit, "path", None):
+                continue
+            mc = self._model_simulatability(hit.path, getattr(hit, "name", None))
+            if mc is not None and mc.simulatable == "no":
+                ref = self._attr(component, "ref", None) or "?"
+                problems.append(
+                    f"{ref}: auto-resolved model '{getattr(hit, 'name', '?')}' is a "
+                    f"non-simulatable class ({mc.dialect}) -- {mc.reason}"
                 )
 
         # 7. Sim.Compat must be unambiguous: one ngspice dialect per simulation.

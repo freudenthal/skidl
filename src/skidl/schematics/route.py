@@ -1404,11 +1404,14 @@ class Router:
                     if (x0, y0) != (x1, y1):
                         new_segs.append((x0, y0, x1, y1))
             if not ok:
-                # Per-net fallback: stub THIS net to labels; siblings stay wired.
-                active_logger.warning(
-                    f"A* could not route net {getattr(net, 'name', '?')!r} "
-                    f"(enclosed route-point); stubbing it to labels while the "
-                    f"other nets on this sheet stay wired"
+                # Per-net fallback: connect THIS net by labels instead of drawn
+                # wire; siblings stay wired. Labels ARE a valid connection (the
+                # drawing-connectivity check confirms the netlist still matches),
+                # so this is a recoverable step, not a routing failure (E2E B7).
+                active_logger.info(
+                    f"routing net {getattr(net, 'name', '?')!r} by labels "
+                    f"(occupancy left no wire path); the net stays connected via "
+                    f"labels and the other nets on this sheet remain wired"
                 )
                 net._stub = True
                 for pin in net.get_pins():
