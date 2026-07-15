@@ -1228,8 +1228,29 @@ class Net(SkidlBaseObject):
         # Remove any phantom pins that may have existed for tieing nets together.
         pins = set([p for p in pins if not isinstance(p, PhantomPin)])
 
-        # Store the traversal.
-        self.traversal = Traversal(nets=list(nets), pins=list(pins))
+        # Store the traversal. The accumulation above is set-based, so
+        # list(pins)/list(nets) would order by object id() -- which differs
+        # between a freshly-parsed part library and one loaded from skidl's
+        # lib-pickle cache (the objects are allocated in a different order).
+        # net.pins is consumed IN ORDER by the schematic router
+        # (get_internal_pins -> per-net route points -> MST), so an id-ordered
+        # list makes a cold render diverge from a warm one (byte-nondeterminism).
+        # Sort on stable, build-independent keys (ref/num/name, net name) so the
+        # traversal -- and everything downstream of it -- is reproducible.
+        def _pin_key(p):
+            part = getattr(p, "part", None)
+            return (
+                str(getattr(part, "ref", "") or ""),
+                str(getattr(p, "num", "") or ""),
+                str(getattr(p, "name", "") or ""),
+            )
+
+        def _net_key(n):
+            return str(getattr(n, "name", "") or "")
+
+        self.traversal = Traversal(
+            nets=sorted(nets, key=_net_key), pins=sorted(pins, key=_pin_key)
+        )
 
         # Every net connected to this one should have the same traversal.
         for n in self.traversal.nets:

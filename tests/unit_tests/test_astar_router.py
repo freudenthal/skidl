@@ -22,11 +22,21 @@ from pathlib import Path
 import pytest
 
 from skidl.schematics.route import (
+    GRID,
     _astar_pair,
     _colinear_foreign,
     _mst_edges,
     _seg_hits_interior,
 )
+
+
+def test_grid_module_default():
+    """route.py must expose a module-level GRID default so direct API/test calls
+    of _astar_pair (which read GRID before route()'s run-time constants injection
+    has happened) do not NameError. Every kicadN backend defines GRID = 50; the
+    injection still overlays the active tool's value at run time. Guards the
+    direct-call path against future injected-constant additions."""
+    assert GRID == 50
 
 # Optional geometry-regression asset. Drop ``buck5v_geom.json`` (a real placed
 # board geometry dumped from the schematic placer) next to this test to enable

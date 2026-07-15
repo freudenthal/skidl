@@ -29,6 +29,13 @@ from skidl.geometry import BBox, Point, Segment, Tx, Vector, tx_rot_90
 
 __all__ = ["RoutingFailure", "GlobalRoutingFailure", "SwitchboxRoutingFailure"]
 
+# 50-mil schematic grid. Every kicadN backend defines GRID = 50, so this value is
+# tool-independent in practice. route() still overlays the active tool's constants
+# at run time (see the this_module.__dict__.update in Router.route), so this is only
+# a fallback for direct API/test use of _astar_pair etc. — those run before any
+# constants injection has happened and would otherwise NameError on GRID.
+GRID = 50
+
 
 ###################################################################
 #

@@ -221,7 +221,17 @@ class Pin(SkidlBaseObject):
         # This pin number gets overridden if the num is set in attribs.
         # Checking the pin number will also detect if the pin has been
         # assigned a real pin number for a part.
-        self.num = random.randint(self.MAX_PIN_NUM + 1, sys.maxsize)
+        #
+        # Assign the private field DIRECTLY (not via the num setter) so the
+        # placeholder does NOT create a "p<hugerandom>" alias. Going through the
+        # setter used to add that alias, and the num deleter removed the wrong key
+        # ("<num>" instead of "p<num>"), so the random placeholder alias leaked
+        # permanently onto every pin and got frozen into the SchLib pickle cache —
+        # making pickle-loaded parts differ from freshly-parsed ones and breaking
+        # render byte-determinism. The setter stringifies num anyway, so keeping
+        # _num a string here preserves the num-property contract and __eq__
+        # distinctness (which keys off the num value, not the alias).
+        self._num = str(random.randint(self.MAX_PIN_NUM + 1, sys.maxsize))
 
         # Attach additional attributes to the pin.
         for k, v in list(attribs.items()):
@@ -902,7 +912,10 @@ class Pin(SkidlBaseObject):
         Delete the pin number.
         """
         try:
-            self.aliases.discard(self._num)
+            # The setter adds the alias as f"p{num}", so discard that same key.
+            # (Discarding the bare self._num was an off-by-prefix bug that left
+            # stale p<num> aliases on every renumbering.)
+            self.aliases.discard(f"p{self._num}")
             self._num = None
         except AttributeError:
             pass

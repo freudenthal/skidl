@@ -154,8 +154,12 @@ class SchLib(object):
         # The pickle file name is based on the library name, the tool name, and the hash.
         # It is stored in a directory specified in the SKIDL configuration file.
         lib_name, lib_ext = os.path.splitext(os.path.split(abs_filename)[1])
+        # "v2" is a pickle-format version token: bump it whenever the parsed-Part
+        # content changes shape so stale pickles auto-invalidate instead of being
+        # silently reused. v2 retires v1 pickles that froze leaked random
+        # placeholder pin-number aliases (p<hugerandom>) — see pin.py Pin.__init__.
         lib_pickle_abs_fn = os.path.abspath(os.path.join(
-            skidl.config.pickle_dir, "_".join((lib_name, tool, str(abs_fn_hash)))
+            skidl.config.pickle_dir, "_".join((lib_name, tool, "v2", str(abs_fn_hash)))
         ) + ".pkl")
 
         # Load this SchLib with an existing SchLib object if the file name hash

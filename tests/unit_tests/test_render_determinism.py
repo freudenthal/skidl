@@ -64,6 +64,14 @@ lib_search_paths["kicad10"] = ["."] + __import__(
 
 which, outdir = sys.argv[1], sys.argv[2]
 
+# Optional argv[3]: point the lib-pickle cache at a test-owned dir so the cold
+# (empty dir -> parse + write pickle) vs warm (pickle present -> load) render
+# invariant can be exercised deterministically. skidl.config.pickle_dir is a
+# plain attribute read by SchLib at load time, so setting it here suffices.
+if len(sys.argv) > 3 and sys.argv[3]:
+    import skidl as _skidl
+    _skidl.config.pickle_dir = sys.argv[3]
+
 def flat(ckt):
     with ckt:
         u1 = Part("Amplifier_Operational", "OPA340NA")
@@ -108,12 +116,15 @@ ckt.generate_schematic(tool=KICAD10, filepath=outdir, top_name=top,
 """
 
 
-def _render_in_subprocess(which, outdir, hashseed):
+def _render_in_subprocess(which, outdir, hashseed, pickle_dir=None):
     env = dict(os.environ)
     env["PYTHONHASHSEED"] = str(hashseed)
     env["PYTHONUTF8"] = "1"
+    args = [sys.executable, "-c", _RENDER, which, str(outdir)]
+    if pickle_dir is not None:
+        args.append(str(pickle_dir))
     r = subprocess.run(
-        [sys.executable, "-c", _RENDER, which, str(outdir)],
+        args,
         env=env,
         capture_output=True,
         text=True,
@@ -150,6 +161,30 @@ def test_render_byte_identical_across_hashseed(which):
     assert set(sa) == set(sb), f"sheet set differs: {set(sa)} vs {set(sb)}"
     for name in sa:
         assert sa[name] == sb[name], f"{name} differs across PYTHONHASHSEED"
+
+
+@requires_kicad10
+@pytest.mark.parametrize("which", ["hier", "hier_netfirst"])
+def test_render_cold_equals_warm(which):
+    """A render from a freshly-parsed symbol library (COLD pickle cache) must be
+    byte-identical to one from the same library loaded via the lib-pickle cache
+    (WARM). Same PYTHONHASHSEED; the ONLY difference is cache state.
+
+    This is the real invariant behind the [hier]/[hier_netfirst] hashseed
+    failures: leaked random placeholder pin aliases used to be frozen into the
+    pickle, so pickle-loaded parts differed from fresh-parsed ones and placement
+    drifted. Uses a test-owned pickle dir: run A finds it empty (cold, writes the
+    pickle), run B reuses it (warm)."""
+    pkl = tempfile.mkdtemp(prefix=f"skidl_det_pkl_{which}_")
+    a = tempfile.mkdtemp(prefix=f"skidl_det_{which}_cold_")
+    b = tempfile.mkdtemp(prefix=f"skidl_det_{which}_warm_")
+    _render_in_subprocess(which, a, hashseed=0, pickle_dir=pkl)  # cold
+    _render_in_subprocess(which, b, hashseed=0, pickle_dir=pkl)  # warm
+    sa, sb = _normalized_sheets(a), _normalized_sheets(b)
+    assert sa, "no schematic produced"
+    assert set(sa) == set(sb), f"sheet set differs (cold vs warm): {set(sa)} vs {set(sb)}"
+    for name in sa:
+        assert sa[name] == sb[name], f"{name} differs between cold and warm render"
 
 
 # Focused, render-free check: the fallback tag check_tags() assigns must be a
