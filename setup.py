@@ -70,7 +70,9 @@ setup(
     # Optional macromodel SPICE simulation layer (skidl.sim). Kept out of the
     # base install so skidl stays dependency-light; `pip install skidl[sim]`
     # pulls PySpice (ngspice must be installed separately, or use KiCad's).
-    extras_require={"sim": ["PySpice>=1.5"]},
+    # `pip install skidl[debug]` pulls Pillow for the placement-animation GIF
+    # renderer (skidl.schematics.debug_anim); imported lazily, debug-only.
+    extras_require={"sim": ["PySpice>=1.5"], "debug": ["pillow>=9"]},
     license="MIT",
     zip_safe=False,
     keywords="skidl kicad electronic circuit schematics",

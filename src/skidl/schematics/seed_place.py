@@ -82,6 +82,19 @@ _ROT_TX = {0: tx_rot_0, 90: tx_rot_90, 180: tx_rot_180, 270: tx_rot_270}
 
 _DEFAULT_GRID = 50  # mils (kicad9 GRID constant); overridable via seed_placement.
 
+# Debug-only hook. When set (see skidl.schematics.debug_anim.record_placements),
+# it is called once per part right after its tx is finalized, in placement order.
+# None in all normal use, so the placer stays pure/no-I/O (the only cost on the
+# production path is one `is not None` check per placed part). Single-threaded
+# debug use only -- placement is not run concurrently.
+_PLACEMENT_OBSERVER = None
+
+
+def _notify_placed(part):
+    """Fire the optional placement observer for ``part`` (no-op when unset)."""
+    if _PLACEMENT_OBSERVER is not None:
+        _PLACEMENT_OBSERVER(part)
+
 
 # --------------------------------------------------------------------------- #
 # Small helpers
@@ -488,6 +501,7 @@ def _place(part, rot, rot_tx, origin, placed_info):
         "tx": tx,
         "wbbox": part.place_bbox * tx,
     }
+    _notify_placed(part)
 
 
 def _fallback_row(parts, gap, grid, start_y=0):
@@ -500,6 +514,7 @@ def _fallback_row(parts, gap, grid, start_y=0):
         else:
             tx = _ROT_TX[0].move(origin)
         part.tx = tx
+        _notify_placed(part)
         w = part.place_bbox.w if part.place_bbox.w else grid
         x += w + gap
 
