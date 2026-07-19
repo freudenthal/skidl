@@ -1541,93 +1541,157 @@ class Placer:
         # Set anchor and pull pins that determine attractive forces between parts.
         add_anchor_pull_pins(parts, nets, **options)
 
-        # Constructively seed the placement (stage 19) or scatter randomly. The
-        # seed replaces only the INITIAL state; force-directed refinement below
-        # runs identically either way. NetTerminals are skipped (they are
-        # (re)placed by place_net_terminals regardless of their pre-evolve tx).
-        if options.get("seed_placement"):
-            # Absolute import: place()'s constant-injection (line ~1709)
-            # overwrites this module's __package__ with the tool module's, so a
-            # relative import here would resolve under skidl.tools.kicad9.
-            # constructive_relax seeds with a wider relaxation gap and then skips
-            # the force-directed refiner (below) -- deterministic spacing that
-            # preserves the seed's directional arrangement.
-            if options.get("constructive_relax"):
-                from skidl.schematics.relax_place import relax_placement as _seed
-            else:
-                from skidl.schematics.seed_place import seed_placement as _seed
+        # ONE seed+refine placement of this group under `opts`. This is the
+        # single placement code path: the default (no bake-off) call is
+        # `_place_once(options)`; each opt-in bake-off trial calls it with a
+        # strategy's option overrides. With `opts is options` it is byte-for-byte
+        # the historical body of place_connected_parts.
+        def _place_once(opts):
+            # Constructively seed the placement (stage 19) or scatter randomly.
+            # The seed replaces only the INITIAL state; force-directed refinement
+            # below runs identically either way. NetTerminals are skipped (they
+            # are (re)placed by place_net_terminals regardless of pre-evolve tx).
+            if opts.get("seed_placement"):
+                # Absolute import: place()'s constant-injection (line ~1709)
+                # overwrites this module's __package__ with the tool module's, so
+                # a relative import here would resolve under skidl.tools.kicad9.
+                # constructive_relax seeds with a wider relaxation gap and then
+                # skips the force-directed refiner (below) -- deterministic
+                # spacing that preserves the seed's directional arrangement.
+                if opts.get("constructive_relax"):
+                    from skidl.schematics.relax_place import relax_placement as _seed
+                else:
+                    from skidl.schematics.seed_place import seed_placement as _seed
 
-            _seed(
-                parts,
-                nets,
-                skip=is_net_terminal,
-                max_fanout=options.get("seed_max_fanout", 3),
-                grid=GRID,
-                **{
-                    k: v
-                    for k, v in options.items()
-                    if k not in ("skip", "grid", "max_fanout")
-                },
-            )
-        else:
-            random_placement(parts)
-
-        if options.get("draw_placement"):
-            # Draw the placement for debug purposes.
-            bbox = get_enclosing_bbox(parts)
-            draw_scr, draw_tx, draw_font = draw_start(bbox)
-            options.update(
-                {"draw_scr": draw_scr, "draw_tx": draw_tx, "draw_font": draw_font}
-            )
-
-        if options.get("compress_before_place"):
-            central_placement(parts, **options)
-
-        # Do force-directed placement of the parts in the parts.
-
-        # Separate the NetTerminals from the other parts.
-        net_terminals = [part for part in parts if is_net_terminal(part)]
-        real_parts = [part for part in parts if not is_net_terminal(part)]
-
-        if options.get("constructive_relax") and options.get("seed_placement"):
-            # Constructive relaxation: the seed already placed every real part in
-            # its pin-face direction with relaxation spacing. Skip the
-            # force-directed refiner entirely -- it re-mixes the arrangement and
-            # its incidental spacing is now provided by the relax gap. The seed
-            # already snaps to grid (choose_slot); nothing else to do for real
-            # parts. (The seed also fixed orientations, so adjust_orientations is
-            # deliberately skipped too.) Still snap to grid -- evolve_placement
-            # did this at its tail, and the deconflict router expects on-grid
-            # part snap points.
-            for part in real_parts:
-                snap_to_grid(part)
-        else:
-            # Do the first trial placement.
-            evolve_placement([], real_parts, nets, total_part_force, **options)
-
-            if options.get("rotate_parts"):
-                # Adjust part orientations after first trial placement is done.
-                # Label-aware term is OFF here by default (connected parts) to
-                # avoid pushing a stub label onto an adjacent power node; opt in
-                # via label_aware_connected.
-                conn_opts = dict(options)
-                conn_opts["_label_aware_scope"] = options.get(
-                    "label_aware_connected", False
+                _seed(
+                    parts,
+                    nets,
+                    skip=is_net_terminal,
+                    max_fanout=opts.get("seed_max_fanout", 3),
+                    grid=GRID,
+                    **{
+                        k: v
+                        for k, v in opts.items()
+                        if k not in ("skip", "grid", "max_fanout")
+                    },
                 )
-                if adjust_orientations(real_parts, **conn_opts):
-                    # Some part orientations were changed, so re-do placement.
-                    evolve_placement([], real_parts, nets, total_part_force, **options)
+            else:
+                random_placement(parts)
 
-        # Place NetTerminals after all the other parts. Under constructive_relax
-        # the real parts are anchored (immobile) here, so the terminal placement's
-        # bounded force never perturbs the constructive arrangement.
-        place_net_terminals(
-            net_terminals, real_parts, nets, total_part_force, **options
-        )
+            if opts.get("draw_placement"):
+                # Draw the placement for debug purposes.
+                bbox = get_enclosing_bbox(parts)
+                draw_scr, draw_tx, draw_font = draw_start(bbox)
+                opts.update(
+                    {"draw_scr": draw_scr, "draw_tx": draw_tx, "draw_font": draw_font}
+                )
 
-        if options.get("draw_placement"):
-            # Pause to look at placement for debugging purposes.
-            draw_pause()
+            if opts.get("compress_before_place"):
+                central_placement(parts, **opts)
+
+            # Do force-directed placement of the parts in the parts.
+
+            # Separate the NetTerminals from the other parts.
+            net_terminals = [part for part in parts if is_net_terminal(part)]
+            real_parts = [part for part in parts if not is_net_terminal(part)]
+
+            if opts.get("constructive_relax") and opts.get("seed_placement"):
+                # Constructive relaxation: the seed already placed every real part
+                # in its pin-face direction with relaxation spacing. Skip the
+                # force-directed refiner entirely -- it re-mixes the arrangement
+                # and its incidental spacing is now provided by the relax gap. The
+                # seed already snaps to grid (choose_slot); nothing else to do for
+                # real parts. (The seed also fixed orientations, so
+                # adjust_orientations is deliberately skipped too.) Still snap to
+                # grid -- evolve_placement did this at its tail, and the deconflict
+                # router expects on-grid part snap points.
+                for part in real_parts:
+                    snap_to_grid(part)
+            else:
+                # Do the first trial placement.
+                evolve_placement([], real_parts, nets, total_part_force, **opts)
+
+                if opts.get("rotate_parts"):
+                    # Adjust part orientations after first trial placement is done.
+                    # Label-aware term is OFF here by default (connected parts) to
+                    # avoid pushing a stub label onto an adjacent power node; opt
+                    # in via label_aware_connected.
+                    conn_opts = dict(opts)
+                    conn_opts["_label_aware_scope"] = opts.get(
+                        "label_aware_connected", False
+                    )
+                    if adjust_orientations(real_parts, **conn_opts):
+                        # Some part orientations were changed, so re-do placement.
+                        evolve_placement(
+                            [], real_parts, nets, total_part_force, **opts
+                        )
+
+            # Place NetTerminals after all the other parts. Under
+            # constructive_relax the real parts are anchored (immobile) here, so
+            # the terminal placement's bounded force never perturbs the
+            # constructive arrangement.
+            place_net_terminals(
+                net_terminals, real_parts, nets, total_part_force, **opts
+            )
+
+            if opts.get("draw_placement"):
+                # Pause to look at placement for debugging purposes.
+                draw_pause()
+
+        if options.get("place_score_select"):
+            # Opt-in candidate bake-off (default OFF => byte-identical to the
+            # single-pass `else` branch, which is what a bare generate_schematic
+            # runs). Place this group with several seed strategies, score each
+            # with the ported crossing/HPWL scorer (sch_score), and keep the
+            # lowest-scoring arrangement. Determinism: strategies run in a fixed
+            # order, ties break on that order (never id()/dict iteration), and the
+            # winning per-part tx state is snapshotted and restored so the applied
+            # arrangement is EXACTLY the one that was scored (re-running would draw
+            # fresh RNG and diverge). Targets the dense-sheet placement-jitter
+            # issue: a bake-off is the fix for "one deterministic pass lands badly".
+            from skidl.schematics import sch_score
+
+            real_parts = [part for part in parts if not is_net_terminal(part)]
+
+            def _clone_tx(t):
+                return Tx(t.a, t.b, t.c, t.d, t.dx, t.dy)
+
+            def _snapshot():
+                return {id(part): _clone_tx(part.tx) for part in parts}
+
+            def _restore(state):
+                for part in parts:
+                    saved = state.get(id(part))
+                    if saved is not None:
+                        part.tx = _clone_tx(saved)
+
+            start_state = _snapshot()
+            strategies = (
+                ("constructive_relax", {"seed_placement": True, "constructive_relax": True}),
+                ("constructive_seed", {"seed_placement": True, "constructive_relax": False}),
+                ("force_directed", {"seed_placement": False}),
+            )
+
+            best_key = None
+            best_state = None
+            for idx, (name, overrides) in enumerate(strategies):
+                _restore(start_state)
+                _place_once(dict(options, **overrides))
+                score = sch_score.score_parts(real_parts, nets)
+                key = (score["crossings"], score["hpwl"], idx)
+                if best_key is None or key < best_key:
+                    best_key = key
+                    best_state = _snapshot()
+                    # Debug-only: which strategy won (never emitted to geometry).
+                    node._place_score_selected = name
+
+            # Leave the group in the best-scoring arrangement.
+            if best_state is not None:
+                _restore(best_state)
+        else:
+            # Default single-pass placement (behavior unchanged when the
+            # place_score_select flag is absent).
+            _place_once(options)
 
     def place_floating_parts(node, parts, **options):
         """Place individual parts.

@@ -305,6 +305,18 @@ def score_node(node) -> dict:
     return agg
 
 
+def score_parts(parts, nets) -> dict:
+    """Score a single placement frame (one connected group) directly.
+
+    Same crossing/HPWL math as :func:`score_node`, but scoped to a caller-
+    supplied ``(parts, nets)`` list instead of a node walk, so the placer's
+    opt-in candidate bake-off (``place.place_connected_parts``) can score a group
+    in its own frame while placing it. Returns
+    ``{"crossings", "hpwl", "parts", "nets", "skipped"}``.
+    """
+    return _score_parts_core(list(parts), list(nets))
+
+
 def estimate_crossings(node) -> int:
     """Total estimated net crossings for a placed node and its children."""
     return score_node(node)["crossings"]
