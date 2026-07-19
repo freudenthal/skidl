@@ -31,6 +31,13 @@ __all__ = [
     "PlacementFailure",
 ]
 
+# 50-mil schematic grid. Every kicadN backend defines GRID = 50, so this value is
+# tool-independent in practice. place() still overlays the active tool's constants
+# at run time (see the this_module.__dict__.update in Placer.place), so this is
+# only a fallback for direct API/test use of helpers like _score_move_refine —
+# those run before any constants injection and would otherwise NameError on GRID.
+GRID = 50
+
 
 ###################################################################
 #
@@ -1438,6 +1445,118 @@ def _score_swap_refine(real_parts, nets, **options):
     return accepted
 
 
+def _score_move_refine(real_parts, nets, **options):
+    """Deterministic accept-if-better bounded single-part move polish.
+
+    The rest of layout's ``refine_placement`` that round 2 could not port:
+    bounded, grid-snapped, accept-if-better single-part moves, made safe by
+    ``sch_score``'s overlap term (round-3 WS1). Unlike the round-2 same-class swap
+    pass -- which only exchanges two parts' world bboxes and so can never create a
+    new overlap -- a free single-part move CAN increase overlap, so the accept key
+    puts overlap FIRST: ``(overlap, crossings, hpwl)``, accept iff strictly
+    lexicographically less than the current score. A move can therefore never
+    increase the total overlap area, and overlap-reducing moves double as the
+    legalization analog (no separate legalize pass is ported).
+
+    All trial deltas are integer multiples of the module-global ``GRID`` added to
+    ``tx.dx``/``dy``; parts are placed with pins on-grid and a GRID-multiple
+    translation preserves that, so ``snap_to_grid`` is never called inside the
+    loop (it would re-anchor on a pin and could move the part off its trialed
+    spot). Deterministic: parts iterate in ``_part_order_key`` order, candidate
+    deltas are built in a fixed literal order, and each trial restores state from
+    a saved ``Tx`` (a fresh ``Tx`` is built per trial/accept, never mutating a
+    snapshot a caller may hold -- same rule as the swap pass). Returns the number
+    of accepted moves.
+    """
+    # Absolute import for the same reason as _score_swap_refine (place()'s
+    # constant-injection rewrites this module's __package__).
+    from skidl.schematics import sch_score
+
+    max_passes = 2
+    max_accepted_moves = 16
+    max_trial_evals = 64
+
+    order = sorted(
+        (p for p in real_parts if not is_net_terminal(p)), key=_part_order_key
+    )
+    if len(order) < 2:
+        return 0
+
+    def _key(s):
+        return (s["overlap"], s["crossings"], s["hpwl"])
+
+    # Connected neighbors per part: the other real parts sharing >=1 of `nets`.
+    # Deduped by object identity, then sorted by _part_order_key so the centroid
+    # sum below is order-deterministic (float addition is not associative).
+    order_set = set(order)
+    neighbors = {}
+    for a in order:
+        seen = set()
+        conn = []
+        for net in nets:
+            pins = getattr(net, "pins", []) or []
+            if not any(getattr(pin, "part", None) is a for pin in pins):
+                continue
+            for pin in pins:
+                part = getattr(pin, "part", None)
+                if part is a or part not in order_set:
+                    continue
+                if id(part) not in seen:
+                    seen.add(id(part))
+                    conn.append(part)
+        neighbors[id(a)] = sorted(conn, key=_part_order_key)
+
+    cur = sch_score.score_parts(order, nets)
+    accepted = 0
+    trial_evals = 0
+    for _pass in range(max_passes):
+        changed_in_pass = False
+        for a in order:
+            if accepted >= max_accepted_moves or trial_evals >= max_trial_evals:
+                break
+            nbrs = neighbors[id(a)]
+            if not nbrs:
+                # No attractive target -- bare nudges would be noise. Skip.
+                continue
+            saved = a.tx
+            cx = sum(n.tx.dx for n in nbrs) / len(nbrs)
+            cy = sum(n.tx.dy for n in nbrs) / len(nbrs)
+            ddx = round((cx - saved.dx) / GRID) * GRID
+            ddy = round((cy - saved.dy) / GRID) * GRID
+            deltas = []
+            for d in [(ddx, ddy), (GRID, 0), (-GRID, 0), (0, GRID), (0, -GRID)]:
+                if d != (0, 0) and d not in deltas:
+                    deltas.append(d)
+            best_delta = None
+            best_key = _key(cur)
+            for dx, dy in deltas:
+                if trial_evals >= max_trial_evals:
+                    break
+                a.tx = Tx(
+                    saved.a, saved.b, saved.c, saved.d, saved.dx + dx, saved.dy + dy
+                )
+                trial = sch_score.score_parts(order, nets)
+                trial_evals += 1
+                trial_key = _key(trial)
+                if trial_key < best_key:
+                    best_key = trial_key
+                    best_delta = (dx, dy)
+                a.tx = saved  # restore before the next trial
+            if best_delta is not None:
+                dx, dy = best_delta
+                a.tx = Tx(
+                    saved.a, saved.b, saved.c, saved.d, saved.dx + dx, saved.dy + dy
+                )
+                cur = sch_score.score_parts(order, nets)
+                accepted += 1
+                changed_in_pass = True
+            else:
+                a.tx = saved
+        if not changed_in_pass:
+            break
+    return accepted
+
+
 @export_to_all
 class Placer:
     """Mixin to add place function to Node class."""
@@ -1778,9 +1897,16 @@ class Placer:
             net_terminals = [p for p in parts if is_net_terminal(p)]
             real_parts = [p for p in parts if not is_net_terminal(p)]
             swaps = _score_swap_refine(real_parts, nets, **options)
+            # Bounded grid single-part move trials (round-3 WS2), made safe by
+            # sch_score's overlap term: an overlap-primary accept key can never
+            # increase total overlap. Runs after the swap pass on the same final
+            # arrangement; 0 accepted (the common case, and always when the flag
+            # is off) keeps the run byte-identical.
+            moves = _score_move_refine(real_parts, nets, **options)
             # Debug-only (mirrors node._place_score_selected); never emitted.
             node._place_score_refine_swaps = swaps
-            if swaps and net_terminals:
+            node._place_score_refine_moves = moves
+            if (swaps + moves) and net_terminals:
                 place_net_terminals(
                     net_terminals, real_parts, nets, total_part_force, **options
                 )

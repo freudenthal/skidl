@@ -23,7 +23,8 @@ import pytest
 
 from skidl.geometry import Tx, Point, BBox
 from skidl.schematics import sch_score
-from skidl.schematics.place import _score_swap_refine
+from skidl.schematics.place import _score_swap_refine, _score_move_refine
+from skidl.schematics.route import GRID  # stable 50 fallback == the injected value
 
 
 # ---------------------------------------------------------------------------
@@ -39,12 +40,14 @@ class _FakePin:
 
 
 class _FakePart:
-    def __init__(self, ref, x, y):
+    def __init__(self, ref, x, y, w=2.0, h=2.0):
         self.ref = ref
         self.num = 0
-        # Shared local bbox + identity orientation => all four parts are one
-        # swap class; only the tx translation (dx, dy) differs.
-        self.place_bbox = BBox(Point(0.0, 0.0), Point(2.0, 2.0))
+        # Default: shared local bbox + identity orientation => all such parts are
+        # one swap class; only the tx translation (dx, dy) differs. Passing a
+        # distinct (w, h) makes a part its own swap class (used to force a
+        # move-only, swap-impossible scenario).
+        self.place_bbox = BBox(Point(0.0, 0.0), Point(w, h))
         self.tx = Tx(dx=x, dy=y)
         self.pins = [_FakePin(self)]
 
@@ -134,6 +137,69 @@ def test_refine_different_classes_never_swapped():
     after = _world_bboxes(parts)
     assert (0.0, 1.0, 3.0, 4.0) in after  # C's box at its original (0,1) origin
     assert sorted(before) == sorted(after)
+
+
+# ===========================================================================
+# Single-part move trials (round-3 WS2): overlap-primary accept key
+# ===========================================================================
+def _move_fixture():
+    """Two nets crossing at (50, 0); moving A or B one grid onto the other net's
+    line uncrosses them with NO new overlap (parts are >=1 grid apart). Parts
+    carry DIFFERENT bbox sizes => distinct swap classes, so this is genuinely
+    move territory (a same-class swap can never arise)."""
+    a = _FakePart("A", 0.0, 0.0, w=2.0)
+    b = _FakePart("B", 2 * GRID, 0.0, w=3.0)     # (100, 0)
+    c = _FakePart("C", GRID, -GRID, w=4.0)       # (50, -50)
+    d = _FakePart("D", GRID, GRID, w=5.0)        # (50, 50)
+    nets = [_FakeNet("n1", [a, b]), _FakeNet("n2", [c, d])]
+    return [a, b, c, d], nets
+
+
+def test_move_refine_fixes_offset_crossing():
+    """A single grid-multiple move uncrosses two nets no swap could fix:
+    crossings 1 -> 0, >=1 accepted, overlap never increased."""
+    parts, nets = _move_fixture()
+    before = sch_score.score_parts(parts, nets)
+    assert before["crossings"] == 1
+    accepted = _score_move_refine(parts, nets)
+    assert accepted >= 1
+    after = sch_score.score_parts(parts, nets)
+    assert after["crossings"] == 0
+    assert after["overlap"] <= before["overlap"]
+
+
+def test_move_refine_never_increases_overlap():
+    """Start with two connected parts fully overlapping; the overlap-primary
+    accept key means the pass can only keep or reduce total overlap area."""
+    a = _FakePart("A", 0.0, 0.0)
+    b = _FakePart("B", 0.0, 0.0)          # exactly overlaps A
+    c = _FakePart("C", 2 * GRID, 0.0)
+    parts = [a, b, c]
+    nets = [_FakeNet("n1", [a, b]), _FakeNet("n2", [b, c])]
+    before = sch_score.score_parts(parts, nets)
+    assert before["overlap"] > 0.0
+    _score_move_refine(parts, nets)
+    after = sch_score.score_parts(parts, nets)
+    assert after["overlap"] <= before["overlap"]
+
+
+def test_move_refine_stays_on_grid():
+    """Every part's net displacement is an integer multiple of GRID."""
+    parts, nets = _move_fixture()
+    orig = {p.ref: (p.tx.dx, p.tx.dy) for p in parts}
+    _score_move_refine(parts, nets)
+    for p in parts:
+        assert (p.tx.dx - orig[p.ref][0]) % GRID == 0
+        assert (p.tx.dy - orig[p.ref][1]) % GRID == 0
+
+
+def test_move_refine_deterministic():
+    """Two runs on identical fresh fixtures land every part identically."""
+    p1, n1 = _move_fixture()
+    _score_move_refine(p1, n1)
+    p2, n2 = _move_fixture()
+    _score_move_refine(p2, n2)
+    assert [(p.tx.dx, p.tx.dy) for p in p1] == [(p.tx.dx, p.tx.dy) for p in p2]
 
 
 # ===========================================================================
