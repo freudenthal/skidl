@@ -431,4 +431,14 @@ class SchNode(Placer, Router):
 
             return wire_length
 
-        return f"{get_wire_length(self)}\n"
+        # Placement-quality measurement (crossings + HPWL) from the same scorer
+        # skidl-layout uses. Report-only: this string is written to a separate
+        # stats_file (kicad5 collect_stats path) and never into the .kicad_sch,
+        # so it cannot change any rendered schematic.
+        from skidl.schematics import sch_score
+
+        score = sch_score.score_node(self)
+        return (
+            f"{get_wire_length(self)}\n"
+            f"crossings={score['crossings']} hpwl={score['hpwl']:.1f}\n"
+        )
