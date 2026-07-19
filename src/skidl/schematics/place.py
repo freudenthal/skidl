@@ -1364,6 +1364,80 @@ def place_net_terminals(net_terminals, placed_parts, nets, force_func, **options
     restore_anchor_pull_pins(net_terminals)
 
 
+def _score_swap_refine(real_parts, nets, **options):
+    """Deterministic accept-if-better same-class pairwise swap polish.
+
+    Ported from skidl-layout's ``refine_placement`` swap loop
+    (``refinement.py`` :1735-1781): after a connected group is placed, optionally
+    exchange the positions of two parts of the SAME swap class when doing so
+    strictly lowers ``(crossings, hpwl)`` under the pure ``sch_score`` scorer.
+
+    A swap class is (identical local ``place_bbox``, identical ``tx`` orientation
+    submatrix), so the two parts' WORLD bounding boxes differ only by translation;
+    swapping their ``tx`` translations exchanges them exactly and can never create
+    a new overlap -- which is required here because ``sch_score`` has no overlap
+    term, so free single-part moves are out of scope (see the round-2 plan's WS1
+    hazard #1). Only the swap loop is ported (no rotation trials, no legalization).
+
+    Deterministic: parts iterate in ``_part_order_key`` order, no RNG, no ``id()``
+    iteration. Returns the number of accepted swaps.
+    """
+    # Absolute import: place()'s constant-injection (see the bake-off's local
+    # import in place_connected_parts) overwrites this module's __package__ with
+    # the tool module's, so a relative import here would misresolve.
+    from skidl.schematics import sch_score
+
+    max_pair_swaps = 16
+    max_passes = 2
+
+    order = sorted(
+        (p for p in real_parts if not is_net_terminal(p)), key=_part_order_key
+    )
+    if len(order) < 2:
+        return 0
+
+    def _swap_class_key(part):
+        pb = part.place_bbox
+        tx = part.tx
+        return (pb.min.x, pb.min.y, pb.max.x, pb.max.y, tx.a, tx.b, tx.c, tx.d)
+
+    cur = sch_score.score_parts(order, nets)
+    accepted = 0
+    for _pass in range(max_passes):
+        swap_attempts = 0
+        changed_in_pass = False
+        for i, a in enumerate(order):
+            if swap_attempts >= max_pair_swaps:
+                break
+            for b in order[i + 1:]:
+                if swap_attempts >= max_pair_swaps:
+                    break
+                if _swap_class_key(a) != _swap_class_key(b):
+                    continue
+                swap_attempts += 1
+                a_tx, b_tx = a.tx, b.tx
+                # Exchange translations only; keep each part's own a,b,c,d (equal
+                # under the class). New Tx objects so no snapshot a caller may
+                # hold is mutated.
+                a.tx = Tx(a_tx.a, a_tx.b, a_tx.c, a_tx.d, b_tx.dx, b_tx.dy)
+                b.tx = Tx(b_tx.a, b_tx.b, b_tx.c, b_tx.d, a_tx.dx, a_tx.dy)
+                trial = sch_score.score_parts(order, nets)
+                if (trial["crossings"], trial["hpwl"]) < (
+                    cur["crossings"],
+                    cur["hpwl"],
+                ):
+                    cur = trial
+                    accepted += 1
+                    changed_in_pass = True
+                    break  # move to the next `a` after an accepted swap
+                # Not better: revert to the pre-trial tx objects.
+                a.tx = a_tx
+                b.tx = b_tx
+        if not changed_in_pass:
+            break
+    return accepted
+
+
 @export_to_all
 class Placer:
     """Mixin to add place function to Node class."""
@@ -1692,6 +1766,24 @@ class Placer:
             # Default single-pass placement (behavior unchanged when the
             # place_score_select flag is absent).
             _place_once(options)
+
+        if options.get("place_score_refine"):
+            # Opt-in accept-if-better same-class swap polish (default OFF =>
+            # byte-identical). Runs on the real parts AFTER the group's
+            # arrangement is final -- whether that came from the default pass or
+            # the bake-off above. NetTerminals were already placed inside
+            # _place_once; re-run place_net_terminals ONLY when a swap actually
+            # landed, so the no-op case (0 accepted swaps) stays byte-identical
+            # to the flag-off run of the same options.
+            net_terminals = [p for p in parts if is_net_terminal(p)]
+            real_parts = [p for p in parts if not is_net_terminal(p)]
+            swaps = _score_swap_refine(real_parts, nets, **options)
+            # Debug-only (mirrors node._place_score_selected); never emitted.
+            node._place_score_refine_swaps = swaps
+            if swaps and net_terminals:
+                place_net_terminals(
+                    net_terminals, real_parts, nets, total_part_force, **options
+                )
 
     def place_floating_parts(node, parts, **options):
         """Place individual parts.
