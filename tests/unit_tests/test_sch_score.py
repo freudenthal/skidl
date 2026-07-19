@@ -155,12 +155,77 @@ def test_score_node_dict_shape_and_hierarchy():
     root.children = {"child": child}
 
     score = sch_score.score_node(root)
-    assert set(score) == {"crossings", "hpwl", "parts", "nets", "skipped"}
+    assert set(score) == {"crossings", "hpwl", "parts", "nets", "skipped", "overlap"}
     # child contributes 1 crossing + 2 scored nets + 4 parts; root adds 0/1/2.
     assert score["crossings"] == 1
     assert score["parts"] == 6
     assert score["nets"] == 3
     assert score["hpwl"] > 0.0
+    # These fakes carry no place_bbox => the overlap term is exactly 0.0.
+    assert score["overlap"] == 0.0
+
+
+# ===========================================================================
+# Overlap term (WS1 round 3): pairwise world-bbox area
+# ===========================================================================
+from skidl.geometry import BBox, Point
+
+
+class _BoxPart:
+    """Part-like with a place_bbox (local frame) + a tx translation, so
+    _world_bbox / overlap_area have real geometry to work on."""
+
+    def __init__(self, ref, x, y, w=2.0, h=2.0, tx=None):
+        self.ref = ref
+        self.num = 0
+        self.pins = []
+        self.place_bbox = BBox(Point(0.0, 0.0), Point(w, h))
+        self.tx = tx if tx is not None else Tx(dx=x, dy=y)
+
+
+def test_overlap_two_overlapping_parts_exact_area():
+    """Two 2x2 boxes offset by (1, 1) overlap on a 1x1 square => area 1.0."""
+    a = _BoxPart("A", 0.0, 0.0)
+    b = _BoxPart("B", 1.0, 1.0)
+    assert sch_score.overlap_area([a, b]) == 1.0
+
+
+def test_overlap_disjoint_is_zero():
+    """Boxes that do not touch contribute 0.0."""
+    a = _BoxPart("A", 0.0, 0.0)
+    b = _BoxPart("B", 10.0, 10.0)
+    assert sch_score.overlap_area([a, b]) == 0.0
+
+
+def test_overlap_ignores_net_terminal(monkeypatch):
+    """A part flagged as a NetTerminal is skipped even if its box overlaps.
+
+    NetTerminal carries skidlbaseobj attribute machinery that a plain fake
+    cannot satisfy, so treat ``T`` as a terminal by patching the same
+    ``_is_net_terminal`` predicate ``overlap_area`` consults."""
+    a = _BoxPart("A", 0.0, 0.0)
+    t = _BoxPart("T", 1.0, 1.0)  # would overlap A by 1.0 if counted
+    monkeypatch.setattr(sch_score, "_is_net_terminal", lambda p: p is t)
+    # Only A survives the terminal filter => no pair => 0.0.
+    assert sch_score.overlap_area([a, t]) == 0.0
+
+
+def test_overlap_ignores_part_without_place_bbox():
+    """A part with no place_bbox (reporting time) drops out of the overlap sum."""
+    a = _BoxPart("A", 0.0, 0.0)
+    b = _FakePart("B", 1.0, 1.0)  # no place_bbox attribute
+    assert sch_score.overlap_area([a, b]) == 0.0
+
+
+def test_overlap_rotated_tx_normalized_bbox():
+    """A 90deg-rotation tx (a=0,b=1,c=-1,d=0) still yields a normalized
+    (min<=max) world bbox from _world_bbox."""
+    rot = Tx(a=0, b=1, c=-1, d=0, dx=0, dy=0)
+    p = _BoxPart("A", 0.0, 0.0, tx=rot)
+    wb = sch_score._world_bbox(p)
+    assert wb is not None
+    min_x, min_y, max_x, max_y = wb
+    assert min_x <= max_x and min_y <= max_y
 
 
 def test_pure_no_tool_imports():

@@ -258,6 +258,59 @@ def _hpwl_from(members, positions) -> float:
     return total
 
 
+def _world_bbox(part):
+    """World-frame ``(min_x, min_y, max_x, max_y)`` of a part's placement bbox.
+
+    ``part.place_bbox * part.tx`` transforms the two stored corners; a ``Tx``
+    with negative ``a``/``d`` (rotation/flip) can swap them, so min/max the
+    transformed corners to return a normalized (min<=max) box. Returns ``None``
+    when the part carries no ``place_bbox`` (reporting time, after
+    ``rmv_placement_stuff`` strips it) or no ``tx`` -- the part then drops out of
+    the overlap sum silently.
+    """
+    pb = getattr(part, "place_bbox", None)
+    if pb is None:
+        return None
+    tx = getattr(part, "tx", None)
+    if tx is None:
+        return None
+    wb = pb * tx
+    return (
+        min(wb.min.x, wb.max.x),
+        min(wb.min.y, wb.max.y),
+        max(wb.min.x, wb.max.x),
+        max(wb.min.y, wb.max.y),
+    )
+
+
+def overlap_area(parts) -> float:
+    """Total pairwise world-bbox overlap area over the real parts.
+
+    Sum over unordered part pairs of the axis-aligned intersection area of their
+    world bounding boxes. Parts are iterated in ``_part_sort_key`` order so the
+    pair enumeration is deterministic; NetTerminals and parts whose
+    ``_world_bbox`` is ``None`` (no ``place_bbox`` -- reporting time) are skipped.
+    Pure float math on identical inputs => deterministic. This is the overlap
+    term the schematic scorer historically lacked; it lets single-part move
+    trials be scored safely, because an overlap-primary accept key can never
+    increase the total overlap area.
+    """
+    boxes = []
+    for part in sorted(parts, key=_part_sort_key):
+        if _is_net_terminal(part):
+            continue
+        wb = _world_bbox(part)
+        if wb is not None:
+            boxes.append(wb)
+    total = 0.0
+    for idx, (ax1, ay1, ax2, ay2) in enumerate(boxes):
+        for bx1, by1, bx2, by2 in boxes[idx + 1:]:
+            total += max(0.0, min(ax2, bx2) - max(ax1, bx1)) * max(
+                0.0, min(ay2, by2) - max(ay1, by1)
+            )
+    return total
+
+
 def _score_parts_core(parts, nets) -> dict:
     """Score a single placement frame given its parts and nets."""
     positions, skipped = _part_positions(parts)
@@ -269,6 +322,7 @@ def _score_parts_core(parts, nets) -> dict:
         "parts": real_parts,
         "nets": len(members),
         "skipped": skipped,
+        "overlap": overlap_area(parts),
     }
 
 
@@ -287,10 +341,10 @@ def _node_nets(node):
 def score_node(node) -> dict:
     """Score a placed ``SchNode`` and all its children.
 
-    Returns ``{"crossings", "hpwl", "parts", "nets", "skipped"}``. Positions
-    across a hierarchy boundary live in per-node frames, so each node is scored
-    independently and the counts / lengths are SUMMED (a per-node score is the
-    right granularity for a per-node placement bake-off).
+    Returns ``{"crossings", "hpwl", "parts", "nets", "skipped", "overlap"}``.
+    Positions across a hierarchy boundary live in per-node frames, so each node
+    is scored independently and the counts / lengths are SUMMED (a per-node score
+    is the right granularity for a per-node placement bake-off).
     """
     agg = dict(_score_parts_core(list(getattr(node, "parts", []) or []), _node_nets(node)))
     children = getattr(node, "children", None)
@@ -302,6 +356,7 @@ def score_node(node) -> dict:
             agg["parts"] += child_score["parts"]
             agg["nets"] += child_score["nets"]
             agg["skipped"] += child_score["skipped"]
+            agg["overlap"] += child_score["overlap"]
     return agg
 
 
@@ -312,7 +367,7 @@ def score_parts(parts, nets) -> dict:
     supplied ``(parts, nets)`` list instead of a node walk, so the placer's
     opt-in candidate bake-off (``place.place_connected_parts``) can score a group
     in its own frame while placing it. Returns
-    ``{"crossings", "hpwl", "parts", "nets", "skipped"}``.
+    ``{"crossings", "hpwl", "parts", "nets", "skipped", "overlap"}``.
     """
     return _score_parts_core(list(parts), list(nets))
 
