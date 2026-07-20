@@ -1202,7 +1202,7 @@ class SpiceConverter:
 
         One malformed line anywhere in a vendor library makes ngspice reject
         every model in it -- measured: 2,101 corpus load failures from 102 files,
-        70 of them 100% dead (``Zener_DiodesInc.lib`` alone holds 810 parts). So
+        70 of them 100% dead (``Zener_DiodesInc.lib`` alone defines 842 zeners). So
         for models the library *index* resolved automatically we include only the
         blocks the netlist actually needs, extracted by ``model_deck``.
 

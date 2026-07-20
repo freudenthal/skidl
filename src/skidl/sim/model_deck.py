@@ -3,8 +3,8 @@
 Vendor libraries ship hundreds of models per file, and ngspice condemns the
 *whole file* when it trips over one malformed line. Measured across the
 KiCad-Spice-Library corpus: 2,101 load failures came from just 102 files, 70 of
-which failed at 100% -- e.g. one bad ``i source`` line poisons all 810 parts in
-``Zener_DiodesInc.lib``. Those are good models nobody can simulate as long as
+which failed at 100% -- e.g. one bad ``i source`` line poisons every one of the 842
+zeners defined in ``Zener_DiodesInc.lib``. Those are good models nobody can simulate as long as
 the sim path ``.include``s the entire file.
 
 This module extracts only what a netlist actually needs: the target
