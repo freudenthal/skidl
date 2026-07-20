@@ -21,6 +21,7 @@ requires_sim = pytest.mark.skipif(not HAS_SIM, reason="PySpice not installed")
 from skidl.sim.simulator import (  # noqa: E402
     _augment_ngspice_error,
     _parse_si_time,
+    _salvage_completed_transient,
     _to_seconds,
     _uic_collapse_hint,
 )
@@ -126,6 +127,130 @@ def test_augment_includes_uic_hint():
     aug2 = _augment_ngspice_error(_FakeSim(_FakeShared(stdout=_COLLAPSE)), exc,
                                   uic=False)
     assert "HINT" not in str(aug2) and "Timestep too small" in str(aug2)
+
+
+# --- F1: salvage a completed transient past a benign end-of-run status ------
+#
+# Pure tests: a fake shared ngspice whose last plot rebuilds to a
+# TransientAnalysis-like object with a .time axis. No ngspice needed.
+
+
+class _FakeAnalysis:
+    def __init__(self, time):
+        self.time = time
+
+
+class _FakePlot:
+    def __init__(self, analysis):
+        self._analysis = analysis
+
+    def to_analysis(self):
+        return self._analysis
+
+
+class _FakeSharedPlot:
+    def __init__(self, last_plot, analysis):
+        self.last_plot = last_plot
+        self._plot = _FakePlot(analysis)
+
+    def plot(self, simulation, plot_name):
+        return self._plot
+
+
+class _FakeSimPlot:
+    def __init__(self, shared):
+        self.ngspice = shared
+
+
+def _fake_sim(last_plot, time):
+    import numpy as np
+
+    an = _FakeAnalysis(None if time is None else np.asarray(time, dtype=float))
+    return _FakeSimPlot(_FakeSharedPlot(last_plot, an))
+
+
+def test_salvage_returns_completed_transient():
+    import numpy as np
+
+    t = np.linspace(0.0, 24e-6, 480049)  # full run to the requested 24 us
+    res = _salvage_completed_transient(_fake_sim("tran1", t), 24e-6)
+    assert res is not None
+    analysis, note = res
+    assert analysis.time is not None and analysis.time.size == 480049
+    assert "salvaged" in note and "480049" in note
+
+
+def test_salvage_rejects_short_rowcount():
+    import numpy as np
+
+    # A genuine early collapse leaves far fewer rows than a completed run.
+    t = np.linspace(0.0, 24e-6, 50)
+    assert _salvage_completed_transient(_fake_sim("tran1", t), 24e-6) is None
+
+
+def test_salvage_rejects_run_that_stopped_short():
+    import numpy as np
+
+    # Many rows, but the time axis only reached 5 us of a 24 us request -> the
+    # transient did NOT complete; this must re-raise, not be salvaged.
+    t = np.linspace(0.0, 5e-6, 480049)
+    assert _salvage_completed_transient(_fake_sim("tran1", t), 24e-6) is None
+
+
+def test_salvage_none_without_last_plot():
+    import numpy as np
+
+    t = np.linspace(0.0, 24e-6, 480049)
+    assert _salvage_completed_transient(_fake_sim(None, t), 24e-6) is None
+
+
+def test_salvage_none_for_non_transient_plot():
+    # An op/dc/ac last plot rebuilds without a .time axis -> not salvageable here.
+    assert _salvage_completed_transient(_fake_sim("op1", None), 24e-6) is None
+
+
+@requires_sim
+def test_run_analysis_salvages_on_benign_command_error():
+    """_run_analysis returns the salvaged transient (and tags a warning) when the
+    thunk raises NgSpiceCommandError but the last plot is a completed run."""
+    import numpy as np
+
+    from skidl.sim.simulator import CircuitSimulator
+    from PySpice.Spice.NgSpice.Shared import NgSpiceCommandError
+
+    t = np.linspace(0.0, 24e-6, 200_000)
+    fake_simulator = _fake_sim("tran1", t)
+
+    cs = CircuitSimulator.__new__(CircuitSimulator)  # skip real __init__/convert
+    cs.model_provenance = {}
+
+    def thunk():
+        raise NgSpiceCommandError("Command 'run' failed")
+
+    analysis = cs._run_analysis(fake_simulator, thunk, salvage_end_time=24e-6)
+    assert getattr(analysis, "_skidl_salvage_warning", None)
+    assert analysis.time.size == 200_000
+
+
+@requires_sim
+def test_run_analysis_reraises_when_not_salvageable():
+    """A short/absent last plot is a real failure -> _run_analysis re-raises."""
+    import numpy as np
+
+    from skidl.sim.simulator import CircuitSimulator
+    from PySpice.Spice.NgSpice.Shared import NgSpiceCommandError
+
+    t = np.linspace(0.0, 1e-6, 10)  # collapsed early
+    fake_simulator = _fake_sim("tran1", t)
+
+    cs = CircuitSimulator.__new__(CircuitSimulator)
+    cs.model_provenance = {}
+
+    def thunk():
+        raise NgSpiceCommandError("Command 'run' failed")
+
+    with pytest.raises(NgSpiceCommandError):
+        cs._run_analysis(fake_simulator, thunk, salvage_end_time=24e-6)
 
 
 # --- B3 live: an SI-string transient actually runs -------------------------

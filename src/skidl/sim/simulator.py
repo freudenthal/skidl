@@ -292,6 +292,69 @@ def _no_dc_solution_hint(text):
     )
 
 
+def _salvage_completed_transient(simulator, end_time, *, min_rows=100, rtol=1e-3):
+    """Best-effort reconstruction of a completed transient result from the shared
+    ngspice instance's last plot (finding F1).
+
+    Certain vendor macromodels (e.g. the TI OPA340 op-amp subckt -- and even the
+    ideal VCVS op-amp) make ngspice return a nonzero status on the closing ``run``
+    command AFTER the ``.tran`` has integrated to ``tstop`` and every node vector
+    is present. PySpice escalates that benign end-of-run status to
+    ``NgSpiceCommandError`` and ``transient_analysis`` would raise *before*
+    constructing the result -- silently discarding a fully computed transient.
+
+    The completed vectors are still in the shared ngspice singleton's last plot.
+    This grabs them and rebuilds a genuine PySpice ``TransientAnalysis`` via
+    ``Plot.to_analysis()`` -- the SAME type the normal path returns, so every
+    ``SimulationResult`` helper keeps working with no special-casing.
+
+    Returns ``(analysis, note)`` only when the last plot is a transient whose time
+    axis reaches ``end_time`` (within ``rtol``) with at least ``min_rows`` rows, so
+    a genuine early convergence collapse (short / absent data) still surfaces as an
+    error. Returns ``None`` otherwise. Any failure to read the plot returns
+    ``None`` (fall through to the normal augmented re-raise).
+    """
+    try:
+        shared = getattr(simulator, "ngspice", None)
+        if shared is None:
+            shared = NgSpiceShared.new_instance()
+        last = getattr(shared, "last_plot", None)
+        if not last:
+            return None
+        plot = shared.plot(None, last)
+        analysis = plot.to_analysis()
+    except Exception:
+        return None
+    # A non-transient last plot (op/dc/ac) has no time axis -> not salvageable here.
+    time = getattr(analysis, "time", None)
+    if time is None:
+        return None
+    try:
+        import numpy as np
+
+        t = np.real(np.asarray(time)).astype(float)
+    except Exception:
+        return None
+    nrows = int(t.size)
+    if nrows < min_rows:
+        return None  # too few rows -> a genuine early collapse, not a completed run
+    if end_time is not None:
+        try:
+            reached = float(t[-1]) >= float(end_time) * (1.0 - rtol)
+        except Exception:
+            reached = True
+        if not reached:
+            return None  # stopped short of the requested stop time -> real failure
+    note = (
+        f"salvaged {nrows} completed transient rows (t reached "
+        f"{float(t[-1]):.6g}s) after ngspice returned a nonzero end-of-run status. "
+        f"This is the benign end-of-run-warning case (e.g. a vendor op-amp subckt) "
+        f"-- the computed vectors are intact and returned; the closing 'run' "
+        f"status is dropped, not the data."
+    )
+    return analysis, note
+
+
 def _augment_ngspice_error(simulator, exc, uic=False):
     """Return ``exc`` unchanged, or -- best effort -- a same-typed copy with the
     tail of ngspice's captured console output appended (E2E finding B1).
@@ -340,6 +403,13 @@ class SimulationResult:
         self.analysis_type = analysis_type
         self._voltages = {}
         self._currents = {}
+        # Non-fatal warnings carried on the result. Populated e.g. when a completed
+        # transient was salvaged past a benign nonzero end-of-run status (F1) so the
+        # caller can surface the caveat without re-parsing logs.
+        self.warnings: List[str] = []
+        salvage = getattr(analysis_result, "_skidl_salvage_warning", None)
+        if salvage:
+            self.warnings.append(salvage)
 
         # Extract voltages and currents from analysis
         if hasattr(analysis_result, "nodes"):
@@ -910,17 +980,34 @@ class CircuitSimulator:
             simulator.options(**options)
         return simulator
 
-    def _run_analysis(self, simulator, thunk, uic=False):
+    def _run_analysis(self, simulator, thunk, uic=False, salvage_end_time=None):
         """Run one PySpice analysis, surfacing ngspice's failure reason (B1).
 
         On ``NgSpiceCommandError`` (the opaque ``Command 'run' failed``) the tail
         of ngspice's captured console output is appended to the message; the
         exception type is preserved so existing ``except`` clauses still catch.
         ``uic`` (True on a UIC transient) enables the driven-subckt collapse HINT
-        (S4)."""
+        (S4).
+
+        When ``salvage_end_time`` is given (transient runs), a benign nonzero
+        end-of-run status whose ``.tran`` actually completed is not an error: the
+        computed vectors are recovered from the shared ngspice instance's last plot
+        and returned, with a salvage warning attached to the result (finding F1).
+        A genuinely truncated/collapsed run still raises the augmented error."""
         try:
             result = thunk()
         except NgSpiceCommandError as exc:
+            if salvage_end_time is not None:
+                salvaged = _salvage_completed_transient(simulator, salvage_end_time)
+                if salvaged is not None:
+                    analysis, note = salvaged
+                    logger.warning("transient result salvaged -- %s", note)
+                    try:
+                        analysis._skidl_salvage_warning = note
+                    except Exception:  # pragma: no cover - analysis attr is settable
+                        pass
+                    self._emit_load_summary(simulator)
+                    return analysis
             augmented = _augment_ngspice_error(simulator, exc, uic=uic)
             if augmented is exc:
                 raise
@@ -1106,7 +1193,7 @@ class CircuitSimulator:
             kwargs["use_initial_condition"] = True
         analysis = self._run_analysis(
             simulator, lambda: simulator.transient(**kwargs),
-            uic=use_initial_condition)
+            uic=use_initial_condition, salvage_end_time=end_time)
 
         return SimulationResult(analysis, "transient")
 
