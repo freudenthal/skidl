@@ -179,6 +179,9 @@ class SpiceConverter:
         # original_ref) for any ref that had to be uniquified. Empty otherwise.
         # Keeps model provenance / error messages traceable back to the source.
         self.flattened_ref_map = {}
+        # node name -> set of excluded (Sim.Enable=0) refs that touched it. Lets
+        # the floating-node tie (F4) name the excluded part that stranded a node.
+        self._excluded_node_refs = {}
 
     class _FlatCircuit:
         """A read-only, flattened view of a hierarchical circuit.
@@ -309,6 +312,11 @@ class SpiceConverter:
 
         # Add power sources (voltage/current sources)
         self._add_power_sources()
+
+        # Netlist conditioning: tie any DC-floating node (e.g. a node stranded by
+        # an excluded Sim.Enable=0 part) so the op-point isn't singular (F4). Runs
+        # last, on the final device graph.
+        self._tie_floating_nodes()
 
         return self.spice_circuit
 
@@ -514,6 +522,10 @@ class SpiceConverter:
         value = getattr(component, "value", None)
 
         if self._sim_excluded(component):
+            # Remember which nodes an excluded part touched, so if excluding it
+            # strands a neighbor node (F4) the tie warning can name the culprit.
+            for node in self._symbol_pin_nodes(component).values():
+                self._excluded_node_refs.setdefault(str(node), set()).add(str(ref))
             logger.debug(f"{ref}: excluded from simulation (Sim.Enable=0)")
             return
 
@@ -3997,6 +4009,145 @@ class SpiceConverter:
                 f"{source_name} from its NAME. If unintended, rename the net or "
                 f"drive it with an explicit Simulation_SPICE:VDC (explicit "
                 f"sources suppress this)."
+            )
+
+    # ------------------------------------------------------------------ #
+    # Floating-node conditioning (F4)                                     #
+    # ------------------------------------------------------------------ #
+
+    # PySpice element classes that are an OPEN at DC: a node reachable from ground
+    # only through these has no operating point (ngspice: 'singular matrix: check
+    # node <n>'). A capacitor is open at DC; an (independent) current source pins a
+    # branch current, not a node voltage.
+    _DC_OPEN_ELEMENT_TYPES = ("Capacitor", "CurrentSource")
+
+    @staticmethod
+    def _tie_floating_enabled() -> bool:
+        """Gmin-tie of DC-floating nodes (on by default).
+
+        ``SKIDL_SIM_TIE_FLOATING=0`` is the kill switch: no tie resistors are
+        added, so a circuit's deck is byte-identical to the pre-feature emission.
+        """
+        return os.environ.get("SKIDL_SIM_TIE_FLOATING", "1") != "0"
+
+    def _conducting_nodes(self, element) -> List[str]:
+        """The nodes an element gives a DC path to (F4 helper).
+
+        Empty for a DC-open element (capacitor / current source). For a MOSFET the
+        gate is DC-isolated from the channel (a capacitive terminal), so a
+        gate-only node still floats -- drain/source/bulk conduct, gate does not.
+        Every other element (R/L/sources/diode/BJT/subckt/behavioral) anchors all
+        of its nodes. Node-topology only, no per-part tables.
+        """
+        names = [str(n) for n in (getattr(element, "node_names", None) or [])]
+        tname = type(element).__name__
+        if tname in self._DC_OPEN_ELEMENT_TYPES:
+            return []
+        if tname == "Mosfet" and len(names) >= 3:
+            # PySpice Mosfet node order is d g s [b]; index 1 (gate) is isolated.
+            return [names[0]] + names[2:]
+        return names
+
+    def _union_raw_mosfet_nodes(self, all_nodes, union, find) -> None:
+        """Union drain/source/bulk (NOT gate) of any raw-spice ``M`` line.
+
+        A VDMOS is emitted via ``raw_spice`` (PySpice's ``M`` forces 4 nodes), so it
+        is not a structured element -- account for its DC path here so its
+        drain/source aren't mistaken for floating. Best-effort; a missed line only
+        risks a harmless extra 1G tie, never a wrong answer."""
+        raw = getattr(self.spice_circuit, "raw_spice", "") or ""
+        for line in str(raw).splitlines():
+            s = line.strip()
+            if not s or s[0] in "*.":
+                continue
+            toks = s.split()
+            if toks[0][:1].upper() != "M" or len(toks) < 5:
+                continue
+            nodes = toks[1:-1]  # drop the ref and the trailing model name
+            # index 1 is the gate (isolated); union drain/source/bulk together
+            channel = [n for i, n in enumerate(nodes) if i != 1]
+            for n in nodes:
+                all_nodes.add(n)
+                find(n)
+            for n in channel[1:]:
+                union(channel[0], n)
+
+    def _tie_floating_nodes(self) -> None:
+        """Tie every DC-floating node to ground with a 1 G bleed (F4).
+
+        Excluding a part (``Sim.Enable=0``) -- or any emission path -- can leave a
+        node with no DC path to ground: its only connections are capacitors /
+        current sources (open at DC), possibly across a chain of resistors (a
+        stranded R-C compensation island is the common case when the controller IC
+        is excluded). The operating point then has no equation pinning those node
+        voltages, so ngspice reports ``singular matrix: check node <n>`` and limps
+        through gmin/source stepping -- or fails outright on a less patient circuit.
+
+        Connectivity is computed on the FINAL device graph with a union-find over
+        nodes joined by DC-conducting elements (everything but capacitors, current
+        sources, and a MOSFET gate). Any node not in ground's component is tied to
+        ground with a resistor high enough to be electrically invisible (1 G) yet
+        enough to anchor the op-point, warning once per node (naming the excluded
+        part(s) that stranded it, when known).
+
+        Byte-identical to before when nothing floats (a fully connected circuit
+        gets no ties). Kill switch: ``SKIDL_SIM_TIE_FLOATING=0``.
+        """
+        if not self._tie_floating_enabled() or self.spice_circuit is None:
+            return
+        gnd = str(self.spice_circuit.gnd)
+        try:
+            elements = list(self.spice_circuit.elements)
+        except Exception:  # pragma: no cover - PySpice internals
+            return
+
+        parent = {}
+
+        def find(x):
+            parent.setdefault(x, x)
+            root = x
+            while parent[root] != root:
+                root = parent[root]
+            while parent[x] != root:
+                parent[x], x = root, parent[x]
+            return root
+
+        def union(a, b):
+            parent[find(a)] = find(b)
+
+        all_nodes = {gnd}
+        find(gnd)
+        for el in elements:
+            names = [str(n) for n in (getattr(el, "node_names", None) or [])]
+            for n in names:
+                all_nodes.add(n)
+                find(n)
+            # Nodes this element gives a DC path between are mutually connected;
+            # a capacitor/current source yields none, a MOSFET omits its gate.
+            conducting = self._conducting_nodes(el)
+            for n in conducting[1:]:
+                union(conducting[0], n)
+        self._union_raw_mosfet_nodes(all_nodes, union, find)
+
+        groot = find(gnd)
+        floating = sorted(n for n in all_nodes if n != gnd and find(n) != groot)
+        for node in floating:
+            safe = re.sub(r"[^A-Za-z0-9]", "_", node) or "n"
+            try:
+                self.spice_circuit.R(f"float_tie_{safe}", node, gnd, 1e9)
+            except Exception as exc:  # pragma: no cover - duplicate/name edge cases
+                logger.debug(f"could not tie floating node '{node}': {exc}")
+                continue
+            culprits = sorted(self._excluded_node_refs.get(node, ()))
+            cause = (
+                f"floated by excluded {', '.join(culprits)}"
+                if culprits
+                else "has no DC path to ground"
+            )
+            logger.warning(
+                f"sim node '{node}' {cause}; tied to ground with 1G to anchor the "
+                f"op-point (electrically invisible). Set SKIDL_SIM_TIE_FLOATING=0 "
+                f"to disable this conditioning."
             )
 
     def _extract_voltage_from_net_name(self, net_name: str) -> Optional[float]:
