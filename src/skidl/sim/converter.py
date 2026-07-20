@@ -3,6 +3,14 @@ SpiceConverter: Converts circuit-synth designs to PySpice format.
 
 This module handles the translation from circuit-synth components and nets
 to SPICE netlists that can be simulated with PySpice/ngspice.
+
+External vendor models are attached in tiers: an explicit ``Sim.Library``, the
+local MPN store, then automatic resolution through the corpus library index.
+That last tier does NOT ``.include`` the model's whole file -- one malformed
+line anywhere in a vendor library makes ngspice reject every model defined in
+it, so ``_emit_minimal_decks`` includes an extracted deck holding only the
+models the netlist needs (see ``model_deck``). Explicit ``Sim.Library`` paths
+keep whole-file includes, and ``SKIDL_SIM_MINIMAL_DECK=0`` reverts everything.
 """
 
 import hashlib
@@ -151,6 +159,10 @@ class SpiceConverter:
         self.model_provenance = {}
         # Absolute paths of external .lib/.sub files already `.include`d (dedup).
         self.included_libs = set()
+        # Corpus-resolved models whose include is deferred to _emit_minimal_decks:
+        # source file path -> set of model names needed from it. See that method
+        # for why auto-resolved hits get a minimal deck instead of the whole file.
+        self._mindeck_needs = {}
         # First non-empty Sim.Compat across components (e.g. "psa" for a vendor
         # PSpice lib) -> the ngspice dialect the simulator should select. Resolved
         # in convert(); a disagreement between components is a validate() error.
@@ -278,6 +290,11 @@ class SpiceConverter:
 
         # Add components to SPICE circuit
         self._add_components()
+
+        # Turn the corpus-resolved models deferred by _emit_external into minimal
+        # `.include`d decks (one per source file). Must run after _add_components
+        # so every model needed from a file is known before its deck is built.
+        self._emit_minimal_decks()
 
         # Emit .model cards for the semiconductor models the components referenced.
         self._emit_models()
@@ -1171,6 +1188,61 @@ class SpiceConverter:
         except Exception as exc:  # pragma: no cover - PySpice/ngspice specifics
             logger.warning(f"Failed to include SPICE library {safe}: {exc}")
 
+    @staticmethod
+    def _minimal_deck_enabled() -> bool:
+        """Minimal-deck includes for corpus-resolved models (on by default).
+
+        ``SKIDL_SIM_MINIMAL_DECK=0`` is the kill switch: every include reverts to
+        the whole file, byte-identical to the pre-feature emission.
+        """
+        return os.environ.get("SKIDL_SIM_MINIMAL_DECK", "1") != "0"
+
+    def _emit_minimal_decks(self) -> None:
+        """`.include` an extracted deck per corpus-resolved library file.
+
+        One malformed line anywhere in a vendor library makes ngspice reject
+        every model in it -- measured: 2,101 corpus load failures from 102 files,
+        70 of them 100% dead (``Zener_DiodesInc.lib`` alone holds 810 parts). So
+        for models the library *index* resolved automatically we include only the
+        blocks the netlist actually needs, extracted by ``model_deck``.
+
+        Only the auto-resolve tier changes. An explicit ``Sim.Library`` is user
+        intent -- and the escape hatch by construction -- so it keeps its
+        whole-file include; if such a part already included this same file, the
+        deck is skipped too (adding it would redefine those subckts). Extraction
+        failure falls back to the whole file: degrade to today, never to silence.
+        """
+        from .model_deck import stage_minimal_deck
+
+        def _same_file(p):
+            return os.path.normcase(os.path.abspath(str(p)))
+
+        already = {_same_file(p) for p in self.included_libs}
+        for path, names in sorted(self._mindeck_needs.items()):
+            if _same_file(path) in already:
+                logger.debug(
+                    f"minimal-deck include skipped for {os.path.basename(path)}: "
+                    f"already included whole-file (explicit Sim.Library)"
+                )
+                continue
+            base = os.path.basename(path)
+            staged = stage_minimal_deck(
+                path, sorted(names), self._include_cache_dir()
+            )
+            if staged:
+                self.included_libs.add(path)  # dedup against a later whole-file ask
+                self._include_lib(staged)
+                logger.info(
+                    f"minimal-deck include: {base} ({len(names)} model(s))"
+                )
+            else:
+                logger.warning(
+                    f"Could not extract a minimal deck from {base} for "
+                    f"{sorted(names)} - including the whole file (a malformed "
+                    f"line anywhere in it will fail the simulation)"
+                )
+                self._include_lib(path)
+
     def _add_external_model(self, component, ref) -> None:
         """Attach a device's external vendor model (Sim.Library + Sim.Name)."""
         sim = self._sim_props(component)
@@ -1195,7 +1267,12 @@ class SpiceConverter:
         model_type="",
     ) -> None:
         """Shared emit for an external model (Sim.Library or store), by file kind."""
-        self._include_lib(path)
+        if source == "library_index" and self._minimal_deck_enabled() and name:
+            # Defer: _emit_minimal_decks includes an extracted deck instead of the
+            # whole file once every needed name from it is known.
+            self._mindeck_needs.setdefault(str(path), set()).add(str(name))
+        else:
+            self._include_lib(path)
         dev_kind = self._kind(component)
         base = os.path.basename(str(path))
 
