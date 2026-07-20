@@ -440,6 +440,14 @@ class SpiceConverter:
         "DFF": "dff",
         "TFF": "tff",
         "DLATCH": "dlatch",
+        # Triggered-breakdown / negative-resistance primitive (F5): one behavioral
+        # smooth-conductance switch covering avalanche transistors, spark gaps and
+        # SCR/DIAC-like discharge devices ngspice can't model natively. Aliases map
+        # to the same emitter; terminal count picks externally- vs self-triggered.
+        "TRIGSW": "trigsw",
+        "SPARKGAP": "trigsw",
+        "DIAC": "trigsw",
+        "AVSW": "trigsw",
         "NOT": "gate",
         "INV": "gate",
         "BUF": "gate",
@@ -587,6 +595,7 @@ class SpiceConverter:
             "dff": self._add_dff,
             "tff": self._add_tff,
             "dlatch": self._add_dlatch,
+            "trigsw": self._add_trigsw,
             "gate": self._add_gate,
         }
         handler = handlers.get(self._kind(component))
@@ -2465,6 +2474,117 @@ class SpiceConverter:
             ref, "dlatch", "sim_params", "dlatch_behavioral"
         )
         logger.debug(f"Added behavioral DLATCH {ref}: d={d} en={en} q={q} qn={qn}")
+
+    # Triggered-breakdown primitive terminal roles (F5). Power terminals accept
+    # switch/anode/collector spellings; the control is the ground-referenced
+    # trigger (base/gate/trigger). Matched via _logic_pin_nodes (pin NAME, or an
+    # explicit Sim.Pins="<num>=P <num>=G <num>=N" override for a bare symbol).
+    _TRIGSW_P_NAMES = {"P", "A", "ANODE", "AN", "C", "COLLECTOR", "MT2", "H", "+"}
+    _TRIGSW_N_NAMES = {"N", "K", "CATHODE", "KA", "E", "EMITTER", "MT1", "L", "-"}
+    _TRIGSW_G_NAMES = {"G", "GATE", "TRIG", "TRIGGER", "B", "BASE", "CTL", "CONTROL"}
+
+    def _trigsw_params(self, component) -> dict:
+        """Parameters for the triggered-breakdown primitive (F5), with defaults.
+
+        ``VT`` trigger threshold (V, default 2.5); ``RON`` on-resistance (ohm,
+        default 1.2) -> on-conductance ``GON`` (a direct ``GON=`` wins); ``WIDTH``
+        turn-on sharpness of the sigmoid (V, default 0.05); ``RLEAK`` off-state /
+        op-point leak (ohm, default 100 Meg); optional ``VHOLD`` quench threshold
+        -- when set, the conductance also falls off as the voltage across the
+        switch drops below it (a smooth self-terminating quench, NOT a latch: a
+        latch makes the DC op-point bistable, a documented failure mode)."""
+        raw = self._parse_sim_params(self._sim_props(component).get("params"))
+
+        def g(key, default):
+            v = self._parse_si_number(raw[key]) if key in raw else None
+            return v if v is not None else default
+
+        ron = g("RON", 1.2)
+        gon = g("GON", None)
+        if gon is None or gon <= 0:
+            gon = (1.0 / ron) if (ron and ron > 0) else 0.83
+        width = g("WIDTH", 0.05)
+        if not width or width <= 0:
+            width = 0.05
+        rleak = g("RLEAK", 100e6)
+        if not rleak or rleak <= 0:
+            rleak = 100e6
+        return {
+            "GON": gon,
+            "VT": g("VT", 2.5),
+            "WIDTH": width,
+            "RLEAK": rleak,
+            "VHOLD": g("VHOLD", None),
+        }
+
+    def _add_trigsw(self, component, ref: str, value: str):
+        """Behavioral triggered-breakdown switch (Sim.Device=TRIGSW/SPARKGAP/DIAC).
+
+        One parameterized primitive for the whole triggered-breakdown /
+        negative-resistance class -- avalanche transistors, spark gaps, SCR/DIAC-
+        like discharge devices -- none of which ngspice models natively. It is a
+        smooth (sigmoid) gated conductance across the two power terminals, NOT an
+        ideal ``sw`` (which collapses the timestep in a resonant loop) and NOT a
+        latched state node (whose DC op-point is bistable) -- both are documented
+        failure modes from the avalanche E2E.
+
+        Terminals (by pin NAME, or Sim.Pins override): ``P`` power+ (A/anode/C/
+        collector), ``N`` power- (K/cathode/E/emitter). With a third control
+        terminal ``G`` (B/base/gate/trig) the device is EXTERNALLY triggered and the
+        gate references ``V(G)`` -- GROUND-referenced, the key avalanche lesson (an
+        emitter/terminal-referenced trigger fails when the power- terminal floats).
+        With only two terminals it is SELF-triggered on the voltage across it
+        (``V(P,N)`` > VT), a spark-gap/DIAC breakover.
+
+        Emission (params via ``_trigsw_params``)::
+
+            B<ref>_sw   P N I = V(P,N) * GON / (1 + exp(-(<trig> - VT)/WIDTH)) [*quench]
+            R<ref>_leak P N RLEAK
+
+        Untriggered the sigmoid is ~0 (a single, unambiguous DC op-point via the
+        leak); triggered it opens to GON (=1/RON). The current ``GON*V(P,N)`` self-
+        terminates as the driving voltage collapses, so the ns pulse SHAPE is set by
+        the EXTERNAL L-C loop, not this model. Provenance tier ``sim_params``.
+        """
+        nodes = self._logic_pin_nodes(component)
+        if nodes is None:
+            logger.warning(f"TRIGSW {ref}: no live pin map; skipping")
+            return
+        p = self._first_named(nodes, self._TRIGSW_P_NAMES)
+        n_ = self._first_named(nodes, self._TRIGSW_N_NAMES)
+        ctrl = self._first_named(nodes, self._TRIGSW_G_NAMES)
+        if p is None or n_ is None:
+            logger.warning(
+                f"TRIGSW {ref}: needs two power terminals -- P/A/anode/C(+) and "
+                f"N/K/cathode/E(-) -- resolved by pin name or Sim.Pins; skipping "
+                f"(got P={p}, N={n_})"
+            )
+            return
+        prm = self._trigsw_params(component)
+        fn = self._fmt_num
+        gon, vt, width, rleak = (
+            fn(prm["GON"]), fn(prm["VT"]), fn(prm["WIDTH"]), fn(prm["RLEAK"])
+        )
+        # externally triggered on the ground-referenced control node, else self-
+        # triggered on the voltage across the switch (spark-gap breakover).
+        trig = f"V({ctrl})" if ctrl is not None else f"V({p},{n_})"
+        gate = f"1/(1+exp(-({trig} - {vt})/{width}))"
+        if prm["VHOLD"] is not None:
+            vhold = fn(prm["VHOLD"])
+            gate = f"({gate})*(1/(1+exp(-(V({p},{n_}) - {vhold})/{width})))"
+        lines = [
+            f"B{ref}_sw {p} {n_} I = V({p},{n_}) * {gon} * {gate}",
+            f"R{ref}_leak {p} {n_} {rleak}",
+        ]
+        self.spice_circuit.raw_spice += "\n" + "\n".join(lines)
+        mode = "ext-trig" if ctrl is not None else "self-trig"
+        self.model_provenance[ref] = ResolvedModel(
+            ref, "trigsw", "sim_params", f"trigsw_{mode}(vt={vt}, gon={gon})"
+        )
+        logger.debug(
+            f"Added behavioral TRIGSW {ref} ({mode}): P={p} N={n_} "
+            f"G={ctrl} vt={vt} gon={gon} rleak={rleak}"
+        )
 
     def _gate_expr(self, op, his, vdd):
         """ngspice B-source expression for a logic gate over input predicates ``his``.
@@ -4532,13 +4652,21 @@ class SpiceConverter:
             if self._sim_excluded(component):
                 continue
             kind = self._kind(component)
-            if kind not in ("dff", "tff", "dlatch", "gate"):
+            if kind not in ("dff", "tff", "dlatch", "gate", "trigsw"):
                 continue
             ref = self._attr(component, "ref", None) or "?"
             nodes = self._logic_pin_nodes(component)
             if nodes is None:
                 continue  # no live pin map -> can't check (lenient path skips it)
-            if kind == "gate":
+            if kind == "trigsw":
+                p = self._first_named(nodes, self._TRIGSW_P_NAMES)
+                n_ = self._first_named(nodes, self._TRIGSW_N_NAMES)
+                if p is None or n_ is None:
+                    problems.append(
+                        f"{ref}: TRIGSW needs two power terminals -- P/A/anode/C(+) "
+                        f"and N/K/cathode/E(-) -- resolved by pin name or Sim.Pins"
+                    )
+            elif kind == "gate":
                 op = str(self._sim_props(component).get("device", "")).strip().upper()
                 out = self._first_named(nodes, self._GATE_OUT_NAMES)
                 ins = [
