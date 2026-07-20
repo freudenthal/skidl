@@ -33,11 +33,19 @@ class ResolvedModel:
     Recorded per device so callers can see -- and log -- that a part simulated
     with datasheet-fit params, a textbook generic, or an external vendor model,
     rather than a generic being silently passed off as the real part.
+
+    ``vendor_lib`` covers a model resolved from the corpus library index or the
+    local MPN store (real silicon someone catalogued). ``user_lib`` is distinct
+    (F2): a model attached from an explicit ``Sim.Library`` path OUTSIDE the
+    configured corpus -- i.e. an author's own hand-written macromodel. The two are
+    kept separate so a *behavioral guess* is never presented with the same
+    authority as a genuine vendor model. (A user file dropped INSIDE the corpus
+    tree cannot be distinguished and reports ``vendor_lib`` -- a known limit.)
     """
 
     ref: str
     kind: str  # diode | bjt | mosfet
-    tier: str  # datasheet_fit | generic | vendor_lib | unresolved
+    tier: str  # datasheet_fit | generic | vendor_lib | user_lib | unresolved
     name: str  # the resolved model/base name
     overridden: bool = False  # True if Sim.Params overlaid a derived card
     source: str = ""  # provenance of a vendor_lib model: sim_library | local_store
@@ -1262,11 +1270,58 @@ class SpiceConverter:
             "local_store", model_type,
         )
 
+    def _path_under_corpus_root(self, path) -> bool:
+        """True if ``path`` lives under a configured SPICE-library (corpus) root.
+
+        Path-class test only (F2): compares absolute, normcased prefixes against
+        the library index's configured roots. Used to tell an author's own
+        ``Sim.Library`` file (outside the corpus -> ``user_lib``) from a catalogued
+        vendor library. Returns False when no corpus is configured (no roots to be
+        under) or on any resolution error -- degrade to the ``vendor_lib`` label,
+        never crash.
+        """
+        if not path:
+            return False
+        try:
+            from .library_index import get_library_index
+
+            index = get_library_index()
+        except Exception:  # pragma: no cover - index import/init failure
+            index = None
+        if index is None:
+            return False
+        try:
+            ap = os.path.normcase(os.path.abspath(str(path)))
+        except Exception:  # pragma: no cover
+            return False
+        for root in getattr(index, "roots", []) or []:
+            try:
+                r = os.path.normcase(os.path.abspath(str(root)))
+            except Exception:  # pragma: no cover
+                continue
+            if ap == r or ap.startswith(r + os.sep):
+                return True
+        return False
+
+    def _external_tier(self, source, path) -> str:
+        """Provenance tier for an external model (F2).
+
+        An explicit ``Sim.Library`` path outside the corpus is a user-authored
+        artifact -> ``user_lib``; a corpus/index or MPN-store model is
+        ``vendor_lib``. Keeping them distinct is the whole point of provenance:
+        a hand-written behavioral macromodel must never wear a real vendor
+        model's label.
+        """
+        if source == "sim_library" and not self._path_under_corpus_root(path):
+            return "user_lib"
+        return "vendor_lib"
+
     def _emit_external(
         self, component, ref, path, name, kind_in_file, subckt_nodes, source,
         model_type="",
     ) -> None:
         """Shared emit for an external model (Sim.Library or store), by file kind."""
+        tier = self._external_tier(source, path)
         if source == "library_index" and self._minimal_deck_enabled() and name:
             # Defer: _emit_minimal_decks includes an extracted deck instead of the
             # whole file once every needed name from it is known.
@@ -1303,18 +1358,24 @@ class SpiceConverter:
             }
             self.spice_circuit.X(ref, name, *nodes, **xparams)
             self.model_provenance[ref] = ResolvedModel(
-                ref, dev_kind or "subckt", "vendor_lib", name, source=source
+                ref, dev_kind or "subckt", tier, name, source=source
             )
-            logger.debug(f"{ref}: external subckt {name} from {base} ({source})")
+            logger.debug(
+                f"{ref}: external subckt {name} from {base} "
+                f"(tier={tier}, source={source})"
+            )
         elif kind_in_file == "model":
             nodes = self._get_component_nodes(component)
             self._emit_primitive_with_external_model(
                 dev_kind, ref, name, nodes, component, model_type
             )
             self.model_provenance[ref] = ResolvedModel(
-                ref, dev_kind or "?", "vendor_lib", name, source=source
+                ref, dev_kind or "?", tier, name, source=source
             )
-            logger.debug(f"{ref}: external .model {name} from {base} ({source})")
+            logger.debug(
+                f"{ref}: external .model {name} from {base} "
+                f"(tier={tier}, source={source})"
+            )
         else:
             # validate() reports this in strict mode; lenient mode just skips.
             logger.warning(f"{ref}: no usable model found in {path} - skipping")
