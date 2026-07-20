@@ -49,6 +49,11 @@ class ResolvedModel:
     name: str  # the resolved model/base name
     overridden: bool = False  # True if Sim.Params overlaid a derived card
     source: str = ""  # provenance of a vendor_lib model: sim_library | local_store
+    # For a subckt attach, how much confidence the terminal (Sim.Pins) mapping
+    # carries (F3): "" not-applicable; "named" the subckt's nodes are self-
+    # descriptive; "heuristic" the nodes are numeric so D/G/S identity is a guess
+    # (verify with `find_spice_model <name> --verify-terminals`).
+    pin_map_confidence: str = ""
 
 
 try:
@@ -1337,6 +1342,40 @@ class SpiceConverter:
             return "user_lib"
         return "vendor_lib"
 
+    @staticmethod
+    def _pin_map_confidence(dev_kind, subckt_nodes) -> str:
+        """Confidence in a subckt's terminal (Sim.Pins) mapping (F3).
+
+        ``"heuristic"`` for a 3-node transistor subckt whose nodes are all-numeric
+        (``10 20 30``) -- the D/G/S (C/B/E) identity is a convention-based guess a
+        wrong map turns into a converged-but-WRONG result with no error;
+        ``"named"`` when the nodes carry self-descriptive names; ``""`` otherwise.
+        """
+        if dev_kind not in ("mosfet", "bjt") or not subckt_nodes:
+            return ""
+        if len(subckt_nodes) != 3:
+            return ""
+        if all(not any(c.isalpha() for c in str(n)) for n in subckt_nodes):
+            return "heuristic"
+        return "named"
+
+    def _warn_heuristic_pin_map(self, ref, name, subckt_nodes) -> None:
+        """One WARNING per (ref) when a heuristic-graded transistor pin map is used."""
+        warned = getattr(self, "_heuristic_pin_warned", None)
+        if warned is None:
+            warned = self._heuristic_pin_warned = set()
+        if ref in warned:
+            return
+        warned.add(ref)
+        logger.warning(
+            f"{ref}: subckt '{name}' terminal identity (which of nodes "
+            f"{' '.join(str(n) for n in subckt_nodes)} is Drain/Gate/Source or "
+            f"Collector/Base/Emitter) is a HEURISTIC, not verified -- a wrong "
+            f"Sim.Pins map gives a converged-but-wrong result with no error. "
+            f"Verify with: python -m skidl_eda.sourcing.find_spice_model "
+            f"{name} --verify-terminals"
+        )
+
     def _emit_external(
         self, component, ref, path, name, kind_in_file, subckt_nodes, source,
         model_type="",
@@ -1378,12 +1417,16 @@ class SpiceConverter:
                 ).items()
             }
             self.spice_circuit.X(ref, name, *nodes, **xparams)
+            confidence = self._pin_map_confidence(dev_kind, subckt_nodes)
             self.model_provenance[ref] = ResolvedModel(
-                ref, dev_kind or "subckt", tier, name, source=source
+                ref, dev_kind or "subckt", tier, name, source=source,
+                pin_map_confidence=confidence,
             )
+            if confidence == "heuristic":
+                self._warn_heuristic_pin_map(ref, name, subckt_nodes)
             logger.debug(
                 f"{ref}: external subckt {name} from {base} "
-                f"(tier={tier}, source={source})"
+                f"(tier={tier}, source={source}, pin_map={confidence or 'n/a'})"
             )
         elif kind_in_file == "model":
             nodes = self._get_component_nodes(component)
