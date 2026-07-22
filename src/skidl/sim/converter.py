@@ -440,6 +440,7 @@ class SpiceConverter:
         # Each replaces only the switch stage; the user's L/caps/divider stay real.
         "BUCKBOOST4": "buckboost4",
         "INVBUCKBOOST": "invbuckboost",
+        "SEPIC": "sepic",
         "TRANSFORMER": "transformer",
         "XFMR": "transformer",
         # Corpus-independent behavioral logic primitives (Stage: DPSG WS2). These
@@ -600,6 +601,7 @@ class SpiceConverter:
             "halfbridge": self._add_halfbridge,
             "buckboost4": self._add_buckboost4,
             "invbuckboost": self._add_invbuckboost,
+            "sepic": self._add_sepic,
             "transformer": self._add_transformer,
             "bjt": self._add_bjt_transistor,
             "mosfet": self._add_mosfet,
@@ -3870,6 +3872,179 @@ class SpiceConverter:
             f"placement sets direction)"
         )
 
+    def _emit_sepic_switches(
+        self, swa, swb, vout, gnd, *, fsw, duty, dt, ron, suffix
+    ) -> bool:
+        """Emit the SEPIC's two switches (main + sync rectifier) directly.
+
+        The SEPIC's two switches do NOT share a switch node -- the main switch is
+        ``swa->gnd`` and the sync rectifier is ``swb->vout`` -- so they are not a
+        top/bottom totem-pole pair and cannot be a single ``_emit_sync_leg`` leg
+        (which emits a complementary pair on ONE middle node). Emitting two full
+        legs would double the device count, so this follows the same
+        PULSE / S-switch / body-diode / ``.model`` machinery as ``_emit_sync_leg``
+        but places the two switches on independent nodes with complementary gate
+        timing:
+
+        - the main switch (``swa->gnd``) conducts for ``duty/fsw - dt`` at phase 0,
+          body diode ``gnd->swa`` (the ground-referenced main FET's freewheel path,
+          Stage 27.4's ``DQ1_body 0 A``);
+        - the sync rectifier (``swb->vout``) conducts for ``(1-duty)/fsw - dt``,
+          delayed ``duty/fsw`` (complementary, one deadtime at each edge), body
+          diode ``swb->vout`` -- the load-bearing SEPIC rectifier orientation the
+          Stage 27.4 device-level twin locked (``DQ2_body B VOUT``; the reversed
+          wiring silently produced -7.8 V in the 27.1 Spike-2).
+
+        Gate PULSEs are referenced to ``gnd``. The user's real coupling cap Cs
+        (``swa->swb``) and both inductors survive -- this emits ONLY the switch
+        stage. Returns True on success; False -- emitting **nothing** -- when the
+        deadtime leaves no conduction window (``dt >= min(duty, 1-duty)/fsw``), so
+        the caller can log a warning and skip.
+        """
+        per = 1.0 / fsw
+        on_m = duty * per - dt          # main-switch conduction time
+        on_r = (1.0 - duty) * per - dt  # sync-rectifier conduction time
+        if on_m <= 0 or on_r <= 0:
+            return False
+        td_r = duty * per               # rectifier turn-on delay (complementary)
+        edge = per / 200.0
+        ron = self._fmt_num(ron)
+        gm, gr = f"{suffix}_gm", f"{suffix}_gr"
+        lines = [
+            # Complementary gate drives with a deadtime gap, referenced to GND:
+            # main on first (duty*per - DT), rectifier after (delayed duty*per),
+            # both off during the two DT windows.
+            f"V{suffix}_gm {gm} {gnd} PULSE(0 5 0 "
+            f"{edge:.6g} {edge:.6g} {on_m:.6g} {per:.6g})",
+            f"V{suffix}_gr {gr} {gnd} PULSE(0 5 {td_r:.6g} "
+            f"{edge:.6g} {edge:.6g} {on_r:.6g} {per:.6g})",
+            f"S{suffix}_m {swa} {gnd} {gm} {gnd} SW{suffix}",
+            f"S{suffix}_r {swb} {vout} {gr} {gnd} SW{suffix}",
+            f".model SW{suffix} SW(Ron={ron} Roff=1e6 Vt=2.5 Vh=0.2)",
+            # Body diodes: main gnd->swa (freewheel), rectifier swb->vout (the
+            # SEPIC rectifier path -- orientation load-bearing; matches the twin).
+            f"D{suffix}_m {gnd} {swa} DFW{suffix}",
+            f"D{suffix}_r {swb} {vout} DFW{suffix}",
+            f".model DFW{suffix} D(IS=1e-9 N=1.05 CJO=100p)",
+        ]
+        self.spice_circuit.raw_spice += "\n" + "\n".join(lines)
+        return True
+
+    def _sepic_params(self, component) -> Optional[dict]:
+        """Params for a bidirectional SEPIC macromodel, or None if unusable.
+
+        ``FSW`` is required. ``D`` (the main-switch on-fraction) is the open-loop
+        control variable and sets the ideal (non-inverting) DC gain
+        ``Vout = Vin * D/(1-D)`` -- swept, not regulated, matching every other
+        switch macromodel's honesty limit. Convenience: if ``D`` is absent but a
+        target ``VOUT`` **and** the input ``VIN`` are given, ``D = Vout/(Vout+Vin)``
+        with the documented first-order caveat (ignores conduction/deadtime loss).
+        ``DT`` (deadtime, default 100 ns) and ``RON`` (default 0.1 Ohm) as
+        HALFBRIDGE.
+
+        Returns None when FSW is missing/invalid, the deadtime is >= half the
+        period, or no duty can be resolved.
+        """
+        raw = self._parse_sim_params(self._sim_props(component).get("params"))
+        fsw = self._parse_si_number(raw["FSW"]) if "FSW" in raw else None
+        if not fsw or fsw <= 0:
+            return None
+
+        def g(key, default=None):
+            v = self._parse_si_number(raw[key]) if key in raw else None
+            return v if v is not None else default
+
+        dt = g("DT", 100e-9)
+        ron = g("RON", 0.1)
+        if dt < 0 or dt >= 0.5 / fsw:
+            return None
+
+        d = g("D")
+        if d is None:
+            vout, vin = g("VOUT"), g("VIN")
+            if vout and vout > 0 and vin and vin > 0:
+                d = vout / (vout + vin)  # Vout/Vin = D/(1-D)  (non-inverting)
+            else:
+                return None
+
+        d = min(max(d, 0.0), 1.0)
+        return {"FSW": fsw, "DT": dt, "RON": ron, "D": d}
+
+    def _add_sepic(self, component, ref: str, value: str):
+        """Emit a bidirectional SEPIC switch stage (Sim.Device=SEPIC).
+
+        Replaces ONLY the two switches -- the user's two inductors (VIN->A,
+        B->GND), the **coupling cap Cs (A->B)** and the output cap stay real
+        parts. The main switch ties node A (SWA) to GND for the on-fraction ``D``
+        (charging L1 from VIN and driving L2 through Cs); the synchronous
+        rectifier ties node B (SWB) to VOUT for the rest of the period (delivering
+        the non-inverting output). Open-loop -- ``D`` is the control variable, so
+        the ideal DC gain is ``Vout = Vin * D/(1-D)`` (steps up or down through the
+        crossover at D=0.5, where Vout=Vin).
+
+        The two switches sit on **independent** nodes (A and B, with the real Cs
+        between them), so this is not a totem-pole leg: it emits the pair directly
+        through ``_emit_sepic_switches`` rather than ``_emit_sync_leg`` (which would
+        double the device count). The rectifier body diode is B->VOUT -- the
+        load-bearing SEPIC orientation the Stage 27.4 device-level twin confirmed
+        (``DQ2_body B VOUT``; reversed it silently mis-regulates). Bidirectional at
+        the switch level for free: driving the VOUT port (Zeta) makes VIN regulate
+        through the same synchronous switches (Stage 27.4's reverse-flow proof).
+        The coupling cap self-biases to ~Vin (the defining SEPIC invariant) -- the
+        SKILL guidance seeds Cs and uses ``stiff=True`` for convergence.
+        """
+        term = self._multiswitch_terminals(component, "sepic")
+        if term is None:
+            logger.warning(
+                f"sepic {ref}: could not resolve VIN/SWA/SWB/VOUT/GND terminals "
+                f"(by pin name) - skipping"
+            )
+            return
+        params = self._sepic_params(component)
+        if params is None:
+            logger.warning(
+                f"sepic {ref}: no usable FSW / duty resolved - skipping "
+                f'(set Sim.Params="fsw=500k d=0.5")'
+            )
+            return
+
+        # Cap-only unmodeled pins (BOOT/EN/VDD...) get a DC path, as HALFBRIDGE does.
+        self._stub_unmodeled_pins(component, ref, set(term.values()), term["gnd"])
+
+        swa, swb, vout, gnd = (str(term[k]) for k in ("swa", "swb", "vout", "gnd"))
+        fsw, dt, ron, d = params["FSW"], params["DT"], params["RON"], params["D"]
+
+        # A single switching pair -- like the inverting model (and unlike the
+        # 4-switch one) there is no *other* leg to saturate this one, so a
+        # saturated duty (0 or 1) is a dead short / open, not a valid SEPIC
+        # operating point. This pair must genuinely switch, so reject a deadtime
+        # that leaves no conduction window rather than fall back to a static tie.
+        if d <= 0.0 or d >= 1.0 or dt >= min(d, 1.0 - d) / fsw:
+            logger.warning(
+                f"sepic {ref}: duty D ({self._fmt_num(d)}) with deadtime DT "
+                f"({self._fmt_num(dt)}s) leaves no conduction window - skipping"
+            )
+            return
+
+        self._emit_sepic_switches(
+            swa, swb, vout, gnd,
+            fsw=fsw, duty=d, dt=dt, ron=ron, suffix=ref,
+        )
+
+        n = self._fmt_num
+        self.model_provenance[ref] = ResolvedModel(
+            ref, "sepic", "sim_params",
+            f"sepic_openloop(d={n(d)}, fsw={self._fmt_hz(fsw)})",
+        )
+        logger.debug(
+            f"{ref}: 2-switch bidirectional SEPIC switch stage (open-loop, "
+            f"d={n(d)}, fsw={self._fmt_hz(fsw)}, dt={n(dt)}); ideal DC gain "
+            f"Vout/Vin = d/(1-d) = {n(d / (1.0 - d))} (non-inverting, steps "
+            f"up/down through d=0.5); coupling cap Cs stays the user's real part "
+            f"and self-biases to ~Vin; antiparallel body diodes make it "
+            f"bidirectional (source/load placement sets direction)"
+        )
+
     @staticmethod
     def _parse_frequency(value) -> Optional[float]:
         """Parse a GBW/frequency string ('1.4G', '10MEG', '1k', '5e5', '2MHz') to Hz.
@@ -5129,6 +5304,33 @@ class SpiceConverter:
             if self._invbuckboost_params(component) is None:
                 problems.append(
                     f"{ref}: invbuckboost needs Sim.Params with FSW and a duty, e.g. "
+                    f'Sim.Params="fsw=500k d=0.5" (or a VOUT+VIN target)'
+                )
+
+        # 4c-sepic. Bidirectional SEPIC: VIN/SWA/SWB/VOUT/GND + FSW + a resolvable
+        #           duty; the coupling cap Cs must be a real external part between
+        #           the two switch nodes (warn if A and B collapse to one net).
+        for component in self._iter_components():
+            if self._sim_excluded(component):
+                continue
+            if self._kind(component) != "sepic":
+                continue
+            ref = self._attr(component, "ref", None) or "?"
+            if getattr(component, "_pins", None) is not None:
+                term = self._multiswitch_terminals(component, "sepic")
+                if term is None:
+                    problems.append(
+                        f"{ref}: sepic needs connected VIN, SW (node A), SW2 "
+                        f"(node B), VOUT and GND pins (resolved by pin name)"
+                    )
+                elif term["swa"] == term["swb"]:
+                    problems.append(
+                        f"{ref}: sepic nodes A (SW) and B (SW2) are the same net -- "
+                        f"the coupling cap Cs must be a real external part between them"
+                    )
+            if self._sepic_params(component) is None:
+                problems.append(
+                    f"{ref}: sepic needs Sim.Params with FSW and a duty, e.g. "
                     f'Sim.Params="fsw=500k d=0.5" (or a VOUT+VIN target)'
                 )
 
