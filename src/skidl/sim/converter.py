@@ -436,6 +436,9 @@ class SpiceConverter:
         "FLYBACK": "flyback",
         "HALFBRIDGE": "halfbridge",
         "LLC": "halfbridge",
+        # Multi-switch synchronous bidirectional families (Stage 27, Route B).
+        # Each replaces only the switch stage; the user's L/caps/divider stay real.
+        "BUCKBOOST4": "buckboost4",
         "TRANSFORMER": "transformer",
         "XFMR": "transformer",
         # Corpus-independent behavioral logic primitives (Stage: DPSG WS2). These
@@ -594,6 +597,7 @@ class SpiceConverter:
             "boost": self._add_boost,
             "flyback": self._add_flyback,
             "halfbridge": self._add_halfbridge,
+            "buckboost4": self._add_buckboost4,
             "transformer": self._add_transformer,
             "bjt": self._add_bjt_transistor,
             "mosfet": self._add_mosfet,
@@ -3574,6 +3578,180 @@ class SpiceConverter:
             f"antiparallel diodes give the tank a deadtime freewheel path (ZVS)"
         )
 
+    # ------------------------------------------------------------------ #
+    # Multi-switch synchronous bidirectional converters (Stage 27 Route B) #
+    # ------------------------------------------------------------------ #
+
+    def _emit_static_or_sync_leg(
+        self, top, sw, bottom, gnd, *, fsw, duty, dt, ron, suffix
+    ) -> bool:
+        """Emit a switching sync leg, or a static pass-through when saturated.
+
+        ``duty`` is the high-side on-fraction. A leg that never switches (a pure
+        buck/boost operating point saturates the *other* leg) has no conduction
+        window for ``_emit_sync_leg`` -- the same problem the device-level twins
+        solved with a static gate tie (Stage 27.2's "static-leg gating pattern").
+        Here the static case is a small ``RON`` tie of the switch node to the rail
+        the permanently-on device connects it to:
+
+        - ``duty >= 1`` -> high-side always on -> ``sw`` tied to ``top``;
+        - ``duty <= 0`` -> low-side always on -> ``sw`` tied to ``bottom``.
+
+        Otherwise delegates to ``_emit_sync_leg`` (complementary switches + body
+        diodes). Returns True if anything was emitted; False only when a genuine
+        switching leg was requested but the deadtime leaves no window -- callers
+        pre-check with ``_leg_has_window`` so this never partially emits.
+        """
+        if duty >= 1.0:
+            self.spice_circuit.raw_spice += (
+                f"\nR{suffix}_sat {sw} {top} {self._fmt_num(ron)}"
+            )
+            return True
+        if duty <= 0.0:
+            self.spice_circuit.raw_spice += (
+                f"\nR{suffix}_sat {sw} {bottom} {self._fmt_num(ron)}"
+            )
+            return True
+        return self._emit_sync_leg(
+            top, sw, bottom, gnd,
+            fsw=fsw, duty=duty, phase=0.0, dt=dt, ron=ron, suffix=suffix,
+        )
+
+    @staticmethod
+    def _leg_has_window(duty, fsw, dt) -> bool:
+        """True if a leg at ``duty`` is emittable: saturated (static) or the
+        deadtime leaves a conduction window (``dt < min(duty,1-duty)/fsw``)."""
+        if duty >= 1.0 or duty <= 0.0:
+            return True
+        return dt < min(duty, 1.0 - duty) / fsw
+
+    def _buckboost4_params(self, component) -> Optional[dict]:
+        """Params for a 4-switch buck-boost macromodel, or None if unusable.
+
+        ``FSW`` is required. The control variables are the two leg duties
+        (open-loop, matching every other switch macromodel's honesty limit):
+
+        - ``DBUCK`` -- buck-leg high-side on-fraction (1 = pass-through);
+        - ``DBOOST`` -- boost-leg low-side on-fraction (0 = pass-through).
+
+        An unspecified leg saturates to pass-through (``DBUCK`` default 1,
+        ``DBOOST`` default 0), so ``dbuck=0.5`` alone is a plain synchronous buck.
+        Convenience: if neither duty is given but a target ``VOUT`` **and** the
+        input ``VIN`` are, one leg's duty is derived (``Vout<Vin`` -> buck mode
+        ``dbuck=Vout/Vin, dboost=0``; else boost mode ``dbuck=1,
+        dboost=1-Vin/Vout``) with the documented first-order caveat. ``DT``
+        (deadtime, default 100 ns) and ``RON`` (default 0.1 Ohm) as HALFBRIDGE.
+
+        Returns None when FSW is missing/invalid, the deadtime is >= half the
+        period, or no duties can be resolved.
+        """
+        raw = self._parse_sim_params(self._sim_props(component).get("params"))
+        fsw = self._parse_si_number(raw["FSW"]) if "FSW" in raw else None
+        if not fsw or fsw <= 0:
+            return None
+
+        def g(key, default=None):
+            v = self._parse_si_number(raw[key]) if key in raw else None
+            return v if v is not None else default
+
+        dt = g("DT", 100e-9)
+        ron = g("RON", 0.1)
+        if dt < 0 or dt >= 0.5 / fsw:
+            return None
+
+        dbuck = g("DBUCK")
+        dboost = g("DBOOST")
+        if dbuck is None and dboost is None:
+            vout, vin = g("VOUT"), g("VIN")
+            if vout and vout > 0 and vin and vin > 0:
+                if vout < vin:
+                    dbuck, dboost = vout / vin, 0.0
+                else:
+                    dbuck, dboost = 1.0, 1.0 - vin / vout
+            else:
+                return None
+        else:
+            if dbuck is None:
+                dbuck = 1.0  # buck leg pass-through (boost-only operation)
+            if dboost is None:
+                dboost = 0.0  # boost leg pass-through (buck-only operation)
+
+        dbuck = min(max(dbuck, 0.0), 1.0)
+        dboost = min(max(dboost, 0.0), 1.0)
+        return {"FSW": fsw, "DT": dt, "RON": ron, "DBUCK": dbuck, "DBOOST": dboost}
+
+    def _add_buckboost4(self, component, ref: str, value: str):
+        """Emit a non-inverting 4-switch buck-boost switch stage (Sim.Device=BUCKBOOST4).
+
+        Replaces ONLY the four switches -- the user's shared inductor (between the
+        two switch nodes), output cap and divider stay real parts. Two synchronous
+        legs share one clock (phase 0): a buck leg (VIN/SWA/GND) at ``DBUCK`` and a
+        boost leg (VOUT/SWB/GND) at ``1-DBOOST``. Open-loop: the duties are the
+        control variables, so the ideal DC gain is ``Vout/Vin = DBUCK/(1-DBOOST)``
+        (swept, not regulated). Bidirectional at the switch level for free -- the
+        antiparallel body diodes in each ``_emit_sync_leg`` conduct either way, so
+        power direction is set by which port the user attaches source vs. load
+        (Stage 27.2's device-level twin proves the reverse-boost case).
+        """
+        term = self._multiswitch_terminals(component, "buckboost4")
+        if term is None:
+            logger.warning(
+                f"buckboost4 {ref}: could not resolve VIN/SWA/SWB/VOUT/GND "
+                f"terminals (by pin name) - skipping"
+            )
+            return
+        params = self._buckboost4_params(component)
+        if params is None:
+            logger.warning(
+                f"buckboost4 {ref}: no usable FSW / duties resolved - skipping "
+                f'(set Sim.Params="fsw=500k dbuck=0.5 dboost=0")'
+            )
+            return
+
+        # Cap-only unmodeled pins (BOOT/EN/VDD...) get a DC path, as HALFBRIDGE does.
+        self._stub_unmodeled_pins(component, ref, set(term.values()), term["gnd"])
+
+        vin, swa, swb, vout, gnd = (
+            str(term[k]) for k in ("vin", "swa", "swb", "vout", "gnd")
+        )
+        fsw, dt, ron = params["FSW"], params["DT"], params["RON"]
+        dbuck, dboost = params["DBUCK"], params["DBOOST"]
+        boost_hs = 1.0 - dboost  # boost-leg high-side on-fraction
+
+        # Pre-check both legs so a too-large deadtime never leaves half a stage.
+        if not (
+            self._leg_has_window(dbuck, fsw, dt)
+            and self._leg_has_window(boost_hs, fsw, dt)
+        ):
+            logger.warning(
+                f"buckboost4 {ref}: deadtime DT ({self._fmt_num(dt)}s) leaves no "
+                f"conduction window for a switching leg at these duties - skipping"
+            )
+            return
+
+        self._emit_static_or_sync_leg(
+            vin, swa, gnd, gnd,
+            fsw=fsw, duty=dbuck, dt=dt, ron=ron, suffix=f"{ref}A",
+        )
+        self._emit_static_or_sync_leg(
+            vout, swb, gnd, gnd,
+            fsw=fsw, duty=boost_hs, dt=dt, ron=ron, suffix=f"{ref}B",
+        )
+
+        n = self._fmt_num
+        self.model_provenance[ref] = ResolvedModel(
+            ref, "buckboost4", "sim_params",
+            f"buckboost4_openloop(dbuck={n(dbuck)}, dboost={n(dboost)}, "
+            f"fsw={self._fmt_hz(fsw)})",
+        )
+        logger.debug(
+            f"{ref}: 4-switch buck-boost switch stage (open-loop, dbuck={n(dbuck)}, "
+            f"dboost={n(dboost)}, fsw={self._fmt_hz(fsw)}, dt={n(dt)}); ideal DC gain "
+            f"Vout/Vin = dbuck/(1-dboost) = {n(dbuck / (1.0 - dboost)) if dboost < 1.0 else 'inf'}; "
+            f"antiparallel body diodes make it bidirectional (source/load placement "
+            f"sets direction)"
+        )
+
     @staticmethod
     def _parse_frequency(value) -> Optional[float]:
         """Parse a GBW/frequency string ('1.4G', '10MEG', '1k', '5e5', '2MHz') to Hz.
@@ -4792,6 +4970,28 @@ class SpiceConverter:
                         f"{ref}: halfbridge deadtime DT ({self._fmt_num(dt)}s) must "
                         f"be < 1/(2*FSW) = {0.5 / fsw:.3g}s"
                     )
+
+        # 4c-bb4. 4-switch buck-boost: all five terminals + FSW + resolvable
+        #         duties; deadtime must leave a conduction window on each leg.
+        for component in self._iter_components():
+            if self._sim_excluded(component):
+                continue
+            if self._kind(component) != "buckboost4":
+                continue
+            ref = self._attr(component, "ref", None) or "?"
+            if (
+                getattr(component, "_pins", None) is not None
+                and self._multiswitch_terminals(component, "buckboost4") is None
+            ):
+                problems.append(
+                    f"{ref}: buckboost4 needs connected VIN, SW (buck node), SW2 "
+                    f"(boost node), VOUT and GND pins (resolved by pin name)"
+                )
+            if self._buckboost4_params(component) is None:
+                problems.append(
+                    f"{ref}: buckboost4 needs Sim.Params with FSW and duties, e.g. "
+                    f'Sim.Params="fsw=500k dbuck=0.5 dboost=0" (or a VOUT+VIN target)'
+                )
 
         # 4d. Transformers: all four winding ends connected + resolvable params.
         for component in self._iter_components():
