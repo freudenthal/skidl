@@ -439,6 +439,7 @@ class SpiceConverter:
         # Multi-switch synchronous bidirectional families (Stage 27, Route B).
         # Each replaces only the switch stage; the user's L/caps/divider stay real.
         "BUCKBOOST4": "buckboost4",
+        "INVBUCKBOOST": "invbuckboost",
         "TRANSFORMER": "transformer",
         "XFMR": "transformer",
         # Corpus-independent behavioral logic primitives (Stage: DPSG WS2). These
@@ -598,6 +599,7 @@ class SpiceConverter:
             "flyback": self._add_flyback,
             "halfbridge": self._add_halfbridge,
             "buckboost4": self._add_buckboost4,
+            "invbuckboost": self._add_invbuckboost,
             "transformer": self._add_transformer,
             "bjt": self._add_bjt_transistor,
             "mosfet": self._add_mosfet,
@@ -3752,6 +3754,122 @@ class SpiceConverter:
             f"sets direction)"
         )
 
+    def _invbuckboost_params(self, component) -> Optional[dict]:
+        """Params for a 2-switch inverting buck-boost macromodel, or None if unusable.
+
+        ``FSW`` is required. ``D`` (the single high-side on-fraction) is the
+        open-loop control variable and sets the ideal (negative) DC gain
+        ``Vout = -Vin * D/(1-D)`` (swept, not regulated -- matching every other
+        switch macromodel's honesty limit). Convenience: if ``D`` is absent but a
+        target ``VOUT`` (the negative output, either sign accepted) **and** the
+        input ``VIN`` are given, ``D = |Vout| / (|Vout| + Vin)`` with the
+        documented first-order caveat (ignores conduction/deadtime loss). ``DT``
+        (deadtime, default 100 ns) and ``RON`` (default 0.1 Ohm) as HALFBRIDGE.
+
+        Returns None when FSW is missing/invalid, the deadtime is >= half the
+        period, or no duty can be resolved.
+        """
+        raw = self._parse_sim_params(self._sim_props(component).get("params"))
+        fsw = self._parse_si_number(raw["FSW"]) if "FSW" in raw else None
+        if not fsw or fsw <= 0:
+            return None
+
+        def g(key, default=None):
+            v = self._parse_si_number(raw[key]) if key in raw else None
+            return v if v is not None else default
+
+        dt = g("DT", 100e-9)
+        ron = g("RON", 0.1)
+        if dt < 0 or dt >= 0.5 / fsw:
+            return None
+
+        d = g("D")
+        if d is None:
+            vout, vin = g("VOUT"), g("VIN")
+            avout = abs(vout) if vout is not None else 0.0
+            if avout > 0 and vin and vin > 0:
+                d = avout / (avout + vin)  # |Vout|/Vin = D/(1-D)
+            else:
+                return None
+
+        d = min(max(d, 0.0), 1.0)
+        return {"FSW": fsw, "DT": dt, "RON": ron, "D": d}
+
+    def _add_invbuckboost(self, component, ref: str, value: str):
+        """Emit a 2-switch inverting buck-boost switch stage (Sim.Device=INVBUCKBOOST).
+
+        Replaces ONLY the two switches -- the user's inductor (SW->GND), output
+        cap and load stay real parts. One synchronous leg spans VIN and the
+        **negative** output VOUT with the switch node SW in the middle: the
+        high-side switch ties VIN->SW for the on-fraction ``D`` (charging the
+        inductor from VIN), the low-side switch ties SW->VOUT for the rest (the
+        synchronous rectifier delivering the inverted output). Open-loop -- ``D``
+        is the control variable, so the ideal DC gain is the negative
+        ``Vout = -Vin * D/(1-D)``.
+
+        The low-side device's antiparallel body diode is VOUT->SW (anode at the
+        negative rail, cathode at the switch node) -- the classic inverting
+        buck-boost rectifier orientation, which the Stage 27.3 device-level twin
+        confirmed is load-bearing (the reversed wiring silently mis-regulated to
+        the wrong sign). Bidirectional at the switch level for free: a negative
+        drive on the VOUT port makes VIN regulate to a positive rail through the
+        same synchronous FETs (Stage 27.3's reverse-boost proof). Emission is
+        sign-agnostic -- no positive-only clamp or seed is applied, so the
+        negative rail forms naturally (the 27.1/27.3 spikes verified the F4
+        floating-node tie needs no special handling: the load-tied output is not
+        DC-floating).
+        """
+        term = self._multiswitch_terminals(component, "invbuckboost")
+        if term is None:
+            logger.warning(
+                f"invbuckboost {ref}: could not resolve VIN/SW/VOUT/GND terminals "
+                f"(by pin name) - skipping"
+            )
+            return
+        params = self._invbuckboost_params(component)
+        if params is None:
+            logger.warning(
+                f"invbuckboost {ref}: no usable FSW / duty resolved - skipping "
+                f'(set Sim.Params="fsw=500k d=0.5")'
+            )
+            return
+
+        # Cap-only unmodeled pins (BOOT/EN/VDD...) get a DC path, as HALFBRIDGE does.
+        self._stub_unmodeled_pins(component, ref, set(term.values()), term["gnd"])
+
+        vin, sw, vout, gnd = (str(term[k]) for k in ("vin", "sw", "vout", "gnd"))
+        fsw, dt, ron, d = params["FSW"], params["DT"], params["RON"], params["D"]
+
+        # A single switching leg -- unlike the 4-switch model there is no *other*
+        # leg to saturate this one, so a saturated duty (0 or 1) is not a valid
+        # inverting buck-boost operating point (it is a dead short / open, not a
+        # pass-through). This leg must genuinely switch, so reject a deadtime that
+        # leaves no conduction window rather than fall back to a static tie.
+        if d <= 0.0 or d >= 1.0 or dt >= min(d, 1.0 - d) / fsw:
+            logger.warning(
+                f"invbuckboost {ref}: duty D ({self._fmt_num(d)}) with deadtime DT "
+                f"({self._fmt_num(dt)}s) leaves no conduction window - skipping"
+            )
+            return
+
+        self._emit_sync_leg(
+            vin, sw, vout, gnd,
+            fsw=fsw, duty=d, phase=0.0, dt=dt, ron=ron, suffix=ref,
+        )
+
+        n = self._fmt_num
+        self.model_provenance[ref] = ResolvedModel(
+            ref, "invbuckboost", "sim_params",
+            f"invbuckboost_openloop(d={n(d)}, fsw={self._fmt_hz(fsw)})",
+        )
+        logger.debug(
+            f"{ref}: 2-switch inverting buck-boost switch stage (open-loop, "
+            f"d={n(d)}, fsw={self._fmt_hz(fsw)}, dt={n(dt)}); ideal DC gain "
+            f"Vout/Vin = -d/(1-d) = {n(-d / (1.0 - d))} (negative rail); "
+            f"antiparallel body diodes make it bidirectional (source/load "
+            f"placement sets direction)"
+        )
+
     @staticmethod
     def _parse_frequency(value) -> Optional[float]:
         """Parse a GBW/frequency string ('1.4G', '10MEG', '1k', '5e5', '2MHz') to Hz.
@@ -4991,6 +5109,27 @@ class SpiceConverter:
                 problems.append(
                     f"{ref}: buckboost4 needs Sim.Params with FSW and duties, e.g. "
                     f'Sim.Params="fsw=500k dbuck=0.5 dboost=0" (or a VOUT+VIN target)'
+                )
+
+        # 4c-ibb. Inverting buck-boost: VIN/SW/VOUT/GND + FSW + a resolvable duty.
+        for component in self._iter_components():
+            if self._sim_excluded(component):
+                continue
+            if self._kind(component) != "invbuckboost":
+                continue
+            ref = self._attr(component, "ref", None) or "?"
+            if (
+                getattr(component, "_pins", None) is not None
+                and self._multiswitch_terminals(component, "invbuckboost") is None
+            ):
+                problems.append(
+                    f"{ref}: invbuckboost needs connected VIN, SW (switch node), "
+                    f"VOUT (negative output) and GND pins (resolved by pin name)"
+                )
+            if self._invbuckboost_params(component) is None:
+                problems.append(
+                    f"{ref}: invbuckboost needs Sim.Params with FSW and a duty, e.g. "
+                    f'Sim.Params="fsw=500k d=0.5" (or a VOUT+VIN target)'
                 )
 
         # 4d. Transformers: all four winding ends connected + resolvable params.
