@@ -441,6 +441,7 @@ class SpiceConverter:
         "BUCKBOOST4": "buckboost4",
         "INVBUCKBOOST": "invbuckboost",
         "SEPIC": "sepic",
+        "CUK": "cuk",
         "TRANSFORMER": "transformer",
         "XFMR": "transformer",
         # Corpus-independent behavioral logic primitives (Stage: DPSG WS2). These
@@ -602,6 +603,7 @@ class SpiceConverter:
             "buckboost4": self._add_buckboost4,
             "invbuckboost": self._add_invbuckboost,
             "sepic": self._add_sepic,
+            "cuk": self._add_cuk,
             "transformer": self._add_transformer,
             "bjt": self._add_bjt_transistor,
             "mosfet": self._add_mosfet,
@@ -3083,7 +3085,10 @@ class SpiceConverter:
         - ``invbuckboost`` -> ``{vin, sw, vout, gnd}`` (vout is the negative
           output node; the single switch node comes from SW/LX...);
         - ``sepic`` -> ``{vin, swa, swb, vout, gnd}`` (swa = node A, swb = node B,
-          with the coupling cap Cs a real external part between them).
+          with the coupling cap Cs a real external part between them);
+        - ``cuk`` -> ``{vin, swa, swb, vout, gnd}`` (same five terminals as sepic;
+          vout is the NEGATIVE output behind the real output inductor L2, not a
+          switch node -- swb->vout is the L2 the emitter leaves in place).
 
         Returns None when any node ``kind`` requires is unresolved (or no live
         pin map is available), so the handler can log an actionable warning and
@@ -3113,6 +3118,7 @@ class SpiceConverter:
             "buckboost4": ("vin", "swa", "swb", "vout", "gnd"),
             "invbuckboost": ("vin", "swa", "vout", "gnd"),
             "sepic": ("vin", "swa", "swb", "vout", "gnd"),
+            "cuk": ("vin", "swa", "swb", "vout", "gnd"),
         }.get(kind)
         if required is None:
             return None
@@ -4043,6 +4049,194 @@ class SpiceConverter:
             f"up/down through d=0.5); coupling cap Cs stays the user's real part "
             f"and self-biases to ~Vin; antiparallel body diodes make it "
             f"bidirectional (source/load placement sets direction)"
+        )
+
+    def _emit_cuk_switches(
+        self, swa, swb, gnd, *, fsw, duty, dt, ron, suffix
+    ) -> bool:
+        """Emit the inverting Cuk's two switches (main + sync rectifier) directly.
+
+        Modeled on ``_emit_sepic_switches`` -- two switches on independent nodes A
+        and B (with the real series coupling cap Cs between them), complementary
+        gate timing referenced to GND -- but for the **inverting Cuk** the two
+        differences from the SEPIC are:
+
+        - the sync rectifier spans ``swb->gnd`` (NOT ``swb->vout``): the negative
+          output is reached through the user's real output inductor L2 (``B->VOUT``),
+          so VOUT is not a switch node and is not passed to this emitter;
+        - the rectifier body diode is ``swb->gnd`` (NOT ``swb->vout``) -- anode at
+          node B (the same anode-at-B orientation as the SEPIC rectifier's
+          ``swb->vout``, just returned to GND). This is load-bearing: node B swings
+          to ``-(Vin+|Vout|)`` during the main-switch on-phase, so a reversed diode
+          (``gnd->swb``) would forward-bias and clamp B, collapsing the inversion
+          (measured: it turns the negative rail POSITIVE). The device-level twin's
+          ``DQ2_body B 0`` locks the same orientation.
+
+        The main switch is unchanged from the SEPIC: ``swa->gnd`` conducting for
+        ``duty/fsw - dt`` at phase 0, body diode ``gnd->swa`` (the ground-referenced
+        main FET's freewheel, the twin's ``DQ1_body 0 A``). The rectifier conducts
+        for ``(1-duty)/fsw - dt``, delayed ``duty/fsw`` (complementary, one deadtime
+        at each edge).
+
+        Gate PULSEs are referenced to ``gnd``. The user's real coupling cap Cs
+        (``swa->swb``), both inductors, Cout and Rload survive -- this emits ONLY the
+        switch stage. Returns True on success; False -- emitting **nothing** -- when
+        the deadtime leaves no conduction window (``dt >= min(duty, 1-duty)/fsw``),
+        so the caller can log a warning and skip.
+        """
+        per = 1.0 / fsw
+        on_m = duty * per - dt          # main-switch conduction time
+        on_r = (1.0 - duty) * per - dt  # sync-rectifier conduction time
+        if on_m <= 0 or on_r <= 0:
+            return False
+        td_r = duty * per               # rectifier turn-on delay (complementary)
+        edge = per / 200.0
+        ron = self._fmt_num(ron)
+        gm, gr = f"{suffix}_gm", f"{suffix}_gr"
+        lines = [
+            # Complementary gate drives with a deadtime gap, referenced to GND:
+            # main on first (duty*per - DT), rectifier after (delayed duty*per),
+            # both off during the two DT windows.
+            f"V{suffix}_gm {gm} {gnd} PULSE(0 5 0 "
+            f"{edge:.6g} {edge:.6g} {on_m:.6g} {per:.6g})",
+            f"V{suffix}_gr {gr} {gnd} PULSE(0 5 {td_r:.6g} "
+            f"{edge:.6g} {edge:.6g} {on_r:.6g} {per:.6g})",
+            f"S{suffix}_m {swa} {gnd} {gm} {gnd} SW{suffix}",
+            # Cuk sync rectifier ties node B to GND (the output is behind L2, not
+            # through the rectifier) -- the one switch-node difference from SEPIC.
+            f"S{suffix}_r {swb} {gnd} {gr} {gnd} SW{suffix}",
+            f".model SW{suffix} SW(Ron={ron} Roff=1e6 Vt=2.5 Vh=0.2)",
+            # Body diodes: main gnd->swa (freewheel), rectifier swb->gnd (anode at
+            # B, as the SEPIC rectifier -- load-bearing: B swings to -(Vin+|Vout|)
+            # on the main-switch on-phase, so the reversed gnd->swb would clamp B
+            # and turn the negative rail positive; the twin's DQ2_body B 0).
+            f"D{suffix}_m {gnd} {swa} DFW{suffix}",
+            f"D{suffix}_r {swb} {gnd} DFW{suffix}",
+            f".model DFW{suffix} D(IS=1e-9 N=1.05 CJO=100p)",
+        ]
+        self.spice_circuit.raw_spice += "\n" + "\n".join(lines)
+        return True
+
+    def _cuk_params(self, component) -> Optional[dict]:
+        """Params for an inverting Cuk macromodel, or None if unusable.
+
+        ``FSW`` is required. ``D`` (the main-switch on-fraction) is the open-loop
+        control variable and sets the ideal (inverting) DC gain
+        ``Vout = -Vin * D/(1-D)`` -- swept, not regulated, matching every other
+        switch macromodel's honesty limit. Convenience: if ``D`` is absent but a
+        target ``VOUT`` (the negative output, either sign accepted) **and** the
+        input ``VIN`` are given, ``D = |Vout| / (|Vout| + Vin)`` (abs-based, as the
+        inverting buck-boost does) with the documented first-order caveat (ignores
+        conduction/deadtime loss). ``DT`` (deadtime, default 100 ns) and ``RON``
+        (default 0.1 Ohm) as HALFBRIDGE.
+
+        Returns None when FSW is missing/invalid, the deadtime is >= half the
+        period, or no duty can be resolved.
+        """
+        raw = self._parse_sim_params(self._sim_props(component).get("params"))
+        fsw = self._parse_si_number(raw["FSW"]) if "FSW" in raw else None
+        if not fsw or fsw <= 0:
+            return None
+
+        def g(key, default=None):
+            v = self._parse_si_number(raw[key]) if key in raw else None
+            return v if v is not None else default
+
+        dt = g("DT", 100e-9)
+        ron = g("RON", 0.1)
+        if dt < 0 or dt >= 0.5 / fsw:
+            return None
+
+        d = g("D")
+        if d is None:
+            vout, vin = g("VOUT"), g("VIN")
+            avout = abs(vout) if vout is not None else 0.0
+            if avout > 0 and vin and vin > 0:
+                d = avout / (avout + vin)  # |Vout|/Vin = D/(1-D)  (inverting)
+            else:
+                return None
+
+        d = min(max(d, 0.0), 1.0)
+        return {"FSW": fsw, "DT": dt, "RON": ron, "D": d}
+
+    def _add_cuk(self, component, ref: str, value: str):
+        """Emit an inverting Cuk switch stage (Sim.Device=CUK).
+
+        Replaces ONLY the two switches -- the user's two inductors (VIN->A via L1,
+        B->VOUT via L2), the **series coupling cap Cs (A->B)** and the output cap
+        stay real parts. The main switch ties node A (SWA) to GND for the
+        on-fraction ``D`` (charging L1 from VIN); the synchronous rectifier ties
+        node B (SWB) to GND for the rest of the period. Unlike the SEPIC the output
+        is **not** a switch node -- it is the **negative** rail reached through the
+        user's real output inductor L2 (B->VOUT). Open-loop -- ``D`` is the control
+        variable, so the ideal (inverting) DC gain is ``Vout = -Vin * D/(1-D)``.
+
+        The two switches sit on **independent** nodes (A and B, with the real Cs
+        between them), so this is not a totem-pole leg: it emits the pair directly
+        through ``_emit_cuk_switches`` rather than ``_emit_sync_leg`` (which would
+        double the device count). The rectifier body diode is B->GND (anode at node
+        B, the same anode-at-B orientation as the SEPIC rectifier) -- load-bearing:
+        B swings to ``-(Vin+|Vout|)`` on the main-switch on-phase, so the reversed
+        GND->B would forward-bias and clamp B, collapsing the inversion (it turns
+        the negative rail positive); the twin's ``DQ2_body B 0``. The main switch is
+        ground-referenced (A->GND, body diode GND->A, the same as the SEPIC main).
+        The coupling cap self-biases to ``Vin - Vout = Vin + |Vout|`` (the Cuk
+        invariant -- a larger bias than the SEPIC's ~Vin, since L2 balances V(B) to
+        the negative output) -- the SKILL guidance seeds VOUT and uses ``stiff=True``
+        on the negative rail for convergence. Bidirectional at the switch level for
+        free: the antiparallel body diodes let power flow either way (source/load
+        placement sets direction).
+        """
+        term = self._multiswitch_terminals(component, "cuk")
+        if term is None:
+            logger.warning(
+                f"cuk {ref}: could not resolve VIN/SWA/SWB/VOUT/GND terminals "
+                f"(by pin name) - skipping"
+            )
+            return
+        params = self._cuk_params(component)
+        if params is None:
+            logger.warning(
+                f"cuk {ref}: no usable FSW / duty resolved - skipping "
+                f'(set Sim.Params="fsw=500k d=0.5")'
+            )
+            return
+
+        # Cap-only unmodeled pins (BOOT/EN/VDD...) get a DC path, as HALFBRIDGE does.
+        self._stub_unmodeled_pins(component, ref, set(term.values()), term["gnd"])
+
+        swa, swb, gnd = (str(term[k]) for k in ("swa", "swb", "gnd"))
+        fsw, dt, ron, d = params["FSW"], params["DT"], params["RON"], params["D"]
+
+        # A single switching pair -- like the SEPIC and inverting models there is
+        # no *other* leg to saturate this one, so a saturated duty (0 or 1) is a
+        # dead short / open, not a valid Cuk operating point. This pair must
+        # genuinely switch, so reject a deadtime that leaves no conduction window
+        # rather than fall back to a static tie.
+        if d <= 0.0 or d >= 1.0 or dt >= min(d, 1.0 - d) / fsw:
+            logger.warning(
+                f"cuk {ref}: duty D ({self._fmt_num(d)}) with deadtime DT "
+                f"({self._fmt_num(dt)}s) leaves no conduction window - skipping"
+            )
+            return
+
+        self._emit_cuk_switches(
+            swa, swb, gnd,
+            fsw=fsw, duty=d, dt=dt, ron=ron, suffix=ref,
+        )
+
+        n = self._fmt_num
+        self.model_provenance[ref] = ResolvedModel(
+            ref, "cuk", "sim_params",
+            f"cuk_openloop(d={n(d)}, fsw={self._fmt_hz(fsw)})",
+        )
+        logger.debug(
+            f"{ref}: 2-switch inverting Cuk switch stage (open-loop, "
+            f"d={n(d)}, fsw={self._fmt_hz(fsw)}, dt={n(dt)}); ideal DC gain "
+            f"Vout/Vin = -d/(1-d) = {n(-d / (1.0 - d))} (negative rail, reached "
+            f"through the real output inductor L2); coupling cap Cs stays the "
+            f"user's real part and self-biases to ~Vin+|Vout|; antiparallel body "
+            f"diodes make it bidirectional (source/load placement sets direction)"
         )
 
     @staticmethod
@@ -5331,6 +5525,34 @@ class SpiceConverter:
             if self._sepic_params(component) is None:
                 problems.append(
                     f"{ref}: sepic needs Sim.Params with FSW and a duty, e.g. "
+                    f'Sim.Params="fsw=500k d=0.5" (or a VOUT+VIN target)'
+                )
+
+        # 4c-cuk. Inverting Cuk: VIN/SWA/SWB/VOUT/GND + FSW + a resolvable duty; the
+        #         series coupling cap Cs must be a real external part between the two
+        #         switch nodes (warn if A and B collapse to one net). VOUT is the
+        #         negative output behind the real output inductor L2, not a switch node.
+        for component in self._iter_components():
+            if self._sim_excluded(component):
+                continue
+            if self._kind(component) != "cuk":
+                continue
+            ref = self._attr(component, "ref", None) or "?"
+            if getattr(component, "_pins", None) is not None:
+                term = self._multiswitch_terminals(component, "cuk")
+                if term is None:
+                    problems.append(
+                        f"{ref}: cuk needs connected VIN, SW (node A), SW2 "
+                        f"(node B), VOUT (negative output) and GND pins (resolved by pin name)"
+                    )
+                elif term["swa"] == term["swb"]:
+                    problems.append(
+                        f"{ref}: cuk nodes A (SW) and B (SW2) are the same net -- "
+                        f"the coupling cap Cs must be a real external part between them"
+                    )
+            if self._cuk_params(component) is None:
+                problems.append(
+                    f"{ref}: cuk needs Sim.Params with FSW and a duty, e.g. "
                     f'Sim.Params="fsw=500k d=0.5" (or a VOUT+VIN target)'
                 )
 
