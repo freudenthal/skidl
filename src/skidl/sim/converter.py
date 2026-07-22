@@ -3069,6 +3069,10 @@ class SpiceConverter:
     # distinct (possibly negative) VOUT.
     _SWITCH_SW2_NAMES = {"SW2", "SWB", "LX2", "PH2"}
     _SWITCH_VOUT_NAMES = {"VOUT", "OUT", "VO"}
+    # Error-amp compensation (VC/ITH/COMP) pin, needed only by the averaged
+    # peak-current-mode loop model (Stage 28.D): the loop closes through the
+    # user's real external VC network, so this pin must be resolvable by name.
+    _SWITCH_VC_NAMES = {"VC", "COMP", "ITH", "COMPENSATION"}
 
     def _multiswitch_terminals(self, component, kind):
         """Resolve the terminals a multi-switch converter ``kind`` needs, by name.
@@ -3179,6 +3183,138 @@ class SpiceConverter:
         raw = self._parse_sim_params(self._sim_props(component).get("params"))
         return "avg" if str(raw.get("MODE", "")).strip().lower() == "avg" else "cycle"
 
+    def _switcher_cmode(self, component) -> str:
+        """Control-mode variant of the averaged model: ``'peak'`` (peak
+        current-mode, Stage 28.D) or ``''`` (voltage-mode, today's default).
+
+        Read from ``Sim.Params`` ``CMODE=`` (case-insensitive); anything other than
+        ``peak`` -- including absent -- selects the voltage-mode averaged buck (so a
+        plain ``MODE=avg`` stays byte-identical to Stage 20.5). Only consulted when
+        ``_switcher_mode`` is already ``'avg'``.
+        """
+        raw = self._parse_sim_params(self._sim_props(component).get("params"))
+        return "peak" if str(raw.get("CMODE", "")).strip().lower() == "peak" else ""
+
+    def _currentmode_terminals(self, component):
+        """Resolve the terminals the averaged peak-current-mode loop needs, by name.
+
+        Returns ``{"fb","vc","vout","gnd","vin"}`` (``vin`` may be None -- it is not
+        used by the small-signal loop, only resolved for completeness) or None when
+        a required node (FB, VC, VOUT, GND) is missing or no live pin map exists.
+
+        Unlike ``_switcher_terminals`` this resolves the **VC** (compensation) and
+        **VOUT** nodes -- the current-mode loop closes the error amp into the real
+        external VC network and injects the averaged output current into the real
+        VOUT/Cout/Rload, so both must be pins. FB is the divider tap (error-amp
+        input); ``FBX`` (the LT3757 single-pin dual-reference feedback) is accepted
+        alongside the usual FB names. First connected match per role wins.
+        """
+        pin_map = getattr(component, "_pins", None)
+        if not isinstance(pin_map, dict):
+            return None
+        fb_names = self._SWITCH_FB_NAMES | {"FBX"}
+        fb = vc = vout = gnd = vin = None
+        for pin in pin_map.values():
+            net = getattr(pin, "net", None)
+            if net is None:
+                continue
+            name = (getattr(pin, "name", "") or "").strip().upper()
+            node = self.node_map.get(net.name, net.name)
+            if fb is None and name in fb_names:
+                fb = node
+            elif vc is None and name in self._SWITCH_VC_NAMES:
+                vc = node
+            elif vout is None and name in self._SWITCH_VOUT_NAMES:
+                vout = node
+            elif gnd is None and name in self._SWITCH_GND_NAMES:
+                gnd = node
+            elif vin is None and name in self._SWITCH_VIN_NAMES:
+                vin = node
+        if fb is None or vc is None or vout is None or gnd is None:
+            return None
+        return {"fb": fb, "vc": vc, "vout": vout, "gnd": gnd, "vin": vin}
+
+    def _averaged_current_mode_params(self, component, topology) -> Optional[dict]:
+        """Params for the averaged peak-current-mode loop model, or None if unusable.
+
+        Extends ``_averaged_params`` with the current-mode knobs. Requires a nonzero
+        ``VREF`` (the FBX reference the divider tap regulates to -- **may be negative**
+        for the -0.8 V inverting configuration, unlike the voltage-mode buck which
+        requires a positive VREF) and ``FSW`` (sets the fsw/2 subharmonic double
+        pole). The steady-state duty ``D`` (for the RHP-zero frequency and the
+        subharmonic Q) is derived from ``VOUT``/``VIN`` per topology, or given
+        directly as ``D``.
+
+        Current-mode knobs (all with datasheet-anchored defaults, documented):
+          * ``GM``   error-amp transconductance (default 250 uS, the LT3757 value);
+          * ``RI``   effective current-sense gain in ohms = Rsense * sense-amp-gain
+                     (default 0.1 = 0.01 R sense x 10 V/V), sets the modulator gain
+                     ``gmc = (1-D)/RI`` (boost/sepic/cuk) or ``1/RI`` (buck);
+          * ``MC``   slope-compensation factor mc = 1 + Se/Sn (default 1.5), sets the
+                     subharmonic Q ``Qp = 1/(pi*(mc*(1-D) - 0.5))``;
+          * ``REA``  finite error-amp DC-gain resistor (default 1e6) -- a DC-path
+                     safety so the op point solves; the AC zero/pole come from the
+                     user's real Rc/Cc, not this;
+          * RHP zero (boost/sepic/cuk only): ``FRHPZ`` in Hz directly, else derived
+                     ``Rload*(1-D)^2/(2*pi*L)`` from ``RLOAD`` and ``L`` params.
+                     Buck has no RHP zero (omitted).
+
+        Returns None when VREF is zero/absent, FSW is missing/invalid, or D cannot
+        be resolved.
+        """
+        raw = self._parse_sim_params(self._sim_props(component).get("params"))
+
+        def g(key, default=None):
+            v = self._parse_si_number(raw[key]) if key in raw else None
+            return v if v is not None else default
+
+        vref = self._parse_si_number(raw["VREF"]) if "VREF" in raw else None
+        if not vref or vref == 0:
+            return None
+        fsw = g("FSW")
+        if not fsw or fsw <= 0:
+            return None
+
+        d = g("D")
+        if d is None:
+            vout, vin = g("VOUT"), g("VIN")
+            if vout and vin and vin > 0 and abs(vout) > 0:
+                av = abs(vout)
+                if topology == "buck":
+                    d = av / vin if vin > 0 else None
+                elif topology == "boost":
+                    d = 1.0 - vin / av if av > vin else None
+                else:  # sepic / cuk: |Vout|/(|Vout|+Vin)
+                    d = av / (av + vin)
+            if d is None:
+                return None
+        d = min(max(d, 0.01), 0.99)
+
+        mc = g("MC", 1.5)
+        ri = g("RI", 0.1)
+        gm = g("GM", 250e-6)
+        rea = g("REA", 1e6)
+
+        # RHP zero (boost/sepic/cuk). FRHPZ wins; else derive from RLOAD and L.
+        frhpz = None
+        if topology != "buck":
+            frhpz = g("FRHPZ")
+            if frhpz is None:
+                rload, lval = g("RLOAD"), g("L")
+                if rload and rload > 0 and lval and lval > 0:
+                    frhpz = rload * (1.0 - d) ** 2 / (2.0 * math.pi * lval)
+
+        return {
+            "VREF": vref,
+            "FSW": fsw,
+            "D": d,
+            "MC": mc,
+            "RI": ri,
+            "GM": gm,
+            "REA": rea,
+            "FRHPZ": frhpz,
+        }
+
     def _averaged_params(self, component) -> Optional[dict]:
         """Error-amp params for the averaged model, or None if VREF is missing.
 
@@ -3240,6 +3376,21 @@ class SpiceConverter:
         reported as loss. Boost and flyback need UIC to converge (boost: start
         V(out) at V(in); flyback: start V(out) at 0); buck converges without it.
         """
+        # MODE=avg CMODE=peak selects the averaged peak-current-mode LOOP model
+        # (Stage 28.D), for .ac crossover/phase-margin of the VC-pin compensation
+        # network. It resolves its OWN terminals (FB/VC/VOUT, not the SW node the
+        # power-stage models need), so branch before the SW/VIN/GND gate. Only
+        # buck/boost are wired (flyback current-mode is out of scope); a plain
+        # MODE=avg (no CMODE) still takes the voltage-mode buck path below,
+        # byte-identical to Stage 20.5.
+        if (
+            topology in ("buck", "boost")
+            and self._switcher_mode(component) == "avg"
+            and self._switcher_cmode(component) == "peak"
+        ):
+            self._emit_averaged_current_mode(component, ref, value, topology)
+            return
+
         term = self._switcher_terminals(component)
         if term is None:
             logger.warning(
@@ -3413,6 +3564,160 @@ class SpiceConverter:
             f"{ref}: buck averaged macromodel (voltage-mode, CCM, vref={vref}, "
             f"gm={gm}, cea={cea}); for loop-gain/phase-margin via .ac. Results above "
             f"~{self._fmt_hz(fsw / 2)} (FSW/2) are not physical (averaging breaks)."
+        )
+
+    def _emit_averaged_current_mode(self, component, ref, value, topology):
+        """Emit the averaged **peak-current-mode** loop model (Stage 28.D).
+
+        A small-signal, ``.ac``-linearizable macromodel for **compensation design**
+        -- crossover / phase margin / gain margin of the VC-pin network on a
+        current-mode boost/buck (SEPIC/Ćuk share the boost RHP-zero shape). It is
+        NOT a cycle-accurate controller and NOT a closed-loop switching sim: no
+        soft-start, no current-limit/foldback, no burst mode, no SYNC, no
+        large-signal startup (those are the deferred ``CMCONTROLLER`` step).
+
+        Structurally different from the voltage-mode ``_emit_averaged_buck``: the
+        inner current loop makes the inductor a *controlled current source*, so the
+        control-to-output plant is (to first order) single-pole ``1/(Rload*Cout)``
+        plus the ESR zero -- both supplied by the user's **real** Cout/Rload -- and
+        the model injects the averaged output current directly into VOUT. Emitted,
+        per ref (all behavioral ``B`` sources + linear ``R``/``L``/``C`` so ``.ac``
+        linearizes cleanly, no switching)::
+
+            B<ref>_ea   0 <vc>  I = GM*(VREF - V(<fb>))   ; gm error amp into the
+            R<ref>_ea  <vc> <gnd> REA                     ;   real external VC network
+            B<ref>_shin <shin> <gnd> V = V(<vc>)          ; buffer (no load on VC net)
+            R<ref>_sh  <shin> <nrh> RH                    ; subharmonic double pole at
+            L<ref>_sh  <nrh> <sh>  LH                     ;   fsw/2, Q=1/(pi*(mc*D'-.5))
+            C<ref>_sh  <sh>  <gnd> CH                     ;   (unity DC, 2-pole LP)
+            C<ref>_z   <sh>  <nz>  CZ                     ; RHP zero (boost/sepic/cuk):
+            V<ref>_z   <nz>  <gnd> DC 0                   ;   V(rz)=V(sh)*(1 - s/wz)
+            B<ref>_rz  <rz>  <gnd> V = V(<sh>) - KZ*I(V<ref>_z)   ;  via sensed dV/dt
+            B<ref>_out 0 <vout> I = GMC*V(<rz>)           ; controlled output current
+
+        Negative feedback: VOUT up -> V(fb) up -> (VREF-fb) down -> less current into
+        VC -> V(vc) down -> less GMC*V(rz) injected -> VOUT down. The real Cout/Rload
+        integrate the injected current into the dominant pole (+ ESR zero if Cout has
+        ESR); the real Rc/Cc on VC set the type-II compensation zero/pole; REA is a
+        DC-path safety (finite error-amp DC gain), not the AC shaping.
+
+        The physical boost inductor L (VIN->SW) is **not** in the small-signal path
+        (the inner current loop subsumes its pole); its value enters only through the
+        RHP-zero frequency (``L``/``FRHPZ`` param). Any SW/VIN pins are DC-tied via
+        the 1G unmodeled-pin stubs. Validity (documented, logged): CCM, small-signal,
+        results above ~fsw/2 are meaningless; no current limit, no slope-comp
+        large-signal instability. A *design-margin* tool, not a validated reference.
+
+        No hard duty clamp (same reason as the buck: a min/max saturation zeroes the
+        DC Jacobian). Emits nothing and warns (honest skip) when the terminals or the
+        required params (VREF/FSW/D) don't resolve.
+        """
+        term = self._currentmode_terminals(component)
+        if term is None:
+            logger.warning(
+                f"{topology} {ref}: MODE=avg CMODE=peak needs connected FB, VC "
+                f"(compensation) and VOUT pins (resolved by pin name) - skipping"
+            )
+            return
+        cm = self._averaged_current_mode_params(component, topology)
+        if cm is None:
+            logger.warning(
+                f"{topology} {ref}: MODE=avg CMODE=peak needs Sim.Params VREF (the "
+                f"FBX reference, may be negative), FSW, and a resolvable duty "
+                f'(D, or VOUT+VIN), e.g. "fsw=300k vout=24 vin=12 vref=1.6 '
+                f'mode=avg cmode=peak" - skipping'
+            )
+            return
+
+        fb, vc, vout, gnd = (
+            str(term["fb"]), str(term["vc"]), str(term["vout"]), str(term["gnd"])
+        )
+        # Give any other pins (SW/VIN/SS/RT/INTVCC...) a DC path; the loop model
+        # uses only FB/VC/VOUT/GND. VIN (if present) is a driven rail; a 1G stub on
+        # it is harmless.
+        self._stub_unmodeled_pins(component, ref, {vc, vout, gnd, fb}, gnd)
+
+        n = self._fmt_num
+        vref, gm, rea, ri, mc, d = (
+            n(cm["VREF"]), n(cm["GM"]), n(cm["REA"]),
+            cm["RI"], cm["MC"], cm["D"],
+        )
+        dprime = 1.0 - d
+        # Modulator gain: control voltage commands the inductor current (iL=V(vc)/Ri);
+        # the delivered average output current is iL for a buck, iL*(1-D) for the
+        # step-up families.
+        gmc = (1.0 / ri) if topology == "buck" else (dprime / ri)
+
+        # Subharmonic double pole at fsw/2 realized as a unity-DC 2-pole LP (R-L-C):
+        # wn=2*pi*(fsw/2), Q from the slope factor. Q blows up as mc*D' -> 0.5, so
+        # clamp it (and warn) rather than emit a negative/None damping.
+        wn = math.pi * cm["FSW"]  # = 2*pi*(fsw/2)
+        q_den = math.pi * (mc * dprime - 0.5)
+        if q_den <= 0.05:
+            qp = 20.0
+            logger.warning(
+                f"{topology} {ref}: slope factor mc={mc:g} at D={d:.3f} gives a "
+                f"subharmonic Q near/over instability (mc*(1-D)={mc * dprime:.3f} "
+                f"<= 0.5); clamped to Q=20. Increase MC (more slope comp)."
+            )
+        else:
+            qp = 1.0 / q_den
+        ch = 1e-6
+        lh = 1.0 / (wn * wn * ch)
+        rh = 1.0 / (qp * wn * ch)
+
+        shin, nrh, sh = f"{ref}_shin", f"{ref}_nrh", f"{ref}_sh"
+        lines = [
+            f"B{ref}_ea 0 {vc} I = {gm}*({vref} - V({fb}))",
+            f"R{ref}_ea {vc} {gnd} {rea}",
+            f"B{ref}_shin {shin} {gnd} V = V({vc})",
+            f"R{ref}_sh {shin} {nrh} {n(rh)}",
+            f"L{ref}_sh {nrh} {sh} {n(lh)}",
+            f"C{ref}_sh {sh} {gnd} {n(ch)}",
+        ]
+
+        # RHP zero (boost/sepic/cuk). Realize (1 - s/wz) exactly via a sensed
+        # capacitor current (no extra pole): I(Vz)=Cz*dV(sh)/dt, so
+        # V(sh) - (1/(wz*Cz))*I(Vz) = V(sh)*(1 - s/wz).
+        frhpz = cm["FRHPZ"]
+        src = sh  # node feeding the output transconductance
+        if topology != "buck":
+            if frhpz and frhpz > 0:
+                wz = 2.0 * math.pi * frhpz
+                cz = 1e-9
+                kz = 1.0 / (wz * cz)
+                nz, rz = f"{ref}_nz", f"{ref}_rz"
+                lines += [
+                    f"C{ref}_z {sh} {nz} {n(cz)}",
+                    f"V{ref}_z {nz} {gnd} DC 0",
+                    f"B{ref}_rz {rz} {gnd} V = V({sh}) - {n(kz)}*I(V{ref}_z)",
+                ]
+                src = rz
+            else:
+                logger.warning(
+                    f"{topology} {ref}: no RHP-zero frequency resolved (give FRHPZ, "
+                    f"or RLOAD and L) - the boost/SEPIC/Ćuk right-half-plane zero is "
+                    f"omitted; the loop model is optimistic above ~fsw/10"
+                )
+
+        lines.append(f"B{ref}_out 0 {vout} I = {n(gmc)}*V({src})")
+
+        self.spice_circuit.raw_spice += "\n" + "\n".join(lines)
+        self.model_provenance[ref] = ResolvedModel(
+            ref, topology, "sim_params",
+            f"{topology}_averaged_cm(vref={vref}, d={d:.3f})",
+        )
+        fsw = cm["FSW"]
+        rhpz_txt = (
+            f"RHP zero {self._fmt_hz(frhpz)}" if (topology != "buck" and frhpz)
+            else "no RHP zero" if topology == "buck" else "RHP zero omitted"
+        )
+        logger.debug(
+            f"{ref}: {topology} averaged peak-current-mode loop model (vref={vref}, "
+            f"d={d:.3f}, gm={gm}, ri={ri:g}, gmc={gmc:g}, mc={mc:g}, Q={qp:.2f} at "
+            f"fsw/2={self._fmt_hz(fsw / 2)}, {rhpz_txt}); small-signal compensation "
+            f"model for .ac loop gain -- NOT the closed-loop switching controller. "
+            f"Results above ~{self._fmt_hz(fsw / 2)} (fsw/2) are not physical."
         )
 
     # ------------------------------------------------------------------ #
@@ -5400,6 +5705,31 @@ class SpiceConverter:
                 )
                 continue
             if kind not in ("buck", "boost", "flyback"):
+                continue
+            # 4c-avgcm. Averaged peak-current-mode LOOP model (MODE=avg CMODE=peak,
+            #           buck/boost only): checks FB/VC/VOUT terminals + VREF/FSW/duty
+            #           instead of the power-stage SW/VIN/GND, since it resolves its
+            #           own terminals and never emits a switch node.
+            if (
+                kind in ("buck", "boost")
+                and self._switcher_mode(component) == "avg"
+                and self._switcher_cmode(component) == "peak"
+            ):
+                if (
+                    getattr(component, "_pins", None) is not None
+                    and self._currentmode_terminals(component) is None
+                ):
+                    problems.append(
+                        f"{ref}: {kind} MODE=avg CMODE=peak needs connected FB, VC "
+                        f"(compensation) and VOUT pins (resolved by pin name)"
+                    )
+                if self._averaged_current_mode_params(component, kind) is None:
+                    problems.append(
+                        f"{ref}: {kind} MODE=avg CMODE=peak needs Sim.Params VREF "
+                        f"(may be negative), FSW and a resolvable duty (D, or "
+                        f'VOUT+VIN), e.g. Sim.Params="fsw=300k vout=24 vin=12 '
+                        f'vref=1.6 mode=avg cmode=peak"'
+                    )
                 continue
             if (
                 getattr(component, "_pins", None) is not None
