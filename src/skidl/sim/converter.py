@@ -3053,6 +3053,72 @@ class SpiceConverter:
             return None
         return {"sw": sw, "vin": vin, "gnd": gnd, "fb": fb}
 
+    # Second switch node (boost-leg / SEPIC node B) and the explicit output node,
+    # for the multi-switch bidirectional families (Stage 27). The 3-node
+    # _switcher_terminals resolver can express neither a second SW node nor a
+    # distinct (possibly negative) VOUT.
+    _SWITCH_SW2_NAMES = {"SW2", "SWB", "LX2", "PH2"}
+    _SWITCH_VOUT_NAMES = {"VOUT", "OUT", "VO"}
+
+    def _multiswitch_terminals(self, component, kind):
+        """Resolve the terminals a multi-switch converter ``kind`` needs, by name.
+
+        Generalizes ``_switcher_terminals`` for the Stage-27 bidirectional
+        families. Resolves each pin by its (upper-cased) NAME -- not position --
+        for the same reason the transistor mapping does (KiCad symbols number
+        pins inconsistently). First connected match per role wins.
+
+        Returns a dict of SPICE nodes shaped for ``kind``:
+
+        - ``buckboost4`` -> ``{vin, swa, swb, vout, gnd}`` (swa = buck-leg node
+          from SW/LX..., swb = boost-leg node from SW2/SWB/LX2/PH2);
+        - ``invbuckboost`` -> ``{vin, sw, vout, gnd}`` (vout is the negative
+          output node; the single switch node comes from SW/LX...);
+        - ``sepic`` -> ``{vin, swa, swb, vout, gnd}`` (swa = node A, swb = node B,
+          with the coupling cap Cs a real external part between them).
+
+        Returns None when any node ``kind`` requires is unresolved (or no live
+        pin map is available), so the handler can log an actionable warning and
+        skip.
+        """
+        pin_map = getattr(component, "_pins", None)
+        if not isinstance(pin_map, dict):
+            return None
+        found = {"vin": None, "swa": None, "swb": None, "vout": None, "gnd": None}
+        for pin in pin_map.values():
+            net = getattr(pin, "net", None)
+            if net is None:
+                continue
+            name = (getattr(pin, "name", "") or "").strip().upper()
+            node = self.node_map.get(net.name, net.name)
+            if found["swa"] is None and name in self._SWITCH_SW_NAMES:
+                found["swa"] = node
+            elif found["swb"] is None and name in self._SWITCH_SW2_NAMES:
+                found["swb"] = node
+            elif found["vin"] is None and name in self._SWITCH_VIN_NAMES:
+                found["vin"] = node
+            elif found["vout"] is None and name in self._SWITCH_VOUT_NAMES:
+                found["vout"] = node
+            elif found["gnd"] is None and name in self._SWITCH_GND_NAMES:
+                found["gnd"] = node
+        required = {
+            "buckboost4": ("vin", "swa", "swb", "vout", "gnd"),
+            "invbuckboost": ("vin", "swa", "vout", "gnd"),
+            "sepic": ("vin", "swa", "swb", "vout", "gnd"),
+        }.get(kind)
+        if required is None:
+            return None
+        if any(found[k] is None for k in required):
+            return None
+        if kind == "invbuckboost":
+            return {
+                "vin": found["vin"],
+                "sw": found["swa"],
+                "vout": found["vout"],
+                "gnd": found["gnd"],
+            }
+        return {k: found[k] for k in required}
+
     def _switcher_params(self, component, value, topology) -> Optional[dict]:
         """Macromodel params for a switcher, or None if a required one is missing.
 
@@ -3364,6 +3430,81 @@ class SpiceConverter:
             return None
         return {"FSW": fsw, "DT": dt, "RON": ron}
 
+    def _emit_sync_leg(
+        self,
+        top: str,
+        sw: str,
+        bottom: str,
+        gnd: str,
+        *,
+        fsw: float,
+        duty: float,
+        phase: float = 0.0,
+        dt: float,
+        ron: float,
+        suffix: str,
+    ) -> bool:
+        """Emit one duty+phase-parameterized synchronous switch leg.
+
+        A complementary voltage-controlled ``S`` switch pair between ``top`` and
+        ``bottom`` with the switch node ``sw`` in the middle, each device
+        carrying a **mandatory antiparallel body diode** so it conducts in
+        reverse -- that reverse path is what makes bidirectionality essentially
+        free at the switch level (the Stage-27 insight). Generalizes
+        ``_add_halfbridge``'s fixed-50 %/zero-phase machinery:
+
+        - the high-side device (``top`` -> ``sw``) conducts for ``duty/fsw - dt``;
+        - the low-side device (``sw`` -> ``bottom``) conducts for
+          ``(1-duty)/fsw - dt``, delayed by ``duty/fsw`` (so it fills the rest of
+          the period, minus a deadtime at each edge);
+        - the whole leg is delayed by ``phase/fsw`` (the inter-leg phase used by
+          multi-leg topologies).
+
+        Gate PULSEs are referenced to ``gnd`` (the control-voltage reference), so
+        a high-side device floating on ``top`` still switches correctly. All card
+        names are suffixed by ``suffix`` (e.g. ``f"{ref}A"``) so several legs may
+        coexist on one converter.
+
+        Returns True on success; False -- emitting **nothing** -- when the
+        deadtime leaves no conduction window (``dt >= min(duty, 1-duty)/fsw``) so
+        the caller can log a warning and skip, mirroring ``_halfbridge_params``.
+
+        At ``duty=0.5, phase=0.0, top=vin, bottom=gnd, gnd=gnd, suffix=ref`` the
+        emitted lines are **byte-for-byte identical** to ``_add_halfbridge`` -- a
+        hard gate (the HALFBRIDGE output must not change; see
+        ``test_sim_halfbridge.py`` and ``test_sim_syncleg.py``).
+        """
+        per = 1.0 / fsw
+        on_hs = duty * per - dt  # high-side conduction time
+        on_ls = (1.0 - duty) * per - dt  # low-side conduction time
+        if on_hs <= 0 or on_ls <= 0:
+            return False
+        td_hs = phase * per  # high-side turn-on delay
+        td_ls = phase * per + duty * per  # low-side turn-on delay
+        edge = per / 200.0
+        ron = self._fmt_num(ron)
+        ghs, gls = f"{suffix}_ghs", f"{suffix}_gls"
+
+        lines = [
+            # Complementary gate drives with a deadtime gap: high-side on first
+            # (for duty*per - DT), low-side after (for (1-duty)*per - DT); both
+            # off during the two DT windows. The whole leg is shifted by phase*per.
+            f"V{suffix}_ghs {ghs} {gnd} PULSE(0 5 {td_hs:.6g} "
+            f"{edge:.6g} {edge:.6g} {on_hs:.6g} {per:.6g})",
+            f"V{suffix}_gls {gls} {gnd} PULSE(0 5 {td_ls:.6g} "
+            f"{edge:.6g} {edge:.6g} {on_ls:.6g} {per:.6g})",
+            f"S{suffix}_hs {top} {sw} {ghs} {gnd} SW{suffix}",
+            f"S{suffix}_ls {sw} {bottom} {gls} {gnd} SW{suffix}",
+            f".model SW{suffix} SW(Ron={ron} Roff=1e6 Vt=2.5 Vh=0.2)",
+            # Antiparallel body diodes (high-side sw->top, low-side bottom->sw):
+            # the deadtime freewheel path and the source of reverse conduction.
+            f"D{suffix}_hs {sw} {top} DFW{suffix}",
+            f"D{suffix}_ls {bottom} {sw} DFW{suffix}",
+            f".model DFW{suffix} D(IS=1e-9 N=1.05 CJO=100p)",
+        ]
+        self.spice_circuit.raw_spice += "\n" + "\n".join(lines)
+        return True
+
     def _add_halfbridge(self, component, ref: str, value: str):
         """Emit an open-loop half-bridge switch stage (Sim.Device=HALFBRIDGE/LLC).
 
@@ -3406,30 +3547,23 @@ class SpiceConverter:
         sw, vin, gnd = str(term["sw"]), str(term["vin"]), str(term["gnd"])
         n = self._fmt_num
         fsw, dt, ron = params["FSW"], params["DT"], n(params["RON"])
-        per = 1.0 / fsw
-        half = per / 2.0
-        on = half - dt  # conduction time per switch (guaranteed > 0 by params)
-        edge = per / 200.0
-        ghs, gls = f"{ref}_ghs", f"{ref}_gls"
-
-        lines = [
-            # Complementary gate drives with a deadtime gap: high-side on for the
-            # first (half - DT), low-side on for the second (half - DT); both off
-            # during the two DT windows.
-            f"V{ref}_ghs {ghs} {gnd} PULSE(0 5 0 "
-            f"{edge:.6g} {edge:.6g} {on:.6g} {per:.6g})",
-            f"V{ref}_gls {gls} {gnd} PULSE(0 5 {half:.6g} "
-            f"{edge:.6g} {edge:.6g} {on:.6g} {per:.6g})",
-            f"S{ref}_hs {vin} {sw} {ghs} {gnd} SW{ref}",
-            f"S{ref}_ls {sw} {gnd} {gls} {gnd} SW{ref}",
-            f".model SW{ref} SW(Ron={ron} Roff=1e6 Vt=2.5 Vh=0.2)",
-            # Antiparallel diodes (high-side sw->vin, low-side gnd->sw): the tank
-            # freewheel path during deadtime and the ZVS clamp.
-            f"D{ref}_hs {sw} {vin} DFW{ref}",
-            f"D{ref}_ls {gnd} {sw} DFW{ref}",
-            f".model DFW{ref} D(IS=1e-9 N=1.05 CJO=100p)",
-        ]
-        self.spice_circuit.raw_spice += "\n" + "\n".join(lines)
+        # A half-bridge is exactly a synchronous leg at 50 % duty / zero phase
+        # between VIN and GND (gates referenced to GND). Emitting through the
+        # shared primitive keeps the two in lockstep; params guaranteed dt < half
+        # the period, so the leg always emits (byte-identical to the legacy
+        # output -- a hard gate; see test_sim_halfbridge.py).
+        self._emit_sync_leg(
+            vin,
+            sw,
+            gnd,
+            gnd,
+            fsw=fsw,
+            duty=0.5,
+            phase=0.0,
+            dt=dt,
+            ron=params["RON"],
+            suffix=ref,
+        )
         self.model_provenance[ref] = ResolvedModel(
             ref, "halfbridge", "sim_params",
             f"halfbridge_openloop(fsw={self._fmt_hz(fsw)}, dt={n(dt)})",
