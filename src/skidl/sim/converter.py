@@ -3354,8 +3354,13 @@ class SpiceConverter:
     # closed-loop controller can emit around its topology-agnostic core, which of
     # them invert the output (needing the dual-reference / flipped error-amp sense),
     # and which need a node-B (SWB, the coupling-cap junction) terminal in addition
-    # to the six buck terminals. buck landed in 29.1; the rest are 29.4.
-    _CMC_TOPOLOGIES = frozenset({"buck", "boost", "sepic", "cuk", "flyback"})
+    # to the six buck terminals. buck landed in 29.1; the rest are 29.4. Stage 31.3
+    # adds ``forward`` -- a single-ended isolated CCM topology whose primary switch
+    # stage is IDENTICAL to the flyback's (LS switch SW->GND, sensed, no rectifier);
+    # only the external magnetics/reset differ (the user supplies them), so it reuses
+    # the flyback emission and just needs its own duty limit (a 1:1-reset forward
+    # requires D<0.5).
+    _CMC_TOPOLOGIES = frozenset({"buck", "boost", "sepic", "cuk", "flyback", "forward"})
     _CMC_INVERTING = frozenset({"cuk"})
     _CMC_NEEDS_SWB = frozenset({"sepic", "cuk"})
 
@@ -3678,8 +3683,9 @@ class SpiceConverter:
                      finite current into the ITH pin -- clamped on the CURRENT
                      (``min``/``max``), which slew-limits VC without floating the node;
           * ``RON``  emitted switch on-resistance in ohms (default 0.1);
-          * ``DMAX`` max duty (default 0.9); a max-duty pulse force-resets the latch
-                     past it, bounding inrush even before soft-start;
+          * ``DMAX`` max duty (default 0.9, or **0.45 for topology=forward** -- a
+                     1:1 single-ended reset needs D<0.5); a max-duty pulse force-resets
+                     the latch past it, bounding inrush even before soft-start;
           * ``TSS``  soft-start / soft-reference ramp time in seconds (default 0 = a
                      hard DC reference). A nonzero TSS ramps the internal reference
                      from 0 to VREF over TSS, so the rail rises monotonically and the
@@ -3687,9 +3693,11 @@ class SpiceConverter:
                      eases the UIC ``.tran`` op point;
           * ``TOPOLOGY``  the switch stage to emit (default ``buck``). Stage 29.4
                      generalizes the core to ``boost`` / ``sepic`` / ``cuk`` /
-                     ``flyback``; ``cuk`` is inverting (negative output, negative
-                     VREF), and ``sepic`` / ``cuk`` need a second switch node (``SWB``
-                     / node B, the coupling-cap junction).
+                     ``flyback``; Stage 31.3 adds ``forward`` (a buck-derived
+                     single-ended isolated CCM topology sharing the flyback primary
+                     switch stage, defaulting ``DMAX`` to 0.45). ``cuk`` is inverting
+                     (negative output, negative VREF), and ``sepic`` / ``cuk`` need a
+                     second switch node (``SWB`` / node B, the coupling-cap junction).
 
         Supervisory features (Stage 29.3) -- each behind its own param, ABSENT = the
         feature is off and the emission stays byte-identical to 29.1/29.2:
@@ -3791,7 +3799,11 @@ class SpiceConverter:
             "ISOURCE": g("ISOURCE", 1e-3),
             "ISINK": g("ISINK", 1e-3),
             "RON": g("RON", 0.1),
-            "DMAX": g("DMAX", 0.9),
+            # Forward with a 1:1 (single-ended) reset must keep D<0.5 or the core
+            # staircases into saturation (Stage 31.2), so its default max duty is
+            # 0.45 -- a topology-conditional default that is byte-safe (no legacy
+            # netlist carries topology=forward). An explicit ``dmax=`` still wins.
+            "DMAX": g("DMAX", 0.45 if topology == "forward" else 0.9),
             "TSS": g("TSS", 0.0),
             "TOPOLOGY": topology,
             "CHIP": chip_name,
@@ -4243,8 +4255,9 @@ class SpiceConverter:
                          VIN->SW + freewheel GND->SW; boost = LS switch SW->GND +
                          rectifier SW->VOUT; sepic = main A->GND + rectifier B->VOUT;
                          cuk = main A->GND + rectifier B->GND (negative VOUT behind L2);
-                         flyback = primary switch SW->GND (user's transformer/rectifier).
-                         Every topology senses the MAIN switch on-time current.
+                         flyback/forward = primary switch SW->GND (user's
+                         transformer/rectifier/reset). Every topology senses the MAIN
+                         switch on-time current.
 
         Topology generalization (Stage 29.4): the core above is topology-agnostic; only
         the switch stage and a sign detail change. Boost/SEPIC/flyback are non-inverting
@@ -4254,6 +4267,18 @@ class SpiceConverter:
         node-B (SWB) coupling-cap-junction terminal. The switch stages are emitted
         directly here (not via the open-loop ``_emit_*_switches``) so those macromodels
         stay byte-identical.
+
+        Forward converter (Stage 31.3): a **buck-derived, single-ended isolated CCM**
+        topology. Its primary switch stage is IDENTICAL to the flyback's -- a latch-gated
+        LS switch SW->GND with the on-time current sense, no controller-emitted rectifier
+        -- so it reuses the flyback emission verbatim; the difference is entirely in the
+        EXTERNAL magnetics the user supplies: the forward transfers energy through the
+        transformer DURING the on-time (forward rectifier conducts while the switch is on)
+        into an output inductor, so ``Vout ~= n*Vin*D`` (the buck law), and the
+        magnetizing inductance is a parasite that must be RESET to zero flux every cycle
+        (an RCD clamp or a tertiary reset winding -- again external). A 1:1 single-ended
+        reset takes exactly the on-time to demagnetize, so the duty must stay below 0.5:
+        forward's ``DMAX`` therefore defaults to **0.45** (an explicit ``dmax=`` wins).
 
         Supervisory features (Stage 29.3, each behind a param, absent = off + emission
         byte-identical to 29.1/29.2): TSS soft-start (a monotone reference ramp bounding
@@ -4279,7 +4304,7 @@ class SpiceConverter:
         parameterized ones. GM/RI/MCSLOPE are datasheet-anchored design inputs.
         Emits nothing and warns (honest skip) when the terminals or required params
         (VREF/FSW, and SWB for sepic/cuk) do not resolve, or the topology is not one of
-        buck/boost/sepic/cuk/flyback.
+        buck/boost/sepic/cuk/flyback/forward.
         """
         term = self._cmcontroller_terminals(component)
         if term is None:
@@ -4300,7 +4325,7 @@ class SpiceConverter:
         if topology not in self._CMC_TOPOLOGIES:
             logger.warning(
                 f"CMCONTROLLER {ref}: topology={topology} is not a supported topology "
-                f"(buck/boost/sepic/cuk/flyback) - skipping"
+                f"(buck/boost/sepic/cuk/flyback/forward) - skipping"
             )
             return
         # SEPIC/Ćuk close through a second switch node (node B, the coupling-cap
@@ -4491,9 +4516,13 @@ class SpiceConverter:
                 f"D{ref}_rect {swb} {gnd} DFW{ref}",
                 dfw_model,
             ]
-        else:  # flyback (CCM): primary switch SW->GND; the user's transformer +
-            # secondary rectifier + output cap form the isolated output stage, so no
-            # rectifier is emitted here. Sense = primary switch on-time current.
+        else:  # flyback / forward (Stage 31.3): primary switch SW->GND; the user's
+            # transformer + secondary rectifier + output cap (flyback) OR transformer
+            # + forward rectifier + freewheel + output inductor + core reset (forward)
+            # form the isolated output stage, so no rectifier is emitted here. The two
+            # differ only in the EXTERNAL magnetics/reset (which the canary supplies)
+            # and the duty limit -- the primary switch stage is byte-identical. Sense =
+            # primary switch on-time current.
             isns_line = f"V{ref}_isns {swlo} {gnd} 0"
             switch_stage = [
                 f"S{ref}_ls {sw} {swlo} {gate} {gnd} SWM{ref}",
@@ -6745,7 +6774,8 @@ class SpiceConverter:
 
         # 4c-cmc. Behavioral closed-loop peak-current-mode controller (Stage 29.1/29.4):
         #         all six terminals (VIN/SW/VOUT/FB/VC/GND) + VREF/FSW; topology one of
-        #         buck/boost/sepic/cuk/flyback (sepic/cuk also need the SWB node-B pin).
+        #         buck/boost/sepic/cuk/flyback/forward (sepic/cuk also need the SWB
+        #         node-B pin).
         for component in self._iter_components():
             if self._sim_excluded(component):
                 continue
@@ -6769,7 +6799,7 @@ class SpiceConverter:
             elif cp["TOPOLOGY"] not in self._CMC_TOPOLOGIES:
                 problems.append(
                     f"{ref}: CMCONTROLLER topology={cp['TOPOLOGY']} is not a supported "
-                    f"topology (buck/boost/sepic/cuk/flyback)"
+                    f"topology (buck/boost/sepic/cuk/flyback/forward)"
                 )
             elif (
                 cp["TOPOLOGY"] in self._CMC_NEEDS_SWB

@@ -497,6 +497,71 @@ def test_flyback_emits_primary_switch_only():
 
 
 @requires_sim
+def test_forward_reuses_flyback_primary_switch_and_defaults_dmax_045():
+    """A forward CMCONTROLLER (Stage 31.3) is a buck-derived single-ended isolated CCM
+    topology whose primary switch stage is IDENTICAL to the flyback's -- a latch-gated
+    LS switch SW->GND with the on-time current sense and NO controller-emitted rectifier
+    (the user supplies the transformer + forward rectifier + freewheel + output inductor
+    + reset). It reuses the flyback emission verbatim; the ONLY difference is a
+    topology-conditional duty limit: a 1:1 single-ended reset needs D<0.5, so forward's
+    DMAX defaults to 0.45 (the max-duty force-off pulse fires at per*0.45)."""
+    _setup()
+    u = _cmc_part(
+        Sim_Device="CMCONTROLLER",
+        Sim_Params="topology=forward fsw=250k vout=5 vin=12 vref=1.2 ri=0.1",
+    )
+    net = _emit(u)
+    # same primary switch stage + sense as the flyback, no rectifier
+    assert "SU1_ls SW U1_swlo U1_gate 0 SWMU1" in net, net
+    assert "VU1_isns U1_swlo 0 0" in net, net
+    assert "DU1_rect" not in net and "DU1_fw" not in net, net
+    # non-inverting error amp (positive VREF), like the flyback
+    assert "BU1_ea 0 VC I = min(max(0.00025*(1.2 - V(FB)), -0.001), 0.001)" in net, net
+    # DMAX defaults to 0.45 for forward: per=4us -> the max-duty pulse fires at 1.8us
+    assert "VU1_duty U1_rstd 0 PULSE(0 5 1.8e-06 " in net, net
+    # provenance records the forward topology
+    assert conv_name(u) == "forward_cmcontroller(vref=1.2, fsw=250k)"
+
+
+@requires_sim
+def test_forward_explicit_dmax_overrides_045_default():
+    """An explicit ``dmax=`` still wins over forward's 0.45 default (byte-safe: the
+    conditional default only sets the value when the user did not)."""
+    _setup()
+    u = _cmc_part(
+        Sim_Device="CMCONTROLLER",
+        Sim_Params="topology=forward fsw=250k vout=5 vin=12 vref=1.2 ri=0.1 dmax=0.4",
+    )
+    net = _emit(u)
+    assert "VU1_duty U1_rstd 0 PULSE(0 5 1.6e-06 " in net, net    # per*0.4 = 1.6us
+
+
+@requires_sim
+def test_forward_primary_switch_byte_identical_to_flyback():
+    """The forward primary switch stage is byte-for-byte the flyback's (only the
+    external magnetics/reset and the duty limit differ): the switch line, sense line,
+    and SWM model are the same three tokens, and neither emits a rectifier."""
+    _setup()
+    fly = _cmc_part(
+        ref="U1", Sim_Device="CMCONTROLLER",
+        Sim_Params="topology=flyback fsw=250k vout=5 vin=12 vref=1.2 ri=0.1 dmax=0.45",
+    )
+    net_fly = _emit(fly)
+    _setup()
+    fwd = _cmc_part(
+        ref="U1", Sim_Device="CMCONTROLLER",
+        Sim_Params="topology=forward fsw=250k vout=5 vin=12 vref=1.2 ri=0.1 dmax=0.45",
+    )
+    net_fwd = _emit(fwd)
+    # with the SAME dmax the switch-stage + sense lines are identical
+    for tok in ("SU1_ls SW U1_swlo U1_gate 0 SWMU1",
+                "VU1_isns U1_swlo 0 0",
+                ".model SWMU1 SW(Ron=0.1 Roff=1e6 Vt=2.5 Vh=0.2)"):
+        assert tok in net_fly and tok in net_fwd, (tok, net_fwd)
+    assert "DU1_rect" not in net_fwd and "DU1_fw" not in net_fwd, net_fwd
+
+
+@requires_sim
 def test_sepic_cuk_current_limit_reads_main_switch_current():
     """VSENSE_MAX still works on the non-buck topologies: the cycle-by-cycle limit
     reads the same V{ref}_isns (the main switch on-time current), OR'd into the reset,
