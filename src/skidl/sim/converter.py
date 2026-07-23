@@ -3080,6 +3080,15 @@ class SpiceConverter:
     # user's real external VC network, so this pin must be resolvable by name.
     _SWITCH_VC_NAMES = {"VC", "COMP", "ITH", "COMPENSATION"}
 
+    # CMCONTROLLER topology generalization (Stage 29.4): the switch stages the
+    # closed-loop controller can emit around its topology-agnostic core, which of
+    # them invert the output (needing the dual-reference / flipped error-amp sense),
+    # and which need a node-B (SWB, the coupling-cap junction) terminal in addition
+    # to the six buck terminals. buck landed in 29.1; the rest are 29.4.
+    _CMC_TOPOLOGIES = frozenset({"buck", "boost", "sepic", "cuk", "flyback"})
+    _CMC_INVERTING = frozenset({"cuk"})
+    _CMC_NEEDS_SWB = frozenset({"sepic", "cuk"})
+
     def _multiswitch_terminals(self, component, kind):
         """Resolve the terminals a multi-switch converter ``kind`` needs, by name.
 
@@ -3327,17 +3336,20 @@ class SpiceConverter:
         The behavioral closed-loop controller (Stage 29.1) emits its own switch stage
         between VIN and SW and closes the loop through the user's real divider
         (VOUT->FB->GND) and VC compensation network, so all six terminals must be
-        real pins. Returns ``{"vin","sw","vout","fb","vc","gnd"}`` or None when any is
-        missing (or no live pin map is available), so the handler logs an actionable
-        skip. FB accepts the usual divider-tap names plus ``FBX`` (the LT3757
-        dual-reference feedback), same as the averaged current-mode resolver. First
-        connected match per role wins.
+        real pins. Returns ``{"vin","sw","vout","fb","vc","gnd","swb"}`` or None when
+        any of the six required terminals is missing (or no live pin map is
+        available), so the handler logs an actionable skip. ``swb`` is the optional
+        second switch node (node B, the coupling-cap junction) the SEPIC/Ćuk
+        topologies need (Stage 29.4); it is None for buck/boost/flyback. FB accepts
+        the usual divider-tap names plus ``FBX`` (the LT3757 dual-reference feedback),
+        same as the averaged current-mode resolver. First connected match per role
+        wins.
         """
         pin_map = getattr(component, "_pins", None)
         if not isinstance(pin_map, dict):
             return None
         fb_names = self._SWITCH_FB_NAMES | {"FBX"}
-        vin = sw = vout = fb = vc = gnd = None
+        vin = sw = swb = vout = fb = vc = gnd = None
         for pin in pin_map.values():
             net = getattr(pin, "net", None)
             if net is None:
@@ -3346,6 +3358,8 @@ class SpiceConverter:
             node = self.node_map.get(net.name, net.name)
             if sw is None and name in self._SWITCH_SW_NAMES:
                 sw = node
+            elif swb is None and name in self._SWITCH_SW2_NAMES:
+                swb = node
             elif vin is None and name in self._SWITCH_VIN_NAMES:
                 vin = node
             elif vout is None and name in self._SWITCH_VOUT_NAMES:
@@ -3358,7 +3372,10 @@ class SpiceConverter:
                 gnd = node
         if None in (vin, sw, vout, fb, vc, gnd):
             return None
-        return {"vin": vin, "sw": sw, "vout": vout, "fb": fb, "vc": vc, "gnd": gnd}
+        return {
+            "vin": vin, "sw": sw, "vout": vout, "fb": fb, "vc": vc, "gnd": gnd,
+            "swb": swb,
+        }
 
     def _cmcontroller_params(self, component) -> Optional[dict]:
         """Params for the behavioral closed-loop CMCONTROLLER (Stage 29.1), or None.
@@ -3398,7 +3415,11 @@ class SpiceConverter:
                      from 0 to VREF over TSS, so the rail rises monotonically and the
                      startup inrush stays bounded -- the Stage 29.3 soft-start. Also
                      eases the UIC ``.tran`` op point;
-          * ``TOPOLOGY``  the switch stage to emit (Stage 29.1: ``buck`` only).
+          * ``TOPOLOGY``  the switch stage to emit (default ``buck``). Stage 29.4
+                     generalizes the core to ``boost`` / ``sepic`` / ``cuk`` /
+                     ``flyback``; ``cuk`` is inverting (negative output, negative
+                     VREF), and ``sepic`` / ``cuk`` need a second switch node (``SWB``
+                     / node B, the coupling-cap junction).
 
         Supervisory features (Stage 29.3) -- each behind its own param, ABSENT = the
         feature is off and the emission stays byte-identical to 29.1/29.2:
@@ -3918,7 +3939,21 @@ class SpiceConverter:
             SR latch     switch-held memory cap; set=clk, RESET-DOMINANT (set is
                          gated off while resetting) so the comparator/current-limit
                          always wins; B_gate = latched Q [AND UVLO run]
-            switch stage S_hs (VIN->SW, latch-gated) + freewheel diode GND->SW
+            switch stage TOPOLOGY-specific, latch-gated (Stage 29.4): buck = HS switch
+                         VIN->SW + freewheel GND->SW; boost = LS switch SW->GND +
+                         rectifier SW->VOUT; sepic = main A->GND + rectifier B->VOUT;
+                         cuk = main A->GND + rectifier B->GND (negative VOUT behind L2);
+                         flyback = primary switch SW->GND (user's transformer/rectifier).
+                         Every topology senses the MAIN switch on-time current.
+
+        Topology generalization (Stage 29.4): the core above is topology-agnostic; only
+        the switch stage and a sign detail change. Boost/SEPIC/flyback are non-inverting
+        (positive VREF); the **Ćuk is inverting** (negative output), so its error amp
+        senses ``(FB - VREF)`` with a negative VREF -- the LT3757 FBX negative-output
+        amplifier -- to keep the loop negative-feedback. SEPIC/Ćuk additionally need the
+        node-B (SWB) coupling-cap-junction terminal. The switch stages are emitted
+        directly here (not via the open-loop ``_emit_*_switches``) so those macromodels
+        stay byte-identical.
 
         Supervisory features (Stage 29.3, each behind a param, absent = off + emission
         byte-identical to 29.1/29.2): TSS soft-start (a monotone reference ramp bounding
@@ -3928,9 +3963,10 @@ class SpiceConverter:
         under-voltage lockout with hysteresis. Load-transient recovery needs no extra
         modeling -- it is the closed loop's own response to a load step.
 
-        Negative feedback (buck): VOUT up -> V(FB) up -> (VREF-FB) down -> less
+        Negative feedback (non-inverting): VOUT up -> V(FB) up -> (VREF-FB) down -> less
         current into VC -> VC down -> the peak-current command drops -> the switch
-        turns off earlier -> VOUT down. The peak comparator + max-duty bound the
+        turns off earlier -> VOUT down (the inverting Ćuk flips the sense so |VOUT| up ->
+        VC down). The peak comparator + max-duty bound the
         per-cycle current, so inrush is limited even without soft-start; a nonzero
         ``TSS`` ramps VREF from 0 to ease startup convergence (the full soft-start is
         Stage 29.3). All memory caps carry ``IC=0``: the closed-loop ``.tran`` must
@@ -3942,7 +3978,8 @@ class SpiceConverter:
         CCM; no thermal / gate-charge / protection corner cases beyond the
         parameterized ones. GM/RI/MCSLOPE are datasheet-anchored design inputs.
         Emits nothing and warns (honest skip) when the terminals or required params
-        (VREF/FSW) do not resolve, or the topology is not yet wired (29.1: buck only).
+        (VREF/FSW, and SWB for sepic/cuk) do not resolve, or the topology is not one of
+        buck/boost/sepic/cuk/flyback.
         """
         term = self._cmcontroller_terminals(component)
         if term is None:
@@ -3960,11 +3997,20 @@ class SpiceConverter:
             )
             return
         topology = cp["TOPOLOGY"]
-        if topology != "buck":
+        if topology not in self._CMC_TOPOLOGIES:
             logger.warning(
-                f"CMCONTROLLER {ref}: topology={topology} is not wired in Stage 29.1 "
-                f"(buck only); the boost/SEPIC/Ćuk/flyback stages are Stage 29.4 - "
-                f"skipping"
+                f"CMCONTROLLER {ref}: topology={topology} is not a supported topology "
+                f"(buck/boost/sepic/cuk/flyback) - skipping"
+            )
+            return
+        # SEPIC/Ćuk close through a second switch node (node B, the coupling-cap
+        # junction) the six buck terminals cannot express; require it for those.
+        swb = str(term["swb"]) if term["swb"] is not None else None
+        if topology in self._CMC_NEEDS_SWB and swb is None:
+            logger.warning(
+                f"CMCONTROLLER {ref}: topology={topology} needs a connected SWB / "
+                f"node-B pin (the coupling-cap junction, between the main switch and "
+                f"the rectifier) - skipping"
             )
             return
 
@@ -3972,9 +4018,13 @@ class SpiceConverter:
             str(term["vin"]), str(term["sw"]), str(term["vout"]),
             str(term["fb"]), str(term["vc"]), str(term["gnd"]),
         )
-        # Any other pins (SS/RT/EN/SYNC/INTVCC...) get a 1G DC path; 29.1 models only
-        # the six resolved terminals (VIN is a driven rail, a stub on it is harmless).
-        self._stub_unmodeled_pins(component, ref, {vin, sw, vout, fb, vc, gnd}, gnd)
+        # Any other pins (SS/RT/EN/SYNC/INTVCC...) get a 1G DC path; the controller
+        # models only its resolved terminals (VIN is a driven rail, a stub on it is
+        # harmless). SEPIC/Ćuk additionally own node B, so keep it out of the stub set.
+        modeled = {vin, sw, vout, fb, vc, gnd}
+        if swb is not None:
+            modeled.add(swb)
+        self._stub_unmodeled_pins(component, ref, modeled, gnd)
 
         n = self._fmt_num
         vref, gm, rea, ri, mcslope, ron, dmax, tss = (
@@ -4005,6 +4055,13 @@ class SpiceConverter:
         hi, sg, qm, gate, swhi = (
             f"{ref}_hi", f"{ref}_sg", f"{ref}_qm", f"{ref}_gate", f"{ref}_swhi",
         )
+        swlo = f"{ref}_swlo"        # low-side switch-branch sense node (non-buck)
+        # Inverting topologies (Ćuk) drive a NEGATIVE output, so the loop sign is
+        # flipped: |VOUT| rises with duty, and a plain VOUT->FB divider makes FB track
+        # VOUT. Negative feedback then needs the error amp to sense (FB - VREF) rather
+        # than (VREF - FB) -- exactly the LT3757 FBX picking its negative-output
+        # amplifier. VREF is negative here, FB is negative, and the loop stays stable.
+        inverting = topology in self._CMC_INVERTING
 
         # Soft reference: a nonzero TSS ramps V(vref) from 0 -> VREF over TSS so the
         # loop starts gently (helps the UIC .tran converge); TSS=0 uses a hard literal.
@@ -4018,6 +4075,14 @@ class SpiceConverter:
             vref_expr = f"V({vrefn})"
         else:
             vref_expr = n(vref)
+
+        # Error-amp difference term: (VREF - FB) for non-inverting topologies, flipped
+        # to (FB - VREF) for the inverting Ćuk so the loop is negative-feedback (see the
+        # `inverting` note above). Buck/boost/SEPIC/flyback all keep the 29.1 form, so
+        # the buck emission stays byte-identical.
+        ea_diff = (
+            f"V({fb}) - {vref_expr}" if inverting else f"{vref_expr} - V({fb})"
+        )
 
         # Frequency foldback (Stage 29.3): a slower folded clock at FSW*FOLD_RATIO is
         # SELECTED to set the latch while V(FB) is far below target (two-state, not a
@@ -4070,6 +4135,71 @@ class SpiceConverter:
             ]
             gate_expr = f"V({qm}) > 2.5 ? (V({run}) > 2.5 ? 5 : 0) : 0"
 
+        # ---- topology-specific switch stage + current-sense point (Stage 29.4) ----
+        # The controller core (oscillator, error amp, comparator, latch, gate) is
+        # topology-agnostic; only the switch stage it emits and where the 0 V current
+        # sense sits change. Every topology senses the MAIN switch's on-time current
+        # (a rising ramp) through V{ref}_isns, so peak current mode and the VSENSE_MAX
+        # cycle-by-cycle current limit (which reads I(V{ref}_isns)) work unchanged.
+        # These stages are emitted directly here (rather than reusing the open-loop
+        # _emit_*_switches, which drive their own PULSE gates and add a sync rectifier)
+        # so the open-loop macromodels stay byte-identical -- the plan's low-risk path.
+        swm_model = f".model SWM{ref} SW(Ron={ron} Roff=1e6 Vt=2.5 Vh=0.2)"
+        dfw_model = f".model DFW{ref} D(IS=1e-9 N=1.05 CJO=100p)"
+        if topology == "buck":
+            # HS switch VIN->SW (sense between switch and the user's inductor SW->VOUT)
+            # + freewheel diode GND->SW. Byte-identical to the 29.1/29.2/29.3 buck.
+            isns_line = f"V{ref}_isns {swhi} {sw} 0"
+            switch_stage = [
+                f"S{ref}_hs {vin} {swhi} {gate} {gnd} SWM{ref}",
+                swm_model,
+                f"D{ref}_fw {gnd} {sw} DFW{ref}",
+                dfw_model,
+            ]
+        elif topology == "boost":
+            # User's inductor VIN->SW; LS switch SW->GND (sense in the switch branch)
+            # + rectifier SW->VOUT. On-time: iL ramps up through the closed LS switch.
+            isns_line = f"V{ref}_isns {swlo} {gnd} 0"
+            switch_stage = [
+                f"S{ref}_ls {sw} {swlo} {gate} {gnd} SWM{ref}",
+                swm_model,
+                f"D{ref}_rect {sw} {vout} DFW{ref}",
+                dfw_model,
+            ]
+        elif topology == "sepic":
+            # User's L1 VIN->SW(A), Cs SW->SWB(B), L2 SWB->GND. Main switch A->GND
+            # (sense) + main freewheel GND->A + rectifier B->VOUT (the load-bearing
+            # anode-at-B SEPIC orientation; Stage 27.4/28.C). Non-inverting.
+            isns_line = f"V{ref}_isns {swlo} {gnd} 0"
+            switch_stage = [
+                f"S{ref}_main {sw} {swlo} {gate} {gnd} SWM{ref}",
+                swm_model,
+                f"D{ref}_mfw {gnd} {sw} DFW{ref}",
+                f"D{ref}_rect {swb} {vout} DFW{ref}",
+                dfw_model,
+            ]
+        elif topology == "cuk":
+            # User's L1 VIN->SW(A), Cs SW->SWB(B), L2 SWB->VOUT (the NEGATIVE rail).
+            # Main switch A->GND (sense) + main freewheel GND->A + rectifier B->GND
+            # (anode at B -- load-bearing: B swings to -(Vin+|Vout|), a reversed
+            # GND->B would clamp it and collapse the inversion; Stage 28.C). Inverting.
+            isns_line = f"V{ref}_isns {swlo} {gnd} 0"
+            switch_stage = [
+                f"S{ref}_main {sw} {swlo} {gate} {gnd} SWM{ref}",
+                swm_model,
+                f"D{ref}_mfw {gnd} {sw} DFW{ref}",
+                f"D{ref}_rect {swb} {gnd} DFW{ref}",
+                dfw_model,
+            ]
+        else:  # flyback (CCM): primary switch SW->GND; the user's transformer +
+            # secondary rectifier + output cap form the isolated output stage, so no
+            # rectifier is emitted here. Sense = primary switch on-time current.
+            isns_line = f"V{ref}_isns {swlo} {gnd} 0"
+            switch_stage = [
+                f"S{ref}_ls {sw} {swlo} {gate} {gnd} SWM{ref}",
+                swm_model,
+            ]
+
         lines = pre + fold + [
             # ---- oscillator: SET clock + slope-comp ramp + max-duty force-off ----
             f"V{ref}_clk {clk} {gnd} PULSE(0 5 0 {tr:g} {tr:g} {thi:g} {per:g})",
@@ -4081,7 +4211,7 @@ class SpiceConverter:
             #      source/sink-limited (min/max on the CURRENT -- slew-limits VC
             #      without floating the node) with soft VHIGH/VLOW output-swing
             #      clamps (Basso Fig. 4; Stage 29.2). REA keeps the DC path. ----
-            f"B{ref}_ea {gnd} {vc} I = min(max({gm}*({vref_expr} - V({fb})), "
+            f"B{ref}_ea {gnd} {vc} I = min(max({gm}*({ea_diff}), "
             f"{isink}), {isource})",
             f"R{ref}_ea {vc} {gnd} {rea}",
             f"V{ref}_vh {ref}_vh {gnd} {vhigh}",
@@ -4090,7 +4220,7 @@ class SpiceConverter:
             f"D{ref}_lo {ref}_vl {vc} DCL{ref}",
             f".model DCL{ref} D(RS=10 N=0.01)",
             # ---- current sense (0 V in the switch branch) + slope-comp signal ----
-            f"V{ref}_isns {swhi} {sw} 0",
+            isns_line,
             f"B{ref}_isig {isig} {gnd} V = {ri}*I(V{ref}_isns) + "
             f"{mcslope}*V({ramp})",
             # ---- reset = current comparator OR max-duty [OR current limit],
@@ -4109,12 +4239,8 @@ class SpiceConverter:
         ] + uvlo + [
             # ---- gate = latched Q [AND the UVLO run signal] ----
             f"B{ref}_gate {gate} {gnd} V = {gate_expr}",
-            # ---- buck switch stage gated by the latch (HS switch + freewheel) ----
-            f"S{ref}_hs {vin} {swhi} {gate} {gnd} SWM{ref}",
-            f".model SWM{ref} SW(Ron={ron} Roff=1e6 Vt=2.5 Vh=0.2)",
-            f"D{ref}_fw {gnd} {sw} DFW{ref}",
-            f".model DFW{ref} D(IS=1e-9 N=1.05 CJO=100p)",
-        ]
+            # ---- topology-specific switch stage gated by the latch (built above) ----
+        ] + switch_stage
         self.spice_circuit.raw_spice += "\n" + "\n".join(lines)
         # Note any active NEW supervisory features (Stage 29.3) in the provenance so
         # the netlist records which nonlinear protections the model is emulating. TSS
@@ -6313,18 +6439,18 @@ class SpiceConverter:
                     f'Sim.Params="fsw=500k d=0.5" (or a VOUT+VIN target)'
                 )
 
-        # 4c-cmc. Behavioral closed-loop peak-current-mode controller (Stage 29.1):
-        #         all six terminals (VIN/SW/VOUT/FB/VC/GND) + VREF/FSW; buck only.
+        # 4c-cmc. Behavioral closed-loop peak-current-mode controller (Stage 29.1/29.4):
+        #         all six terminals (VIN/SW/VOUT/FB/VC/GND) + VREF/FSW; topology one of
+        #         buck/boost/sepic/cuk/flyback (sepic/cuk also need the SWB node-B pin).
         for component in self._iter_components():
             if self._sim_excluded(component):
                 continue
             if self._kind(component) != "cmcontroller":
                 continue
             ref = self._attr(component, "ref", None) or "?"
-            if (
-                getattr(component, "_pins", None) is not None
-                and self._cmcontroller_terminals(component) is None
-            ):
+            has_pins = getattr(component, "_pins", None) is not None
+            term = self._cmcontroller_terminals(component) if has_pins else None
+            if has_pins and term is None:
                 problems.append(
                     f"{ref}: CMCONTROLLER needs connected VIN, SW, VOUT, FB, VC "
                     f"(compensation) and GND pins (resolved by pin name)"
@@ -6336,10 +6462,19 @@ class SpiceConverter:
                     f'FSW, e.g. Sim.Params="topology=buck fsw=500k vout=3.3 vin=12 '
                     f'vref=0.8"'
                 )
-            elif cp["TOPOLOGY"] != "buck":
+            elif cp["TOPOLOGY"] not in self._CMC_TOPOLOGIES:
                 problems.append(
-                    f"{ref}: CMCONTROLLER topology={cp['TOPOLOGY']} is not wired in "
-                    f"Stage 29.1 (buck only; boost/SEPIC/Ćuk/flyback are Stage 29.4)"
+                    f"{ref}: CMCONTROLLER topology={cp['TOPOLOGY']} is not a supported "
+                    f"topology (buck/boost/sepic/cuk/flyback)"
+                )
+            elif (
+                cp["TOPOLOGY"] in self._CMC_NEEDS_SWB
+                and term is not None
+                and term["swb"] is None
+            ):
+                problems.append(
+                    f"{ref}: CMCONTROLLER topology={cp['TOPOLOGY']} needs a connected "
+                    f"SWB / node-B pin (the coupling-cap junction)"
                 )
 
         # 4d. Transformers: all four winding ends connected + resolvable params.

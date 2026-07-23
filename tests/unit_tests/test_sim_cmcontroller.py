@@ -387,6 +387,167 @@ def test_supervisory_features_recorded_in_provenance():
     assert conv2.model_provenance["U2"].name == "buck_cmcontroller(vref=0.8, fsw=500k)"
 
 
+# --- topology generalization (Stage 29.4) --------------------------------- #
+
+
+# A SEPIC/Ćuk stand-in adds the SWB (node-B, coupling-cap junction) pin the two
+# coupling-cap topologies need on top of the six buck terminals.
+def _cmc_part_swb(ref="U1", **fields):
+    pins = [
+        Pin(num=1, name="VIN", func=pin_types.PWRIN),
+        Pin(num=2, name="SW", func=pin_types.PASSIVE),
+        Pin(num=3, name="SWB", func=pin_types.PASSIVE),
+        Pin(num=4, name="VOUT", func=pin_types.PWROUT),
+        Pin(num=5, name="FB", func=pin_types.PASSIVE),
+        Pin(num=6, name="VC", func=pin_types.PASSIVE),
+        Pin(num=7, name="GND", func=pin_types.PWRIN),
+    ]
+    u = Part(tool=SKIDL, name="CMCONTROLLER", ref_prefix="U", ref=ref, pins=pins)
+    for k, v in fields.items():
+        setattr(u, k, v)
+    return u
+
+
+def _wire_swb(u):
+    for name in ("VIN", "SW", "SWB", "VOUT", "FB", "VC", "GND"):
+        Net(name).connect(u[name])
+
+
+def _emit_swb(u):
+    _wire_swb(u)
+    return str(SpiceConverter(_view()).convert(strict=False))
+
+
+@requires_sim
+def test_boost_emits_lowside_switch_and_rectifier():
+    """A boost CMCONTROLLER reuses the whole core but emits a LOW-side switch
+    (SW->GND, latch-gated, sensed in the switch branch) plus a rectifier SW->VOUT --
+    not the buck's high-side switch + freewheel. The error amp keeps the non-inverting
+    (VREF - FB) sense, and the current sense reads the switch on-time current."""
+    _setup()
+    u = _cmc_part(
+        Sim_Device="CMCONTROLLER",
+        Sim_Params="topology=boost fsw=500k vout=12 vin=5 vref=1.2 ri=0.1",
+    )
+    net = _emit(u)
+    # non-inverting error amp, sense in the low-side branch
+    assert "BU1_ea 0 VC I = min(max(0.00025*(1.2 - V(FB)), -0.001), 0.001)" in net, net
+    assert "VU1_isns U1_swlo 0 0" in net, net
+    assert "BU1_isig U1_isig 0 V = 0.1*I(VU1_isns) + 0.1*V(U1_ramp)" in net, net
+    # low-side switch + rectifier to VOUT; NO buck high-side switch / freewheel
+    assert "SU1_ls SW U1_swlo U1_gate 0 SWMU1" in net, net
+    assert ".model SWMU1 SW(Ron=0.1 Roff=1e6 Vt=2.5 Vh=0.2)" in net, net
+    assert "DU1_rect SW VOUT DFWU1" in net, net
+    assert "SU1_hs" not in net and "DU1_fw" not in net, net
+    assert conv_name(u) == "boost_cmcontroller(vref=1.2, fsw=500k)"
+
+
+@requires_sim
+def test_sepic_emits_main_switch_and_rectifier_to_vout():
+    """A SEPIC CMCONTROLLER emits the main switch A(SW)->GND (sensed) with a freewheel
+    GND->SW and a rectifier from node B (SWB) to VOUT -- the load-bearing anode-at-B
+    orientation. Non-inverting. Needs the SWB pin."""
+    _setup()
+    u = _cmc_part_swb(
+        Sim_Device="CMCONTROLLER",
+        Sim_Params="topology=sepic fsw=500k vout=12 vin=12 vref=1.2 ri=0.1",
+    )
+    net = _emit_swb(u)
+    assert "BU1_ea 0 VC I = min(max(0.00025*(1.2 - V(FB)), -0.001), 0.001)" in net, net
+    assert "VU1_isns U1_swlo 0 0" in net, net
+    assert "SU1_main SW U1_swlo U1_gate 0 SWMU1" in net, net
+    assert "DU1_mfw 0 SW DFWU1" in net, net
+    assert "DU1_rect SWB VOUT DFWU1" in net, net
+
+
+@requires_sim
+def test_cuk_emits_inverted_error_amp_and_rectifier_to_gnd():
+    """The inverting Ćuk flips the error-amp sense to (FB - VREF) (with a negative VREF)
+    so the loop stays negative-feedback on the negative output, and its rectifier ties
+    node B (SWB) to GND (anode at B) -- the output is the negative rail behind the
+    user's L2 (SWB->VOUT). Needs the SWB pin."""
+    _setup()
+    u = _cmc_part_swb(
+        Sim_Device="CMCONTROLLER",
+        Sim_Params="topology=cuk fsw=500k vout=-5 vin=12 vref=-0.8 ri=0.1",
+    )
+    net = _emit_swb(u)
+    # inverted sense: (FB - VREF), VREF negative
+    assert "BU1_ea 0 VC I = min(max(0.00025*(V(FB) - -0.8), -0.001), 0.001)" in net, net
+    assert "SU1_main SW U1_swlo U1_gate 0 SWMU1" in net, net
+    assert "DU1_mfw 0 SW DFWU1" in net, net
+    assert "DU1_rect SWB 0 DFWU1" in net, net
+    assert conv_name(u) == "cuk_cmcontroller(vref=-0.8, fsw=500k)"
+
+
+@requires_sim
+def test_flyback_emits_primary_switch_only():
+    """A flyback CMCONTROLLER emits only the primary LS switch SW->GND (sensed); the
+    user's transformer + secondary rectifier + output cap form the isolated output, so
+    no rectifier is emitted. Non-inverting, no SWB needed."""
+    _setup()
+    u = _cmc_part(
+        Sim_Device="CMCONTROLLER",
+        Sim_Params="topology=flyback fsw=250k vout=12 vin=24 vref=1.2 ri=0.2",
+    )
+    net = _emit(u)
+    assert "SU1_ls SW U1_swlo U1_gate 0 SWMU1" in net, net
+    assert "VU1_isns U1_swlo 0 0" in net, net
+    assert "DU1_rect" not in net and "DU1_fw" not in net, net
+
+
+@requires_sim
+def test_sepic_cuk_current_limit_reads_main_switch_current():
+    """VSENSE_MAX still works on the non-buck topologies: the cycle-by-cycle limit
+    reads the same V{ref}_isns (the main switch on-time current), OR'd into the reset,
+    for boost/sepic/cuk exactly as for buck."""
+    _setup()
+    u = _cmc_part_swb(
+        Sim_Device="CMCONTROLLER",
+        Sim_Params="topology=cuk fsw=500k vout=-5 vin=12 vref=-0.8 ri=0.1 "
+        "vsense_max=0.3",
+    )
+    net = _emit_swb(u)
+    assert "0.1*I(VU1_isns) > 0.3 ? 5 : 0" in net, net
+
+
+@requires_sim
+def test_sepic_without_swb_skips_with_warning(caplog):
+    """SEPIC/Ćuk need the node-B (SWB) coupling-cap-junction pin; without it the
+    emitter warns and emits nothing (honest skip), and validate() flags it."""
+    import logging
+
+    _setup()
+    # a plain 6-pin part (no SWB) asked to be a sepic
+    u = _cmc_part(
+        Sim_Device="CMCONTROLLER",
+        Sim_Params="topology=sepic fsw=500k vout=12 vin=12 vref=1.2 ri=0.1",
+    )
+    with caplog.at_level(logging.WARNING):
+        net = _emit(u)
+    assert "SU1_main" not in net and "BU1_gate" not in net, net
+    assert any("needs a connected SWB" in r.message for r in caplog.records)
+
+    _setup()
+    u2 = _cmc_part(
+        ref="U2",
+        Sim_Device="CMCONTROLLER",
+        Sim_Params="topology=sepic fsw=500k vout=12 vin=12 vref=1.2 ri=0.1",
+    )
+    _wire(u2)
+    with pytest.raises(SimulationValidationError) as ei:
+        SpiceConverter(_view()).convert(strict=True)
+    assert any("needs a connected SWB" in p for p in ei.value.problems), (
+        ei.value.problems
+    )
+
+
+def conv_name(u):
+    conv = SpiceConverter(_view())
+    conv.convert(strict=False)
+    return conv.model_provenance[u.ref].name
+
+
 # --- validation ----------------------------------------------------------- #
 
 
@@ -437,31 +598,31 @@ def test_missing_fb_skips_with_warning(caplog):
 
 
 @requires_sim
-def test_nonbuck_topology_skips_with_warning(caplog):
-    """A topology other than buck is not wired in 29.1 (boost/SEPIC/Ćuk/flyback are
-    Stage 29.4): the emitter warns and emits nothing, and validate() flags it."""
+def test_unknown_topology_skips_with_warning(caplog):
+    """An unrecognised topology (not buck/boost/sepic/cuk/flyback) is a config error:
+    the emitter warns and emits nothing, and validate() flags it."""
     import logging
 
     _setup()
     u = _cmc_part(
         Sim_Device="CMCONTROLLER",
-        Sim_Params="topology=boost fsw=500k vref=1.6 ri=0.1",
+        Sim_Params="topology=zeta fsw=500k vref=1.6 ri=0.1",
     )
     with caplog.at_level(logging.WARNING):
         net = _emit(u)
     assert "SU1_hs" not in net and "BU1_gate" not in net, net
-    assert any("topology=boost is not wired" in r.message for r in caplog.records)
+    assert any("is not a supported topology" in r.message for r in caplog.records)
 
     _setup()
     u2 = _cmc_part(
         ref="U2",
         Sim_Device="CMCONTROLLER",
-        Sim_Params="topology=boost fsw=500k vref=1.6 ri=0.1",
+        Sim_Params="topology=zeta fsw=500k vref=1.6 ri=0.1",
     )
     _wire(u2)
     with pytest.raises(SimulationValidationError) as ei:
         SpiceConverter(_view()).convert(strict=True)
-    assert any("topology=boost is not wired" in p for p in ei.value.problems), (
+    assert any("is not a supported topology" in p for p in ei.value.problems), (
         ei.value.problems
     )
 
@@ -775,3 +936,123 @@ def test_frequency_foldback_slows_switching_under_low_fb():
     # the switching rate is the folded rate, clearly below the nominal FSW
     assert abs(fsw_meas - folded) / folded <= 0.35, ("not folded", fsw_meas)
     assert fsw_meas < 0.5 * 500e3, ("rate not reduced", fsw_meas)
+
+
+# --- live topology generalization (Stage 29.4, gated) --------------------- #
+
+
+@requires_sim
+def test_cmcontroller_boost_regulates_closed_loop():
+    """Live closed-loop .tran: the CMCONTROLLER BOOST steps 5 V -> 12 V and regulates
+    to VREF*(Rtop+Rbot)/Rbot with the same core as the buck (only the switch stage is
+    a low-side switch + rectifier). The rectifier pre-charges VOUT to ~VIN and the loop
+    boosts it to target; the compensation crosses over below the RHP zero."""
+    import numpy as np
+
+    _setup()
+    u = _cmc_part(
+        Sim_Device="CMCONTROLLER",
+        Sim_Params="topology=boost fsw=500k vout=12 vin=5 vref=1.2 ri=0.1 "
+        "mcslope=0.1 tss=100u",
+    )
+    v1 = Part("Simulation_SPICE", "VDC", value="5", ref="V1")
+    L1 = Part("Device", "L", value="10u", ref="L1")
+    Co = Part("Device", "C", value="100u", ref="C1")
+    Rl = Part("Device", "R", value="24", ref="RL")     # ~0.5 A at 12 V
+    Rt = Part("Device", "R", value="90k", ref="RT")
+    Rb = Part("Device", "R", value="10k", ref="RB")
+    Rc = Part("Device", "R", value="10k", ref="RC")
+    Cc = Part("Device", "C", value="22n", ref="CC")
+
+    vin, sw, vout, vc, ncc = (Net(nm) for nm in ("VIN", "SW", "VOUT", "VC", "NCC"))
+    fb, gnd = Net("FB"), Net("GND")
+    vin.connect(v1[1], u["VIN"], L1[1])        # boost: user's inductor VIN->SW
+    gnd.connect(v1[2], u["GND"], Co[2], Rl[2], Rb[2], Cc[2])
+    sw.connect(u["SW"], L1[2])
+    vout.connect(u["VOUT"], Co[1], Rl[1], Rt[1])
+    fb.connect(Rt[2], Rb[1], u["FB"])
+    vc.connect(u["VC"], Rc[1])
+    ncc.connect(Rc[2], Cc[1])
+
+    from skidl.sim import simulate
+
+    per = 1.0 / 500e3
+    try:
+        res = simulate().transient_analysis(
+            step_time=per / 100, end_time=700e-6, max_time=per / 50, stiff=True,
+            use_initial_condition=True, initial_conditions={"VOUT": 0},
+        )
+    except Exception as e:  # noqa: BLE001
+        pytest.skip(f"ngspice not available: {type(e).__name__}: {str(e)[:80]}")
+
+    t = np.asarray(res.analysis.time, dtype=float)
+    vo = np.asarray(res.analysis["VOUT"], dtype=float)
+    target = 1.2 * (90.0 + 10.0) / 10.0        # 12 V
+    assert np.isfinite(vo).all(), "non-finite VOUT (diverged)"
+    vreg = float(vo[t > (t[-1] - 60e-6)].mean())
+    assert abs(vreg - target) / target <= 0.08, (vreg, target)
+    g = np.asarray(res.analysis["U1_gate"], dtype=float)
+    rises = int(np.sum((g[:-1] < 2.5) & (g[1:] >= 2.5)))
+    assert rises > 50, ("gate not switching", rises)
+
+
+@requires_sim
+def test_cmcontroller_cuk_regulates_negative_rail():
+    """Live closed-loop .tran: the inverting Ćuk CMCONTROLLER regulates a NEGATIVE rail
+    (12 V -> -5 V). This is the true negative-OUTPUT inverting-FBX converter deferred
+    from Stage 29.2: VOUT itself is negative, VREF is negative (-0.8 V), the error amp
+    senses (FB - VREF), and the simple VOUT->FB->GND divider makes FB negative. The
+    rectifier ties node B to GND; the output is behind the user's L2."""
+    import numpy as np
+
+    _setup()
+    u = _cmc_part_swb(
+        Sim_Device="CMCONTROLLER",
+        Sim_Params="topology=cuk fsw=500k vout=-5 vin=12 vref=-0.8 ri=0.1 "
+        "mcslope=0.15 tss=120u",
+    )
+    v1 = Part("Simulation_SPICE", "VDC", value="12", ref="V1")
+    L1 = Part("Device", "L", value="22u", ref="L1")   # VIN->SW (node A)
+    Cs = Part("Device", "C", value="1u", ref="CS")    # coupling cap SW->SWB
+    L2 = Part("Device", "L", value="22u", ref="L2")   # SWB->VOUT (negative rail)
+    Co = Part("Device", "C", value="22u", ref="C1")
+    Rl = Part("Device", "R", value="10", ref="RL")    # ~0.5 A at -5 V
+    Rt = Part("Device", "R", value="42k", ref="RT")
+    Rb = Part("Device", "R", value="8k", ref="RB")    # tap = -5*8/50 = -0.8 V
+    Rc = Part("Device", "R", value="22k", ref="RC")
+    Cc = Part("Device", "C", value="2.2n", ref="CC")
+
+    vin, sw, swb, vout = (Net(nm) for nm in ("VIN", "SW", "SWB", "VOUT"))
+    vc, ncc, fb, gnd = (Net(nm) for nm in ("VC", "NCC", "FB", "GND"))
+    vin.connect(v1[1], u["VIN"], L1[1])
+    gnd.connect(v1[2], u["GND"], Co[2], Rl[2], Rb[2], Cc[2])
+    sw.connect(u["SW"], L1[2], Cs[1])              # node A
+    swb.connect(u["SWB"], Cs[2], L2[1])            # node B
+    vout.connect(u["VOUT"], L2[2], Co[1], Rl[1], Rt[1])
+    fb.connect(Rt[2], Rb[1], u["FB"])              # negative tap
+    vc.connect(u["VC"], Rc[1])
+    ncc.connect(Rc[2], Cc[1])
+
+    from skidl.sim import simulate
+
+    per = 1.0 / 500e3
+    try:
+        res = simulate().transient_analysis(
+            step_time=per / 100, end_time=900e-6, max_time=per / 50, stiff=True,
+            use_initial_condition=True, initial_conditions={"VOUT": 0},
+        )
+    except Exception as e:  # noqa: BLE001
+        pytest.skip(f"ngspice not available: {type(e).__name__}: {str(e)[:80]}")
+
+    t = np.asarray(res.analysis.time, dtype=float)
+    vo = np.asarray(res.analysis["VOUT"], dtype=float)
+    fbv = np.asarray(res.analysis["FB"], dtype=float)
+    assert np.isfinite(vo).all(), "non-finite VOUT (diverged)"
+    vreg = float(vo[t > (t[-1] - 80e-6)].mean())
+    fbreg = float(fbv[t > (t[-1] - 80e-6)].mean())
+    assert vreg < 0, ("output not negative", vreg)         # a real negative rail
+    assert abs(vreg - (-5.0)) / 5.0 <= 0.12, (vreg,)       # regulates near -5 V
+    assert fbreg < 0, ("FB not negative", fbreg)           # negative-ref path
+    g = np.asarray(res.analysis["U1_gate"], dtype=float)
+    rises = int(np.sum((g[:-1] < 2.5) & (g[1:] >= 2.5)))
+    assert rises > 50, ("gate not switching", rises)
