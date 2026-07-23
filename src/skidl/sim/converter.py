@@ -2906,10 +2906,48 @@ class SpiceConverter:
         halves share ``N`` unless ``N2`` is given for the second half. ``K`` is the
         coupling coefficient applied to every winding pair, default 0.999; a value
         outside (0, 1] is rejected (ngspice requires it) and reported as ``K=None``.
-        Returns ``{"LP", "secondaries": [ls, ...], "K", "center_tap"}``.
+
+        **Flyback-friendly spelling (Stage 30.1):** instead of ``LP``/``K`` a caller
+        may give ``LM`` (magnetizing inductance, primary-referred) and optional
+        ``LLK`` (primary leakage, henries; default 0 -> ideal coupling). These map to
+        the same coupled-inductor form via ``LP = Lm + Llk`` and ``K = sqrt(Lm/LP)``,
+        so leakage is a real tunable value. ``LM`` together with ``LP`` or ``K`` is
+        over-constrained and rejected (``None``). Absent ``LM`` the ``LP``/``K`` path
+        is byte-identical to before.
+
+        Returns ``{"LP", "secondaries": [ls, ...], "K", "center_tap", "RP",
+        "sec_res", "lm", "llk"}`` (``lm``/``llk`` are ``None`` unless the flyback
+        spelling drove the mapping).
         """
         raw = self._parse_sim_params(self._sim_props(component).get("params"))
-        lp = self._parse_si_number(raw["LP"]) if "LP" in raw else None
+
+        # Stage 30.1: flyback-friendly Lm/n/Llk input set. When LM (magnetizing
+        # inductance) is given, derive the primary self-inductance LP and the
+        # coupling K from the T-model -- LP = Lm + Llk, K = sqrt(Lm/LP) -- so
+        # leakage is a real tunable henries value (the drain-spike / RCD-snubber
+        # path) instead of being buried in K. Absent LM, the LP/K path below is
+        # unchanged (byte-identical emission). LM and LP/K are two spellings of the
+        # same quantity, so supplying both is over-constrained and rejected.
+        lm = self._parse_si_number(raw["LM"]) if "LM" in raw else None
+        llk = self._parse_si_number(raw["LLK"]) if "LLK" in raw else None
+        lm_used = None
+        llk_used = None
+        if lm is not None:
+            ref = self._attr(component, "ref", None) or "?"
+            if "LP" in raw or "K" in raw:
+                logger.warning(
+                    f"transformer {ref}: over-constrained -- give either "
+                    f"lm/llk (flyback style) OR lp/k (self-inductance style), not "
+                    f"both; skipping this transformer"
+                )
+                return None
+            if lm <= 0 or (llk is not None and llk < 0):
+                return None  # validate() names it
+            llk_used = llk if llk is not None else 0.0
+            lm_used = lm
+            lp = lm + llk_used
+        else:
+            lp = self._parse_si_number(raw["LP"]) if "LP" in raw else None
         if not lp or lp <= 0:
             return None
         shape = self._transformer_shape(component)
@@ -2955,13 +2993,19 @@ class SpiceConverter:
         # 0.0 -> byte-identical emission to the pre-DCR output.
         rp = winding_res("RP")
 
-        k = self._parse_si_number(raw["K"]) if "K" in raw else 0.999
+        if lm_used is not None:
+            # Derived from Lm/Llk: K = sqrt(Lm/LP); Llk=0 -> ideal coupling K=1.
+            k = 1.0 if llk_used <= 0 else math.sqrt(lm_used / lp)
+        else:
+            k = self._parse_si_number(raw["K"]) if "K" in raw else 0.999
         if k is None or not (0 < k <= 1):
             # bad k -> validate() names it
             return {"LP": lp, "secondaries": secondaries, "K": None,
-                    "center_tap": center_tap, "RP": rp, "sec_res": sec_res}
+                    "center_tap": center_tap, "RP": rp, "sec_res": sec_res,
+                    "lm": lm_used, "llk": llk_used}
         return {"LP": lp, "secondaries": secondaries, "K": k,
-                "center_tap": center_tap, "RP": rp, "sec_res": sec_res}
+                "center_tap": center_tap, "RP": rp, "sec_res": sec_res,
+                "lm": lm_used, "llk": llk_used}
 
     def _add_transformer(self, component, ref: str, value: str):
         """Emit a transformer as N coupled inductors + pairwise ``K`` cards.
@@ -3000,6 +3044,13 @@ class SpiceConverter:
             return
         n = self._fmt_num
         lp, k = n(params["LP"]), n(params["K"])
+        # Stage 30.1: when the flyback Lm/Llk spelling drove the mapping, record it
+        # in the provenance string so the netlist never hides that leakage was set
+        # explicitly (rather than being buried in K). Absent Lm -> byte-identical.
+        lm_p, llk_p = params.get("lm"), params.get("llk")
+        leak_prov = (
+            f", lm={n(lm_p)}, llk={n(llk_p)}" if lm_p is not None else ""
+        )
         sec_nodes = term["secondaries"]
         sec_ind = params["secondaries"]
         rp = params.get("RP", 0.0) or 0.0
@@ -3042,7 +3093,8 @@ class SpiceConverter:
             )
             self.spice_circuit.raw_spice += "\n" + "\n".join(lines)
             self.model_provenance[ref] = ResolvedModel(
-                ref, "transformer", "sim_params", f"xfmr(lp={lp}, ls={ls}, k={k})"
+                ref, "transformer", "sim_params",
+                f"xfmr(lp={lp}, ls={ls}, k={k}{leak_prov})"
             )
             logger.debug(
                 f"{ref}: transformer as coupled inductors (lp={lp}, ls={ls}, "
@@ -3068,7 +3120,7 @@ class SpiceConverter:
         shape = "center-tap" if term.get("center_tap") else f"{len(sec_nodes)}-sec"
         self.model_provenance[ref] = ResolvedModel(
             ref, "transformer", "sim_params",
-            f"xfmr_{shape}(lp={lp}, ls=[{ls_str}], k={k})",
+            f"xfmr_{shape}(lp={lp}, ls=[{ls_str}], k={k}{leak_prov})",
         )
         logger.debug(
             f"{ref}: {shape} transformer as {len(lnames)} coupled inductors "
@@ -6581,9 +6633,10 @@ class SpiceConverter:
             params = self._transformer_params(component)
             if params is None:
                 problems.append(
-                    f"{ref}: transformer needs Sim.Params with LP and a turns "
-                    f"ratio N (or LS) per winding, e.g. Sim.Params=\"lp=100u n=0.5\" "
-                    f'(two secondaries: "lp=25u n=0.5 n2=0.1")'
+                    f"{ref}: transformer needs Sim.Params with a magnetizing/primary "
+                    f"inductance and a turns ratio -- either \"lm=100u llk=2u n=0.2\" "
+                    f"(flyback style) or \"lp=100u n=0.5\" (self-inductance style; two "
+                    f'secondaries: "lp=25u n=0.5 n2=0.1"); do not give both lp and lm'
                 )
             elif params["K"] is None:
                 problems.append(f"{ref}: transformer coupling k must be in (0, 1]")

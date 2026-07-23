@@ -272,3 +272,139 @@ def test_1pss_emission_center_tap_halves():
     assert "KT1_PS1 LT1_P LT1_S1 0.999" in netlist
     assert "KT1_PS2 LT1_P LT1_S2 0.999" in netlist
     assert "KT1_S1S2 LT1_S1 LT1_S2 0.999" in netlist
+
+
+# --- Stage 30.1: Lm / n / Llk flyback-friendly parameterization -----------
+#
+# New opt-in Sim.Params keys LM (magnetizing inductance) and LLK (primary
+# leakage, henries) map internally to the existing LP/K coupled-inductor form
+# via the T-model (LP=Lm+Llk, K=sqrt(Lm/LP), LS=LP*n^2), so leakage is a real
+# tunable value. Absent LM, the LP/K path stays byte-identical.
+
+
+def _emit_conv(view):
+    """Emit and return (netlist_text, converter) so provenance is inspectable."""
+    conv = SpiceConverter(view)
+    return str(conv.convert(strict=False)), conv
+
+
+@requires_sim
+def test_transformer_lm_llk_maps_to_lp_k():
+    """lm=100u llk=2u n=0.2 -> LP=102u, K=sqrt(100/102), LS=LP*0.04."""
+    _setup()
+    t = Part("Device", "Transformer_1P_1S", ref="T1")
+    t.Sim_Params = "lm=100u llk=2u n=0.2"
+    for pin, net in (("AA", "PA"), ("AB", "PB"), ("SA", "SA_N"), ("SB", "SB_N")):
+        Net(net).connect(t[pin])
+    netlist = _emit(_view())
+    assert "LT1_P PA PB 0.000102" in netlist, netlist
+    assert "KT1 LT1_P LT1_S 0.990148" in netlist, netlist
+    assert "LT1_S SA_N SB_N 4.08e-06" in netlist, netlist
+
+
+@requires_sim
+def test_transformer_lm_no_llk_is_ideal_k1():
+    """lm=100u n=0.2 (no llk) -> ideal coupling K=1, LP=Lm, LS=LP*0.04."""
+    _setup()
+    t = Part("Device", "Transformer_1P_1S", ref="T1")
+    t.Sim_Params = "lm=100u n=0.2"
+    for pin, net in (("AA", "PA"), ("AB", "PB"), ("SA", "SA_N"), ("SB", "SB_N")):
+        Net(net).connect(t[pin])
+    netlist = _emit(_view())
+    assert "LT1_P PA PB 0.0001" in netlist, netlist
+    assert "KT1 LT1_P LT1_S 1" in netlist, netlist
+    assert "LT1_S SA_N SB_N 4e-06" in netlist, netlist
+
+
+@requires_sim
+def test_transformer_lp_path_byte_identical():
+    """The existing lp/n/k spelling emits byte-identically (hard gate)."""
+    _setup()
+    t = Part("Device", "Transformer_1P_1S", ref="T1")
+    t.Sim_Params = "lp=100u n=0.5"
+    for pin, net in (("AA", "PA"), ("AB", "PB"), ("SA", "SA_N"), ("SB", "SB_N")):
+        Net(net).connect(t[pin])
+    netlist = _emit(_view())
+    assert "LT1_P PA PB 0.0001" in netlist
+    assert "LT1_S SA_N SB_N 2.5e-05" in netlist
+    assert "KT1 LT1_P LT1_S 0.999" in netlist
+
+
+@requires_sim
+def test_transformer_over_constrained_rejected(caplog):
+    """Both lp and lm is over-constrained -> params None + a logged warning."""
+    import logging
+
+    _setup()
+    t = Part("Device", "Transformer_1P_1S", ref="T1")
+    t.Sim_Params = "lp=100u lm=98u n=0.2"
+    for pin, net in (("AA", "PA"), ("AB", "PB"), ("SA", "SA_N"), ("SB", "SB_N")):
+        Net(net).connect(t[pin])
+    conv = SpiceConverter(_view())
+    with caplog.at_level(logging.WARNING):
+        params = conv._transformer_params(_view().components["T1"])
+    assert params is None
+    assert any("over-constrained" in r.message for r in caplog.records), caplog.text
+
+
+@requires_sim
+def test_transformer_provenance_records_llk():
+    """Provenance records lm/llk iff LM drove the mapping."""
+    _setup()
+    t = Part("Device", "Transformer_1P_1S", ref="T1")
+    t.Sim_Params = "lm=100u llk=2u n=0.2"
+    for pin, net in (("AA", "PA"), ("AB", "PB"), ("SA", "SA_N"), ("SB", "SB_N")):
+        Net(net).connect(t[pin])
+    _netlist, conv = _emit_conv(_view())
+    prov = conv.model_provenance["T1"].name
+    assert "lm=" in prov and "llk=" in prov, prov
+
+
+@requires_sim
+def test_transformer_provenance_unchanged_without_lm():
+    """The lp/n/k spelling records the legacy xfmr(lp=.., ls=.., k=..) string."""
+    _setup()
+    t = Part("Device", "Transformer_1P_1S", ref="T1")
+    t.Sim_Params = "lp=100u n=0.5"
+    for pin, net in (("AA", "PA"), ("AB", "PB"), ("SA", "SA_N"), ("SB", "SB_N")):
+        Net(net).connect(t[pin])
+    _netlist, conv = _emit_conv(_view())
+    prov = conv.model_provenance["T1"].name
+    assert prov == "xfmr(lp=0.0001, ls=2.5e-05, k=0.999)", prov
+    assert "lm=" not in prov and "llk=" not in prov
+
+
+@requires_sim
+def test_transformer_llk_is_short_circuit_inductance_live():
+    """Live proof that LLK is a real element: with the secondary shorted, the
+    primary short-circuit inductance is the leakage (magnetizing is shorted out
+    by the reflected short), so a DC step ramps primary current at ~V/Llk. Recover
+    Lsc = V*t/I from the measured slope and check it matches the set LLK (10u), not
+    the magnetizing-limited LP (110u, ~11x slower)."""
+    _setup()
+    LLK = 10e-6
+    t = Part("Device", "Transformer_1P_1S", ref="T1")
+    t.Sim_Params = "lm=100u llk=10u n=1"
+    v = Part("Simulation_SPICE", "VDC", ref="V1", value="5")
+    rsc = Part("Device", "R", ref="R1", value="0.001")  # secondary short
+    p, gnd, s1 = Net("P"), Net("GND"), Net("S1")
+    p.connect(t["AA"], v[1])
+    gnd.connect(t["AB"], v[2])
+    s1.connect(t["SA"], rsc[1])
+    gnd.connect(t["SB"], rsc[2])
+    from skidl.sim import simulate
+
+    try:
+        an = simulate().transient_analysis(
+            step_time=2e-7, end_time=2e-5, max_time=2e-7,
+            use_initial_condition=True,
+        )
+    except Exception as e:
+        pytest.skip(f"ngspice not available: {type(e).__name__}: {str(e)[:80]}")
+    iv = an.get_current("V1")
+    tv = an.time_array()
+    i_end = abs(iv[-1] if hasattr(iv, "__len__") else iv)
+    t_end = float(tv[-1])
+    lsc = 5.0 * t_end / i_end  # V*t/I from the leakage-limited ramp
+    # leakage-limited, not magnetizing-limited: Lsc ~ LLK (10u), far below LP=110u
+    assert 0.5 * LLK < lsc < 2.0 * LLK, f"Lsc={lsc:g} (I={i_end:g} at t={t_end:g})"
