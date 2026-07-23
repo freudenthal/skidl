@@ -548,6 +548,80 @@ def conv_name(u):
     return conv.model_provenance[u.ref].name
 
 
+# --- chip-profile registry (Stage 29.5) ----------------------------------- #
+
+
+@requires_sim
+def test_chip_profile_fills_datasheet_params():
+    """chip=<name> fills the controller's params from the CMCONTROLLER_PROFILES table:
+    a bare ``chip=LT3757 topology=boost`` build picks up the datasheet VREF (1.6),
+    gm (250 uS), the current limit (VSENSE_MAX) and UVLO -- no other Sim.Params needed --
+    and records the chip family in the provenance name."""
+    _setup()
+    u = _cmc_part(
+        Sim_Device="CMCONTROLLER", Sim_Params="chip=LT3757 topology=boost"
+    )
+    net = _emit(u)
+    # VREF 1.6 and gm 250 uS came from the profile (nothing set them explicitly)
+    assert "BU1_ea 0 VC I = min(max(0.00025*(1.6 - V(FB)), -0.001), 0.001)" in net, net
+    # the profile's datasheet current limit + UVLO are active (VSENSE_MAX=1.0, RI=0.1)
+    assert "0.1*I(VU1_isns) > 1 ? 5 : 0" in net, net
+    assert "BU1_uvset U1_uvset 0 V = V(VIN) > 2.9 ? 5 : 0" in net, net
+    assert "BU1_uvrst U1_uvrst 0 V = V(VIN) < 2.5 ? 5 : 0" in net, net
+    # provenance records the chip family + the active protections
+    name = conv_name(u)
+    assert name.startswith("LT3757_boost_cmcontroller(vref=1.6, fsw=300k"), name
+    assert "uvlo=2.9/2.5" in name, name
+
+
+@requires_sim
+def test_explicit_param_overrides_profile():
+    """An explicit Sim.Params key always wins over the profile (design intent). Here a
+    ``chip=LT3757`` build overrides gm and vref, and the emission uses the overrides,
+    not the profile's 250 uS / 1.6 V."""
+    _setup()
+    u = _cmc_part(
+        Sim_Device="CMCONTROLLER",
+        Sim_Params="chip=LT3757 topology=boost gm=100u vref=1.2",
+    )
+    net = _emit(u)
+    # 100 uS -> 0.0001, vref 1.2 -- both the overrides, not the LT3757 profile defaults
+    assert "BU1_ea 0 VC I = min(max(0.0001*(1.2 - V(FB)), -0.001), 0.001)" in net, net
+    assert conv_name(u).startswith("LT3757_boost_cmcontroller(vref=1.2, fsw=300k"), net
+
+
+@requires_sim
+def test_unknown_chip_warns_and_falls_back(caplog):
+    """An unrecognised chip is a loud warning + fall back to the bare Sim.Params (never
+    a silent wrong emulation): with explicit VREF/FSW the controller still emits, and no
+    chip prefix goes into the provenance."""
+    import logging
+
+    _setup()
+    u = _cmc_part(
+        Sim_Device="CMCONTROLLER",
+        Sim_Params="chip=NOSUCHCHIP topology=buck fsw=500k vref=0.8 ri=0.1",
+    )
+    with caplog.at_level(logging.WARNING):
+        net = _emit(u)
+    assert "BU1_ea 0 VC I = min(max(0.00025*(0.8 - V(FB)), -0.001), 0.001)" in net, net
+    assert any("no profile in CMCONTROLLER_PROFILES" in r.message for r in caplog.records)
+    # no chip prefix on the provenance (fell back to bare params)
+    assert conv_name(u) == "buck_cmcontroller(vref=0.8, fsw=500k)", net
+
+
+@requires_sim
+def test_profile_absent_is_byte_identical():
+    """With no chip= given the resolver is inert: the emission and provenance are
+    byte-identical to a plain bare-params build (the additive-only gate for 29.5)."""
+    _setup()
+    u = _cmc_part(Sim_Device="CMCONTROLLER", Sim_Params=_BUCK_PARAMS)
+    net = _emit(u)
+    assert conv_name(u) == "buck_cmcontroller(vref=0.8, fsw=500k)", net
+    # none of the profile machinery leaked a node in
+    assert "U1_uvset" not in net and "I(VU1_isns) >" not in net, net
+
+
 # --- validation ----------------------------------------------------------- #
 
 

@@ -56,6 +56,53 @@ class ResolvedModel:
     pin_map_confidence: str = ""
 
 
+# --- CMCONTROLLER chip-profile registry (Stage 29.5) ----------------------- #
+# A behavioral current-mode controller is a handful of datasheet numbers; this table
+# fills them from a chip name so ``Sim.Params="chip=LT3757 topology=boost ..."`` picks
+# up a datasheet-anchored preset (adding a chip is adding a row, not code). An explicit
+# Sim.Params key always OVERRIDES the profile (design intent wins), and an unknown chip
+# is a loud warning + fall back to bare params -- never a silent wrong emulation.
+#
+# HONESTY: each row cites its datasheet source; a field that is a model design input
+# (RI, the effective A->V current-sense gain) or an estimate is called out as such, not
+# passed off as a verified datasheet spec. Keys are the ``_cmcontroller_params`` names.
+CMCONTROLLER_PROFILES = {
+    # Analog Devices LT3757 -- boost / SEPIC / flyback / inverting current-mode
+    # controller (single FBX feedback pin, dual +1.6 V / -0.8 V reference). Values from
+    # the LT3757 datasheet (the reference placed in workingdocs/documents/ and captured
+    # in the Stage 29 plan): VREF 1.600 V (FBX positive-output amplifier; the inverting
+    # amplifier regulates FBX to -0.800 V -- use vref=-0.8 for a negative output); error-
+    # amp transconductance gm ~ 250 uS; SENSE-pin current-limit threshold ~ 100 mV; max
+    # duty ~ 92 %; Vin UVLO ~ 2.9 V rising / 2.5 V falling. FSW is set by RT over
+    # 100 kHz-1 MHz -- 300 kHz matches the datasheet LT3757_Boost demo. RI (0.1) is a
+    # MODEL design input (the effective current-sense gain, = the 10 mohm boost Rsense
+    # referred through the internal sense path); VSENSE_MAX (1.0) is the 100 mV SENSE
+    # limit expressed in that same RI frame, so VSENSE_MAX/RI = the datasheet ~10 A
+    # switch-current limit. SS / TON_MIN are set by external caps (design inputs, not
+    # stored). No default TOPOLOGY -- the LT3757 is a multi-topology controller.
+    # FB_FOLD/FOLD_RATIO model the datasheet frequency-foldback (the LT3757 lowers fsw
+    # when FBX is far below its regulation point, e.g. during startup / into a fault) --
+    # here a two-state fold to FSW/4 while V(FB) < 1.0 V (~0.6 x the 1.6 V reference, the
+    # typical foldback design point); both the threshold and the fold ratio are
+    # representative of the datasheet's startup foldback, not exact specs.
+    "LT3757": dict(
+        VREF=1.6, GM=250e-6, FSW=300e3, VSENSE_MAX=1.0, RI=0.1,
+        DMAX=0.92, UVLO_RISE=2.9, UVLO_FALL=2.5, FB_FOLD=1.0, FOLD_RATIO=0.25,
+    ),
+    # Analog Devices LTC3851 -- synchronous step-down (buck) current-mode controller.
+    # VREF 0.800 V (+-1 %) and error-amp gm ~ 1.7 mS are datasheet specs; the maximum
+    # current-sense threshold is pin-selectable (30 / 50 / 75 mV) -- the 50 mV mid
+    # setting is stored, expressed in the RI=0.1 model frame as VSENSE_MAX=0.5 (so
+    # VSENSE_MAX/RI ~ 5 A for a 10 mohm sense). FSW is programmable (250-750 kHz);
+    # 500 kHz stored. Max duty ~ 98 %. (UVLO omitted -- the part runs from INTVCC and a
+    # verified Vin-UVLO corner is not asserted here rather than fabricate one.)
+    "LTC3851": dict(
+        VREF=0.8, GM=1.7e-3, FSW=500e3, VSENSE_MAX=0.5, RI=0.1,
+        DMAX=0.98, TOPOLOGY="buck",
+    ),
+}
+
+
 try:
     from PySpice.Spice.Netlist import Circuit as SpiceCircuit
     from PySpice.Unit import *
@@ -3449,21 +3496,50 @@ class SpiceConverter:
                      (default ``0.9*UVLO_RISE``); realized with a hysteretic run latch
                      (the switch-held-memory pattern) gating the gate output.
 
+        Chip-profile registry (Stage 29.5): ``CHIP`` (alias ``PROFILE``) names a row in
+        the module-level ``CMCONTROLLER_PROFILES`` table, whose datasheet-anchored values
+        fill any param the user did NOT set explicitly (an explicit Sim.Params key always
+        wins). An unknown chip is a loud warning + fall back to bare params. The resolved
+        chip name is returned under ``CHIP`` so the emitter records it in provenance.
+
         Returns None when VREF is zero/absent or FSW is missing/invalid.
         """
         raw = self._parse_sim_params(self._sim_props(component).get("params"))
 
-        def g(key, default=None):
-            v = self._parse_si_number(raw[key]) if key in raw else None
-            return v if v is not None else default
+        # Chip profile: fill defaults from the named preset; explicit params override.
+        prof = {}
+        chip_name = None
+        chip = raw.get("CHIP") or raw.get("PROFILE")
+        if chip is not None:
+            key = str(chip).strip().upper()
+            if key in CMCONTROLLER_PROFILES:
+                prof = CMCONTROLLER_PROFILES[key]
+                chip_name = key
+            else:
+                logger.warning(
+                    f"CMCONTROLLER chip={chip}: no profile in CMCONTROLLER_PROFILES "
+                    f"(known: {', '.join(sorted(CMCONTROLLER_PROFILES))}) - falling "
+                    f"back to bare Sim.Params"
+                )
 
-        vref = self._parse_si_number(raw["VREF"]) if "VREF" in raw else None
+        def g(key, default=None):
+            if key in raw:
+                v = self._parse_si_number(raw[key])
+                if v is not None:
+                    return v
+            if key in prof:
+                return prof[key]
+            return default
+
+        vref = self._parse_si_number(raw["VREF"]) if "VREF" in raw else prof.get("VREF")
         if not vref or vref == 0:
             return None
         fsw = g("FSW")
         if not fsw or fsw <= 0:
             return None
-        topology = str(raw.get("TOPOLOGY", "buck")).strip().lower() or "buck"
+        topology = str(
+            raw.get("TOPOLOGY") or prof.get("TOPOLOGY") or "buck"
+        ).strip().lower() or "buck"
         gm = g("GM", 250e-6)
         # Finite error-amp DC gain: an explicit REA wins; else derive from GAIN (dB)
         # as 10^(GAIN/20)/GM so the gm-into-REA DC gain equals GAIN; else the default.
@@ -3495,6 +3571,7 @@ class SpiceConverter:
             "DMAX": g("DMAX", 0.9),
             "TSS": g("TSS", 0.0),
             "TOPOLOGY": topology,
+            "CHIP": chip_name,
             # supervisory (None = off, byte-identical emission)
             "VSENSE_MAX": g("VSENSE_MAX", None),
             "TON_MIN": g("TON_MIN", None),
@@ -4256,9 +4333,13 @@ class SpiceConverter:
         if uvlo_rise is not None:
             sup.append(f"uvlo={n(uvlo_rise)}/{n(uvlo_fall)}")
         sup_str = (", " + ", ".join(sup)) if sup else ""
+        # Chip-profile provenance prefix (Stage 29.5): a "chip=<name>" build records the
+        # chip family so the netlist documents which datasheet it emulates. Absent chip
+        # => empty prefix => the provenance string stays byte-identical to 29.1-29.4.
+        chip_prefix = f"{cp['CHIP']}_" if cp.get("CHIP") else ""
         self.model_provenance[ref] = ResolvedModel(
             ref, "cmcontroller", "sim_params",
-            f"{topology}_cmcontroller(vref={n(vref)}, "
+            f"{chip_prefix}{topology}_cmcontroller(vref={n(vref)}, "
             f"fsw={self._fmt_hz(cp['FSW'])}{sup_str})",
         )
         logger.debug(
