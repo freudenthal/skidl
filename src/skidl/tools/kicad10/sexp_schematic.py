@@ -822,6 +822,18 @@ def part_to_sexp(part, uuid_path, tx=Tx()):
             if field_value is not None and str(field_value).strip():
                 extra_props[str(field_name)] = str(field_value)
 
+    # Explicit decoupling declaration (decouples=) -> a Decouples=U1.3 property
+    # so the intent survives HITL round-trips + skidl-codegen. Lazy (refs are
+    # final by now); a no-op -> byte-identical output when the attr is absent.
+    # An explicit part.fields["Decouples"] above wins (setdefault).
+    try:
+        from ...decouple import decouples_field_value
+        _dv = decouples_field_value(part)
+        if _dv:
+            extra_props.setdefault("Decouples", _dv)
+    except Exception:
+        pass
+
     y_offset = 5.08
     for field_name, field_value in extra_props.items():
         if field_name.lower() in (
