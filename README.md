@@ -109,6 +109,22 @@ generate_netlist(tool=KICAD9)
 
 **SPICE Integration**: Run simulations directly on your SKiDL circuits.
 
+**Declaring decoupling caps**: Tag a bypass cap with the IC/pin it serves via a
+`decouples=` attribute, so downstream placement (skidl-layout) puts it against
+the right supply pad instead of guessing from shared nets:
+
+```python
+vreg = Part("Regulator_Linear", "AMS1117-3.3")
+cbyp = Part("Device", "C", value="1u", decouples=vreg["VI"])  # a Pin
+cbyp.decouples = vreg           # a Part  -> parent ref, nearest supply pin
+cbyp.decouples = "U1.3"         # ref.pin string (also "U1" or ("U1", "3"))
+```
+
+The declaration is normalized lazily to `(ref, pin)` (`skidl.decouple`) and
+exported to the KiCad schematic as a `Decouples=U1.3` property so it survives
+HITL round-trips and skidl-codegen regeneration. Absent the attribute, output is
+byte-identical.
+
 ## Installation
 
 ```bash
