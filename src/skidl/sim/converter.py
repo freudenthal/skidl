@@ -2915,11 +2915,19 @@ class SpiceConverter:
         over-constrained and rejected (``None``). Absent ``LM`` the ``LP``/``K`` path
         is byte-identical to before.
 
+        **Saturable core (Stage 30.2):** an optional ``ISAT`` (magnetizing knee
+        current, A) or ``BSAT`` (knee flux, V-s; ``Isat = Bsat/Lm``) selects a
+        nonlinear magnetizing inductance, with an optional ``LSAT`` residual
+        (saturated) inductance. Saturation needs the ``LM`` spelling; ``LP``/``K``
+        alone is rejected.
+
         Returns ``{"LP", "secondaries": [ls, ...], "K", "center_tap", "RP",
-        "sec_res", "lm", "llk"}`` (``lm``/``llk`` are ``None`` unless the flyback
-        spelling drove the mapping).
+        "sec_res", "lm", "llk", "isat", "lsat"}`` (``lm``/``llk`` are ``None``
+        unless the flyback spelling drove the mapping; ``isat``/``lsat`` are
+        ``None`` unless a saturation key selected the nonlinear core).
         """
         raw = self._parse_sim_params(self._sim_props(component).get("params"))
+        ref = self._attr(component, "ref", None) or "?"
 
         # Stage 30.1: flyback-friendly Lm/n/Llk input set. When LM (magnetizing
         # inductance) is given, derive the primary self-inductance LP and the
@@ -2933,7 +2941,6 @@ class SpiceConverter:
         lm_used = None
         llk_used = None
         if lm is not None:
-            ref = self._attr(component, "ref", None) or "?"
             if "LP" in raw or "K" in raw:
                 logger.warning(
                     f"transformer {ref}: over-constrained -- give either "
@@ -2950,6 +2957,45 @@ class SpiceConverter:
             lp = self._parse_si_number(raw["LP"]) if "LP" in raw else None
         if not lp or lp <= 0:
             return None
+
+        # Stage 30.2: nonlinear (saturable) magnetizing core (opt-in). ISAT or
+        # BSAT selects nonlinear mode. Saturation acts on the MAGNETIZING
+        # inductance, so it requires the explicit Lm spelling (you cannot saturate
+        # a magnetizing inductance you have not separated out of LP). LSAT is the
+        # residual (saturated / air-core) inductance in henries; its default is a
+        # small fraction of Lm so the post-knee slope is finite (a nonsingular
+        # Jacobian), NOT a datasheet value. Absent every saturation key, the
+        # emission below is byte-identical to the linear coupled-inductor form.
+        isat = self._parse_si_number(raw["ISAT"]) if "ISAT" in raw else None
+        bsat = self._parse_si_number(raw["BSAT"]) if "BSAT" in raw else None
+        lsat = None
+        if isat is not None or bsat is not None:
+            if lm_used is None:
+                logger.warning(
+                    f"transformer {ref}: saturation (isat/bsat) needs the "
+                    f"magnetizing spelling, e.g. \"lm=100u isat=2 n=0.2\"; skipping"
+                )
+                return None
+            if isat is not None and bsat is not None:
+                logger.warning(
+                    f"transformer {ref}: both isat and bsat given -- using isat"
+                )
+            if isat is None:
+                # Knee current at which the linear flux Lm*i reaches Bsat (V-s).
+                isat = bsat / lm_used
+            if isat <= 0:
+                logger.warning(f"transformer {ref}: isat must be > 0; skipping")
+                return None
+            lsat = self._parse_si_number(raw["LSAT"]) if "LSAT" in raw else None
+            if lsat is None:
+                lsat = self._XFMR_LSAT_FRAC * lm_used
+            if lsat <= 0 or lsat >= lm_used:
+                logger.warning(
+                    f"transformer {ref}: lsat must be a residual inductance in "
+                    f"(0, lm) -- a saturated core is a SMALLER inductance; skipping"
+                )
+                return None
+
         shape = self._transformer_shape(component)
         center_tap, n_sec = shape if shape is not None else (False, 1)
 
@@ -3002,10 +3048,10 @@ class SpiceConverter:
             # bad k -> validate() names it
             return {"LP": lp, "secondaries": secondaries, "K": None,
                     "center_tap": center_tap, "RP": rp, "sec_res": sec_res,
-                    "lm": lm_used, "llk": llk_used}
+                    "lm": lm_used, "llk": llk_used, "isat": isat, "lsat": lsat}
         return {"LP": lp, "secondaries": secondaries, "K": k,
                 "center_tap": center_tap, "RP": rp, "sec_res": sec_res,
-                "lm": lm_used, "llk": llk_used}
+                "lm": lm_used, "llk": llk_used, "isat": isat, "lsat": lsat}
 
     def _add_transformer(self, component, ref: str, value: str):
         """Emit a transformer as N coupled inductors + pairwise ``K`` cards.
@@ -3062,6 +3108,13 @@ class SpiceConverter:
                 f"transformer {ref}: {len(sec_nodes)} secondary winding(s) but "
                 f"{len(sec_ind)} inductance(s) resolved - skipping"
             )
+            return
+
+        # Stage 30.2: a saturation key selects the nonlinear behavioral T-model
+        # (a saturable magnetizing branch). Entirely additive -- the linear
+        # coupled-inductor emission below is never touched when isat is absent.
+        if params.get("isat") is not None:
+            self._emit_saturable_transformer(ref, term, params)
             return
 
         def winding_lines(lname, tag, node_a, node_b, ind, res):
@@ -3126,6 +3179,124 @@ class SpiceConverter:
             f"{ref}: {shape} transformer as {len(lnames)} coupled inductors "
             f"(lp={lp}, ls=[{ls_str}], k={k}); pairwise K; dots at first-named "
             f"pin of each winding"
+        )
+
+    # Stage 30.2 saturable-core numerical-stability constants (NOT datasheet):
+    # the residual saturated inductance as a fraction of Lm (a small but nonzero
+    # post-knee slope so the Newton Jacobian never zeroes), and the flux-knee
+    # smoothing width as a fraction of the knee flux (a soft, C-infinity knee).
+    _XFMR_LSAT_FRAC = 0.05
+    _XFMR_SAT_SMOOTH = 0.05
+
+    def _emit_saturable_transformer(self, ref, term, params):
+        """Emit a saturable-core transformer (Stage 30.2) as a behavioral T-model.
+
+        Nonlinear mode, selected by an ``ISAT``/``BSAT`` Sim.Param. The core is
+        split into a linear primary leakage inductor + a NONLINEAR magnetizing
+        branch + an ideal ``n:1`` coupling to each secondary::
+
+            AA -[Rp]-[Llk linear L]- magp -(nonlinear magnetizing)- magm(=AB)
+            secondary i:  V(sa,sb) = n_i * V(magp,magm),  reflected current n_i*Is
+
+        The magnetizing branch is a flux-node current source: a 1 F cap integrates
+        the magnetizing voltage to flux ``phi = int(Vm dt)``, and the branch
+        current is a smooth two-slope function of ``phi`` -- incremental slope
+        ``1/Lm`` below the knee (``|phi| < Lm*Isat``) and ``1/Lsat`` above it. So
+        past the knee the magnetizing current RUNS AWAY as volt-seconds pile on
+        (real core saturation), while below the knee it reproduces the linear
+        magnetizing inductance. ``i(phi)`` curves UPWARD (convex) past the knee --
+        the opposite of a ``tanh`` current *clamp*, which would wrongly cap the
+        current. The characteristic is smooth (C-infinity) and monotonic, so
+        ``di/dphi`` stays bounded in ``[1/Lm, 1/Lsat]`` and the Jacobian is never
+        singular (no hard clamp; the 28.D / 29.2 lesson).
+
+        Honest boundary: this is a **behavioral flux-node knee**, NOT a
+        Jiles-Atherton core -- no hysteresis, no remanence, no minor loop, no core
+        loss. ``Lsat`` and the knee smoothing are numerical choices (see the class
+        constants), not datasheet specs. Leakage is primary-referred only.
+        """
+        n = self._fmt_num
+        aa, ab = term["primary"]
+        sec_nodes = term["secondaries"]
+        sec_ind = params["secondaries"]
+        lp = params["LP"]
+        lm = params["lm"]
+        llk = params["llk"] or 0.0
+        isat = params["isat"]
+        lsat = params["lsat"]
+        rp = params.get("RP", 0.0) or 0.0
+        sec_res = params.get("sec_res") or [0.0] * len(sec_nodes)
+
+        flux = f"{ref}_flux"
+        magm = ab
+        lines = []
+        # Primary DCR (optional) then leakage (optional, a real series L now that
+        # Llk is explicit) into the magnetizing node.
+        pri_hi = aa
+        if rp > 0:
+            lines.append(f"R{ref}_P {aa} {ref}_pri {n(rp)}")
+            pri_hi = f"{ref}_pri"
+        if llk > 0:
+            magp = f"{ref}_magp"
+            lines.append(f"L{ref}_LKP {pri_hi} {magp} {n(llk)}")
+        else:
+            magp = pri_hi
+
+        # Nonlinear magnetizing branch. i(phi) = phi/Lm + (1/Lsat - 1/Lm)*W(phi),
+        # W(phi) = R(phi - phis) - R(-phi - phis), R(y) = 0.5*(y + sqrt(y^2 + d^2))
+        # a smooth one-sided ramp (slope ~0 below y=0, ~1 above). W is odd, ~0 for
+        # |phi| < phis and ~ (|phi|-phis)*sign(phi) beyond, so the added slope
+        # (1/Lsat - 1/Lm) engages only past the knee -> upward curvature / runaway.
+        phis = lm * isat                       # knee flux (V-s): the linear Lm*Isat
+        dsm = self._XFMR_SAT_SMOOTH * phis     # knee smoothing width
+        dsm2 = dsm * dsm
+        invlm = 1.0 / lm
+        coefw = 1.0 / lsat - 1.0 / lm
+        vf = f"V({flux})"
+        r_pos = (f"0.5*(({vf}-{n(phis)})+sqrt(({vf}-{n(phis)})*({vf}-{n(phis)})"
+                 f"+{n(dsm2)}))")
+        r_neg = (f"0.5*((-{vf}-{n(phis)})+sqrt(({vf}+{n(phis)})*({vf}+{n(phis)})"
+                 f"+{n(dsm2)}))")
+        i_expr = f"{vf}*{n(invlm)}+{n(coefw)}*(({r_pos})-({r_neg}))"
+        lines += [
+            f"B{ref}_mag {magp} {magm} I = {i_expr}",
+            f"B{ref}_fluxdrv 0 {flux} I = V({magp})-V({magm})",
+            f"C{ref}_flux {flux} 0 1 IC=0",
+            f"R{ref}_fluxlk {flux} 0 1e12",
+        ]
+
+        # Ideal n:1 coupling to each secondary: the secondary open-circuit voltage
+        # is n_i * the magnetizing voltage (E source), and the load current is
+        # reflected n_i:1 back onto the magnetizing node (F source, sensed by the
+        # series 0 V ammeter). n_i = sqrt(Ls/Lp) recovers the winding's turns ratio.
+        for i, (pair, ls) in enumerate(zip(sec_nodes, sec_ind), start=1):
+            sa, sb = pair
+            n_i = math.sqrt(ls / lp) if lp > 0 else 0.0
+            res = sec_res[i - 1] if i - 1 < len(sec_res) else 0.0
+            secv = f"{ref}_s{i}v"
+            lines.append(f"E{ref}_S{i} {secv} {sb} {magp} {magm} {n(n_i)}")
+            if res and res > 0:
+                secr = f"{ref}_s{i}r"
+                lines.append(f"R{ref}_S{i} {secv} {secr} {n(res)}")
+                lines.append(f"V{ref}_S{i} {secr} {sa} 0")
+            else:
+                lines.append(f"V{ref}_S{i} {secv} {sa} 0")
+            lines.append(f"F{ref}_S{i} {magp} {magm} V{ref}_S{i} {n(n_i)}")
+
+        self.spice_circuit.raw_spice += "\n" + "\n".join(lines)
+
+        ls_str = ", ".join(n(x) for x in sec_ind)
+        shape = "center_tap" if term.get("center_tap") else (
+            "1sec" if len(sec_nodes) == 1 else f"{len(sec_nodes)}sec")
+        self.model_provenance[ref] = ResolvedModel(
+            ref, "transformer", "sim_params",
+            f"xfmr_sat_{shape}(lm={n(lm)}, llk={n(llk)}, ls=[{ls_str}], "
+            f"sat(isat={n(isat)}, lsat={n(lsat)}))",
+        )
+        logger.debug(
+            f"{ref}: saturable transformer (behavioral flux-node T-model): "
+            f"lm={n(lm)}, llk={n(llk)}, isat={n(isat)}, lsat={n(lsat)}, "
+            f"{len(sec_nodes)} secondary winding(s); knee flux {n(phis)} V-s"
         )
 
     # ------------------------------------------------------------------ #
@@ -6636,7 +6807,9 @@ class SpiceConverter:
                     f"{ref}: transformer needs Sim.Params with a magnetizing/primary "
                     f"inductance and a turns ratio -- either \"lm=100u llk=2u n=0.2\" "
                     f"(flyback style) or \"lp=100u n=0.5\" (self-inductance style; two "
-                    f'secondaries: "lp=25u n=0.5 n2=0.1"); do not give both lp and lm'
+                    f'secondaries: "lp=25u n=0.5 n2=0.1"); do not give both lp and lm. '
+                    f"A saturable core (isat=/bsat=) additionally needs the lm= spelling "
+                    f"and an lsat in (0, lm)"
                 )
             elif params["K"] is None:
                 problems.append(f"{ref}: transformer coupling k must be in (0, 1]")
