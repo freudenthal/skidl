@@ -442,6 +442,11 @@ class SpiceConverter:
         "INVBUCKBOOST": "invbuckboost",
         "SEPIC": "sepic",
         "CUK": "cuk",
+        # Behavioral CLOSED-LOOP peak-current-mode controller (Stage 29.1). Unlike
+        # the open-loop switch macromodels above (duty is swept) and the averaged
+        # 28.D loop model (small-signal .ac), this generates the real gate from
+        # feedback and regulates a live rail cycle-accurately in .tran.
+        "CMCONTROLLER": "cmcontroller",
         "TRANSFORMER": "transformer",
         "XFMR": "transformer",
         # Corpus-independent behavioral logic primitives (Stage: DPSG WS2). These
@@ -604,6 +609,7 @@ class SpiceConverter:
             "invbuckboost": self._add_invbuckboost,
             "sepic": self._add_sepic,
             "cuk": self._add_cuk,
+            "cmcontroller": self._add_cmcontroller,
             "transformer": self._add_transformer,
             "bjt": self._add_bjt_transistor,
             "mosfet": self._add_mosfet,
@@ -3315,6 +3321,98 @@ class SpiceConverter:
             "FRHPZ": frhpz,
         }
 
+    def _cmcontroller_terminals(self, component):
+        """Resolve the CMCONTROLLER's VIN/SW/VOUT/FB/VC/GND SPICE nodes by pin name.
+
+        The behavioral closed-loop controller (Stage 29.1) emits its own switch stage
+        between VIN and SW and closes the loop through the user's real divider
+        (VOUT->FB->GND) and VC compensation network, so all six terminals must be
+        real pins. Returns ``{"vin","sw","vout","fb","vc","gnd"}`` or None when any is
+        missing (or no live pin map is available), so the handler logs an actionable
+        skip. FB accepts the usual divider-tap names plus ``FBX`` (the LT3757
+        dual-reference feedback), same as the averaged current-mode resolver. First
+        connected match per role wins.
+        """
+        pin_map = getattr(component, "_pins", None)
+        if not isinstance(pin_map, dict):
+            return None
+        fb_names = self._SWITCH_FB_NAMES | {"FBX"}
+        vin = sw = vout = fb = vc = gnd = None
+        for pin in pin_map.values():
+            net = getattr(pin, "net", None)
+            if net is None:
+                continue
+            name = (getattr(pin, "name", "") or "").strip().upper()
+            node = self.node_map.get(net.name, net.name)
+            if sw is None and name in self._SWITCH_SW_NAMES:
+                sw = node
+            elif vin is None and name in self._SWITCH_VIN_NAMES:
+                vin = node
+            elif vout is None and name in self._SWITCH_VOUT_NAMES:
+                vout = node
+            elif vc is None and name in self._SWITCH_VC_NAMES:
+                vc = node
+            elif fb is None and name in fb_names:
+                fb = node
+            elif gnd is None and name in self._SWITCH_GND_NAMES:
+                gnd = node
+        if None in (vin, sw, vout, fb, vc, gnd):
+            return None
+        return {"vin": vin, "sw": sw, "vout": vout, "fb": fb, "vc": vc, "gnd": gnd}
+
+    def _cmcontroller_params(self, component) -> Optional[dict]:
+        """Params for the behavioral closed-loop CMCONTROLLER (Stage 29.1), or None.
+
+        Requires a nonzero VREF (the FB reference; **may be negative**, the 28.D
+        convention) and a positive FSW. Everything else is a datasheet-anchored
+        default matching the averaged current-mode model's knobs, so the two regimes
+        cross-check:
+
+          * ``GM``   error-amp transconductance (default 250 uS, the LT3757 value);
+          * ``RI``   effective current-sense gain (ohms) = Rsense * sense-amp gain
+                     (default 0.1); scales the sensed inductor current into the
+                     comparator;
+          * ``MCSLOPE``  volts of slope-compensation ramp added across one period
+                     into the current signal (default 0.1). Raise it if a D>0.5 run
+                     subharmonic-oscillates (Basso Fig. 5c/d); aliased ``MC_SLOPE``;
+          * ``REA``  finite error-amp DC-gain resistor on VC (default 1e6), a DC-path
+                     safety (the AC shaping is the user's real Rth/Cth);
+          * ``RON``  emitted switch on-resistance in ohms (default 0.1);
+          * ``DMAX`` max duty (default 0.9); a max-duty pulse force-resets the latch
+                     past it, bounding inrush even before soft-start;
+          * ``TSS``  soft-reference ramp time in seconds (default 0 = a hard DC
+                     reference). A small TSS ramps VREF from 0 over TSS to ease
+                     startup convergence; the full soft-start machinery is Stage 29.3;
+          * ``TOPOLOGY``  the switch stage to emit (Stage 29.1: ``buck`` only).
+
+        Returns None when VREF is zero/absent or FSW is missing/invalid.
+        """
+        raw = self._parse_sim_params(self._sim_props(component).get("params"))
+
+        def g(key, default=None):
+            v = self._parse_si_number(raw[key]) if key in raw else None
+            return v if v is not None else default
+
+        vref = self._parse_si_number(raw["VREF"]) if "VREF" in raw else None
+        if not vref or vref == 0:
+            return None
+        fsw = g("FSW")
+        if not fsw or fsw <= 0:
+            return None
+        topology = str(raw.get("TOPOLOGY", "buck")).strip().lower() or "buck"
+        return {
+            "VREF": vref,
+            "FSW": fsw,
+            "GM": g("GM", 250e-6),
+            "RI": g("RI", 0.1),
+            "MCSLOPE": g("MCSLOPE", g("MC_SLOPE", 0.1)),
+            "REA": g("REA", 1e6),
+            "RON": g("RON", 0.1),
+            "DMAX": g("DMAX", 0.9),
+            "TSS": g("TSS", 0.0),
+            "TOPOLOGY": topology,
+        }
+
     def _averaged_params(self, component) -> Optional[dict]:
         """Error-amp params for the averaged model, or None if VREF is missing.
 
@@ -3718,6 +3816,165 @@ class SpiceConverter:
             f"fsw/2={self._fmt_hz(fsw / 2)}, {rhpz_txt}); small-signal compensation "
             f"model for .ac loop gain -- NOT the closed-loop switching controller. "
             f"Results above ~{self._fmt_hz(fsw / 2)} (fsw/2) are not physical."
+        )
+
+    def _add_cmcontroller(self, component, ref: str, value: str):
+        """Behavioral CLOSED-LOOP peak-current-mode controller (Sim.Device="CMCONTROLLER").
+
+        Stage 29.1 -- the cycle-accurate, large-signal, closed-loop regime neither
+        the open-loop switch macromodels (duty is swept) nor the averaged 28.D loop
+        model (small-signal ``.ac``) can reach. It **generates the real gate from
+        feedback** and regulates a live rail in ``.tran``. Built entirely from
+        ngspice ``B``-sources + the switch-held-memory latch pattern of
+        ``_emit_ms_dff`` (no XSPICE, no corpus model). The controller emits its OWN
+        buck switch stage between VIN and SW, gated by the latch; the user supplies
+        the real inductor (SW->VOUT), Cout, feedback divider (VOUT->FB->GND) and the
+        VC/ITH compensation network -- exactly the parts the averaged 28.D model uses,
+        so the two regimes cross-check.
+
+        Emitted per ref (``per`` = 1/FSW; nodes prefixed ``<ref>_``)::
+
+            oscillator   VCLK narrow SET pulse @ FSW; VRAMP 0->1 slope sawtooth;
+                         VDUTY max-duty force-off pulse past DMAX
+            error amp    B_ea: I into VC = GM*(VREF - V(FB))  (reuses 28.D's gm cell)
+                         R_ea VC->GND REA (finite-DC-gain / DC-path safety)
+            sense+slope  V_isns (0 V) in the switch branch -> I(V_isns) = iL(on);
+                         B_isig = RI*I(V_isns) + MCSLOPE*V(ramp)
+            reset        B_rst = (isig > VC) OR (past DMAX), RC-slowed (Basso conv.)
+            SR latch     switch-held memory cap; set=clk, RESET-DOMINANT (set is
+                         gated off while resetting) so the comparator/current-limit
+                         always wins; B_gate = latched Q
+            switch stage S_hs (VIN->SW, latch-gated) + freewheel diode GND->SW
+
+        Negative feedback (buck): VOUT up -> V(FB) up -> (VREF-FB) down -> less
+        current into VC -> VC down -> the peak-current command drops -> the switch
+        turns off earlier -> VOUT down. The peak comparator + max-duty bound the
+        per-cycle current, so inrush is limited even without soft-start; a nonzero
+        ``TSS`` ramps VREF from 0 to ease startup convergence (the full soft-start is
+        Stage 29.3). All memory caps carry ``IC=0``: the closed-loop ``.tran`` must
+        use ``use_initial_condition=True`` (seed ``{VOUT:0}``), exactly as the DFF
+        divider does.
+
+        HONEST BOUNDARY (logged + recorded in provenance): behavioral emulation of a
+        current-mode controller's headline datasheet specs, NOT the encrypted silicon.
+        CCM; no thermal / gate-charge / protection corner cases beyond the
+        parameterized ones. GM/RI/MCSLOPE are datasheet-anchored design inputs.
+        Emits nothing and warns (honest skip) when the terminals or required params
+        (VREF/FSW) do not resolve, or the topology is not yet wired (29.1: buck only).
+        """
+        term = self._cmcontroller_terminals(component)
+        if term is None:
+            logger.warning(
+                f"CMCONTROLLER {ref}: needs connected VIN, SW, VOUT, FB, VC "
+                f"(compensation) and GND pins (resolved by pin name) - skipping"
+            )
+            return
+        cp = self._cmcontroller_params(component)
+        if cp is None:
+            logger.warning(
+                f"CMCONTROLLER {ref}: needs Sim.Params VREF (the FB reference, may be "
+                f"negative) and FSW, e.g. "
+                f'"topology=buck fsw=500k vout=3.3 vin=12 vref=0.8 ri=0.1" - skipping'
+            )
+            return
+        topology = cp["TOPOLOGY"]
+        if topology != "buck":
+            logger.warning(
+                f"CMCONTROLLER {ref}: topology={topology} is not wired in Stage 29.1 "
+                f"(buck only); the boost/SEPIC/Ćuk/flyback stages are Stage 29.4 - "
+                f"skipping"
+            )
+            return
+
+        vin, sw, vout, fb, vc, gnd = (
+            str(term["vin"]), str(term["sw"]), str(term["vout"]),
+            str(term["fb"]), str(term["vc"]), str(term["gnd"]),
+        )
+        # Any other pins (SS/RT/EN/SYNC/INTVCC...) get a 1G DC path; 29.1 models only
+        # the six resolved terminals (VIN is a driven rail, a stub on it is harmless).
+        self._stub_unmodeled_pins(component, ref, {vin, sw, vout, fb, vc, gnd}, gnd)
+
+        n = self._fmt_num
+        vref, gm, rea, ri, mcslope, ron, dmax, tss = (
+            cp["VREF"], n(cp["GM"]), n(cp["REA"]), n(cp["RI"]),
+            n(cp["MCSLOPE"]), n(cp["RON"]), cp["DMAX"], cp["TSS"],
+        )
+        per = 1.0 / cp["FSW"]
+        tr = per * 1e-3            # narrow switch edge
+        thi = per * 0.02           # narrow SET pulse
+        rd = 1000.0                # reset RC-slow: tau = rd*cd = per/1000
+        cd = per / (rd * 1000.0)
+        cq = per / 5000.0          # latch memory: tau = 50*cq ~ per/100
+        dmax_on = max(per * dmax, tr)
+        dmax_off = max(per * (1.0 - dmax), tr)
+
+        clk, ramp, rstd = f"{ref}_clk", f"{ref}_ramp", f"{ref}_rstd"
+        isig, rstr, rstf = f"{ref}_isig", f"{ref}_rstr", f"{ref}_rstf"
+        hi, sg, qm, gate, swhi = (
+            f"{ref}_hi", f"{ref}_sg", f"{ref}_qm", f"{ref}_gate", f"{ref}_swhi",
+        )
+
+        # Soft reference: a nonzero TSS ramps V(vref) from 0 -> VREF over TSS so the
+        # loop starts gently (helps the UIC .tran converge); TSS=0 uses a hard literal.
+        pre = []
+        if tss and tss > 0:
+            vrefn = f"{ref}_vref"
+            pre.append(
+                f"B{ref}_vref {vrefn} {gnd} V = {n(vref)}*(time > {n(tss)} ? "
+                f"1 : time/{n(tss)})"
+            )
+            vref_expr = f"V({vrefn})"
+        else:
+            vref_expr = n(vref)
+
+        lines = pre + [
+            # ---- oscillator: SET clock + slope-comp ramp + max-duty force-off ----
+            f"V{ref}_clk {clk} {gnd} PULSE(0 5 0 {tr:g} {tr:g} {thi:g} {per:g})",
+            f"V{ref}_ramp {ramp} {gnd} PULSE(0 1 0 {per * 0.98:g} {per * 0.01:g} "
+            f"0 {per:g})",
+            f"V{ref}_duty {rstd} {gnd} PULSE(0 5 {per * dmax:g} {tr:g} {tr:g} "
+            f"{dmax_off:g} {per:g})",
+            # ---- error amp: gm cell into the real external VC net (28.D cell) ----
+            f"B{ref}_ea {gnd} {vc} I = {gm}*({vref_expr} - V({fb}))",
+            f"R{ref}_ea {vc} {gnd} {rea}",
+            # ---- current sense (0 V in the switch branch) + slope-comp signal ----
+            f"V{ref}_isns {swhi} {sw} 0",
+            f"B{ref}_isig {isig} {gnd} V = {ri}*I(V{ref}_isns) + "
+            f"{mcslope}*V({ramp})",
+            # ---- reset = current comparator OR max-duty, RC-slowed ----
+            f"B{ref}_rst {rstr} {gnd} V = V({isig}) > V({vc}) ? 5 : "
+            f"(V({rstd}) > 2.5 ? 5 : 0)",
+            f"R{ref}_rd {rstr} {rstf} {n(rd)}",
+            f"C{ref}_rd {rstf} {gnd} {n(cd)}",
+            # ---- SR latch (set=clk, RESET-DOMINANT), switch-held memory cap ----
+            f"V{ref}_hi {hi} {gnd} 5",
+            f"B{ref}_sg {sg} {gnd} V = V({clk}) > 2.5 ? "
+            f"(V({rstf}) > 2.5 ? 0 : 5) : 0",
+            f"S{ref}_set {hi} {qm} {sg} {gnd} SWL{ref}",
+            f"S{ref}_rst {qm} {gnd} {rstf} {gnd} SWL{ref}",
+            f"C{ref}_qm {qm} {gnd} {n(cq)} IC=0",
+            f".model SWL{ref} SW(Ron=50 Roff=1e9 Vt=2.5 Vh=0.2)",
+            f"B{ref}_gate {gate} {gnd} V = V({qm}) > 2.5 ? 5 : 0",
+            # ---- buck switch stage gated by the latch (HS switch + freewheel) ----
+            f"S{ref}_hs {vin} {swhi} {gate} {gnd} SWM{ref}",
+            f".model SWM{ref} SW(Ron={ron} Roff=1e6 Vt=2.5 Vh=0.2)",
+            f"D{ref}_fw {gnd} {sw} DFW{ref}",
+            f".model DFW{ref} D(IS=1e-9 N=1.05 CJO=100p)",
+        ]
+        self.spice_circuit.raw_spice += "\n" + "\n".join(lines)
+        self.model_provenance[ref] = ResolvedModel(
+            ref, "cmcontroller", "sim_params",
+            f"{topology}_cmcontroller(vref={n(vref)}, fsw={self._fmt_hz(cp['FSW'])})",
+        )
+        logger.debug(
+            f"{ref}: {topology} behavioral CLOSED-LOOP peak-current-mode controller "
+            f"(vref={n(vref)}, fsw={self._fmt_hz(cp['FSW'])}, ri={ri}, mcslope="
+            f"{mcslope}, dmax={dmax:g}"
+            f"{f', tss={self._fmt_num(tss)}s' if tss else ''}); cycle-accurate .tran "
+            f"needs use_initial_condition=True + initial_conditions={{{vout}:0}}. "
+            f"Behavioral emulation of datasheet specs -- NOT the encrypted silicon; "
+            f"CCM; no thermal / gate-charge / protection corners beyond the "
+            f"parameterized ones."
         )
 
     # ------------------------------------------------------------------ #
@@ -5884,6 +6141,35 @@ class SpiceConverter:
                 problems.append(
                     f"{ref}: cuk needs Sim.Params with FSW and a duty, e.g. "
                     f'Sim.Params="fsw=500k d=0.5" (or a VOUT+VIN target)'
+                )
+
+        # 4c-cmc. Behavioral closed-loop peak-current-mode controller (Stage 29.1):
+        #         all six terminals (VIN/SW/VOUT/FB/VC/GND) + VREF/FSW; buck only.
+        for component in self._iter_components():
+            if self._sim_excluded(component):
+                continue
+            if self._kind(component) != "cmcontroller":
+                continue
+            ref = self._attr(component, "ref", None) or "?"
+            if (
+                getattr(component, "_pins", None) is not None
+                and self._cmcontroller_terminals(component) is None
+            ):
+                problems.append(
+                    f"{ref}: CMCONTROLLER needs connected VIN, SW, VOUT, FB, VC "
+                    f"(compensation) and GND pins (resolved by pin name)"
+                )
+            cp = self._cmcontroller_params(component)
+            if cp is None:
+                problems.append(
+                    f"{ref}: CMCONTROLLER needs Sim.Params VREF (may be negative) and "
+                    f'FSW, e.g. Sim.Params="topology=buck fsw=500k vout=3.3 vin=12 '
+                    f'vref=0.8"'
+                )
+            elif cp["TOPOLOGY"] != "buck":
+                problems.append(
+                    f"{ref}: CMCONTROLLER topology={cp['TOPOLOGY']} is not wired in "
+                    f"Stage 29.1 (buck only; boost/SEPIC/Ćuk/flyback are Stage 29.4)"
                 )
 
         # 4d. Transformers: all four winding ends connected + resolvable params.
