@@ -3393,10 +3393,40 @@ class SpiceConverter:
           * ``RON``  emitted switch on-resistance in ohms (default 0.1);
           * ``DMAX`` max duty (default 0.9); a max-duty pulse force-resets the latch
                      past it, bounding inrush even before soft-start;
-          * ``TSS``  soft-reference ramp time in seconds (default 0 = a hard DC
-                     reference). A small TSS ramps VREF from 0 over TSS to ease
-                     startup convergence; the full soft-start machinery is Stage 29.3;
+          * ``TSS``  soft-start / soft-reference ramp time in seconds (default 0 = a
+                     hard DC reference). A nonzero TSS ramps the internal reference
+                     from 0 to VREF over TSS, so the rail rises monotonically and the
+                     startup inrush stays bounded -- the Stage 29.3 soft-start. Also
+                     eases the UIC ``.tran`` op point;
           * ``TOPOLOGY``  the switch stage to emit (Stage 29.1: ``buck`` only).
+
+        Supervisory features (Stage 29.3) -- each behind its own param, ABSENT = the
+        feature is off and the emission stays byte-identical to 29.1/29.2:
+
+          * ``VSENSE_MAX``  cycle-by-cycle peak current limit as a sense voltage
+                     (e.g. 0.11 for 110 mV). When set, the latch also resets when the
+                     RAW sensed current ``RI*I(isns)`` exceeds it (slope comp excluded),
+                     so the switch current can never command past the datasheet limit --
+                     into a short the rail collapses at constant current instead of
+                     running away (Basso Fig. 6 ``ILIMIT``, OR'd into the reset);
+          * ``TON_MIN``  minimum on-time / leading-edge blanking in seconds. When set,
+                     the reset comparator is ignored for the first ``TON_MIN`` of each
+                     cycle (``V(ramp) < TON_MIN*FSW``), enforcing a floor on the on-time
+                     and blanking current-sense noise at the switch edge;
+          * ``FB_FOLD``  frequency-foldback FB threshold. When ``V(FB)`` is below it
+                     (startup into a heavy load / a short), the latch is clocked by a
+                     slower folded clock at ``FSW*FOLD_RATIO`` instead of ``FSW``, so
+                     the inductor current stays controllable at the forced short on-time.
+                     This is the documented TWO-STATE foldback (a dual fixed-frequency
+                     clock select), not a continuously variable oscillator -- robust and
+                     convergence-safe;
+          * ``FOLD_RATIO``  folded-clock frequency as a fraction of FSW (default 0.25);
+                     only used when ``FB_FOLD`` is set;
+          * ``UVLO_RISE``/``UVLO_FALL``  under-voltage lockout on VIN with hysteresis.
+                     When ``UVLO_RISE`` is set, the gate is held off until ``V(VIN)``
+                     rises past ``UVLO_RISE`` and turns off again below ``UVLO_FALL``
+                     (default ``0.9*UVLO_RISE``); realized with a hysteretic run latch
+                     (the switch-held-memory pattern) gating the gate output.
 
         Returns None when VREF is zero/absent or FSW is missing/invalid.
         """
@@ -3423,6 +3453,12 @@ class SpiceConverter:
             rea = (10.0 ** (gain_db / 20.0)) / gm if (gain_db is not None and gm) else 1e6
         else:
             rea = 1e6
+        # Supervisory features (Stage 29.3): each defaults to None (= off) so the
+        # emission is byte-identical to 29.1/29.2 when the param is absent.
+        uvlo_rise = g("UVLO_RISE", None)
+        uvlo_fall = g("UVLO_FALL", None)
+        if uvlo_rise is not None and uvlo_fall is None:
+            uvlo_fall = 0.9 * uvlo_rise
         return {
             "VREF": vref,
             "FSW": fsw,
@@ -3438,6 +3474,13 @@ class SpiceConverter:
             "DMAX": g("DMAX", 0.9),
             "TSS": g("TSS", 0.0),
             "TOPOLOGY": topology,
+            # supervisory (None = off, byte-identical emission)
+            "VSENSE_MAX": g("VSENSE_MAX", None),
+            "TON_MIN": g("TON_MIN", None),
+            "FB_FOLD": g("FB_FOLD", None),
+            "FOLD_RATIO": g("FOLD_RATIO", 0.25),
+            "UVLO_RISE": uvlo_rise,
+            "UVLO_FALL": uvlo_fall,
         }
 
     def _averaged_params(self, component) -> Optional[dict]:
@@ -3869,11 +3912,21 @@ class SpiceConverter:
                          soft VHIGH/VLOW diode clamps bound the VC output swing
             sense+slope  V_isns (0 V) in the switch branch -> I(V_isns) = iL(on);
                          B_isig = RI*I(V_isns) + MCSLOPE*V(ramp)
-            reset        B_rst = (isig > VC) OR (past DMAX), RC-slowed (Basso conv.)
+            reset        B_rst = (isig > VC) OR (past DMAX) [OR raw sensed I >
+                         VSENSE_MAX, the cycle-by-cycle current limit], RC-slowed
+                         (Basso conv.); optionally blanked for TON_MIN after each set
             SR latch     switch-held memory cap; set=clk, RESET-DOMINANT (set is
                          gated off while resetting) so the comparator/current-limit
-                         always wins; B_gate = latched Q
+                         always wins; B_gate = latched Q [AND UVLO run]
             switch stage S_hs (VIN->SW, latch-gated) + freewheel diode GND->SW
+
+        Supervisory features (Stage 29.3, each behind a param, absent = off + emission
+        byte-identical to 29.1/29.2): TSS soft-start (a monotone reference ramp bounding
+        inrush), VSENSE_MAX cycle-by-cycle peak current limit, TON_MIN leading-edge
+        blanking / min-on-time, FB_FOLD/FOLD_RATIO two-state frequency foldback (a slow
+        folded clock selected while V(FB) is far below target), and UVLO_RISE/UVLO_FALL
+        under-voltage lockout with hysteresis. Load-transient recovery needs no extra
+        modeling -- it is the closed loop's own response to a load step.
 
         Negative feedback (buck): VOUT up -> V(FB) up -> (VREF-FB) down -> less
         current into VC -> VC down -> the peak-current command drops -> the switch
@@ -3931,6 +3984,13 @@ class SpiceConverter:
         vhigh, vlow, isource, isink = (
             n(cp["VHIGH"]), n(cp["VLOW"]), n(cp["ISOURCE"]), n(-cp["ISINK"]),
         )
+        # Supervisory features (Stage 29.3); None = off (byte-identical to 29.1/29.2).
+        vsense_max, ton_min, fb_fold = (
+            cp["VSENSE_MAX"], cp["TON_MIN"], cp["FB_FOLD"],
+        )
+        fold_ratio, uvlo_rise, uvlo_fall = (
+            cp["FOLD_RATIO"], cp["UVLO_RISE"], cp["UVLO_FALL"],
+        )
         per = 1.0 / cp["FSW"]
         tr = per * 1e-3            # narrow switch edge
         thi = per * 0.02           # narrow SET pulse
@@ -3959,7 +4019,58 @@ class SpiceConverter:
         else:
             vref_expr = n(vref)
 
-        lines = pre + [
+        # Frequency foldback (Stage 29.3): a slower folded clock at FSW*FOLD_RATIO is
+        # SELECTED to set the latch while V(FB) is far below target (two-state, not a
+        # continuous VCO -- robust). Absent FB_FOLD, the set clock is the FSW clock.
+        fold = []
+        clk_set = clk               # node the SR latch's set gate samples
+        if fb_fold is not None:
+            clkf, clksel = f"{ref}_clkf", f"{ref}_clksel"
+            perf = per / fold_ratio if fold_ratio else per
+            fold = [
+                f"V{ref}_clkf {clkf} {gnd} PULSE(0 5 0 {tr:g} {tr:g} {thi:g} "
+                f"{perf:g})",
+                f"B{ref}_clksel {clksel} {gnd} V = V({fb}) < {n(fb_fold)} ? "
+                f"V({clkf}) : V({clk})",
+            ]
+            clk_set = clksel
+
+        # Reset expression (Stage 29.3): the 29.1 core (current comparator OR max-duty),
+        # optionally OR'd with the cycle-by-cycle current limit (RAW sensed current past
+        # VSENSE_MAX, slope comp excluded), optionally blanked for TON_MIN after the set
+        # (V(ramp) < TON_MIN*FSW == the leading TON_MIN of the cycle). Built so that
+        # both-off reproduces the exact 29.1 line byte-for-byte.
+        reset_core = (
+            f"V({isig}) > V({vc}) ? 5 : (V({rstd}) > 2.5 ? 5 : 0)"
+        )
+        if vsense_max is not None:
+            reset_core = (
+                f"V({isig}) > V({vc}) ? 5 : (V({rstd}) > 2.5 ? 5 : "
+                f"({ri}*I(V{ref}_isns) > {n(vsense_max)} ? 5 : 0))"
+            )
+        reset_expr = reset_core
+        if ton_min is not None:
+            reset_expr = f"V({ramp}) < {n(ton_min / per)} ? 0 : ({reset_core})"
+
+        # UVLO / EN (Stage 29.3): a hysteretic run latch (switch-held memory, the SR
+        # pattern) gates the gate output off until V(VIN) rises past UVLO_RISE, back off
+        # below UVLO_FALL. Absent UVLO_RISE, the gate is the bare latched Q (29.1).
+        uvlo = []
+        gate_expr = f"V({qm}) > 2.5 ? 5 : 0"
+        if uvlo_rise is not None:
+            runm, run = f"{ref}_runm", f"{ref}_run"
+            uvset, uvrst = f"{ref}_uvset", f"{ref}_uvrst"
+            uvlo = [
+                f"B{ref}_uvset {uvset} {gnd} V = V({vin}) > {n(uvlo_rise)} ? 5 : 0",
+                f"B{ref}_uvrst {uvrst} {gnd} V = V({vin}) < {n(uvlo_fall)} ? 5 : 0",
+                f"S{ref}_uvs {hi} {runm} {uvset} {gnd} SWL{ref}",
+                f"S{ref}_uvr {runm} {gnd} {uvrst} {gnd} SWL{ref}",
+                f"C{ref}_uvr {runm} {gnd} {n(cq)} IC=0",
+                f"B{ref}_run {run} {gnd} V = V({runm}) > 2.5 ? 5 : 0",
+            ]
+            gate_expr = f"V({qm}) > 2.5 ? (V({run}) > 2.5 ? 5 : 0) : 0"
+
+        lines = pre + fold + [
             # ---- oscillator: SET clock + slope-comp ramp + max-duty force-off ----
             f"V{ref}_clk {clk} {gnd} PULSE(0 5 0 {tr:g} {tr:g} {thi:g} {per:g})",
             f"V{ref}_ramp {ramp} {gnd} PULSE(0 1 0 {per * 0.98:g} {per * 0.01:g} "
@@ -3982,20 +4093,22 @@ class SpiceConverter:
             f"V{ref}_isns {swhi} {sw} 0",
             f"B{ref}_isig {isig} {gnd} V = {ri}*I(V{ref}_isns) + "
             f"{mcslope}*V({ramp})",
-            # ---- reset = current comparator OR max-duty, RC-slowed ----
-            f"B{ref}_rst {rstr} {gnd} V = V({isig}) > V({vc}) ? 5 : "
-            f"(V({rstd}) > 2.5 ? 5 : 0)",
+            # ---- reset = current comparator OR max-duty [OR current limit],
+            #      optionally leading-edge-blanked for TON_MIN, RC-slowed ----
+            f"B{ref}_rst {rstr} {gnd} V = {reset_expr}",
             f"R{ref}_rd {rstr} {rstf} {n(rd)}",
             f"C{ref}_rd {rstf} {gnd} {n(cd)}",
             # ---- SR latch (set=clk, RESET-DOMINANT), switch-held memory cap ----
             f"V{ref}_hi {hi} {gnd} 5",
-            f"B{ref}_sg {sg} {gnd} V = V({clk}) > 2.5 ? "
+            f"B{ref}_sg {sg} {gnd} V = V({clk_set}) > 2.5 ? "
             f"(V({rstf}) > 2.5 ? 0 : 5) : 0",
             f"S{ref}_set {hi} {qm} {sg} {gnd} SWL{ref}",
             f"S{ref}_rst {qm} {gnd} {rstf} {gnd} SWL{ref}",
             f"C{ref}_qm {qm} {gnd} {n(cq)} IC=0",
             f".model SWL{ref} SW(Ron=50 Roff=1e9 Vt=2.5 Vh=0.2)",
-            f"B{ref}_gate {gate} {gnd} V = V({qm}) > 2.5 ? 5 : 0",
+        ] + uvlo + [
+            # ---- gate = latched Q [AND the UVLO run signal] ----
+            f"B{ref}_gate {gate} {gnd} V = {gate_expr}",
             # ---- buck switch stage gated by the latch (HS switch + freewheel) ----
             f"S{ref}_hs {vin} {swhi} {gate} {gnd} SWM{ref}",
             f".model SWM{ref} SW(Ron={ron} Roff=1e6 Vt=2.5 Vh=0.2)",
@@ -4003,16 +4116,32 @@ class SpiceConverter:
             f".model DFW{ref} D(IS=1e-9 N=1.05 CJO=100p)",
         ]
         self.spice_circuit.raw_spice += "\n" + "\n".join(lines)
+        # Note any active NEW supervisory features (Stage 29.3) in the provenance so
+        # the netlist records which nonlinear protections the model is emulating. TSS
+        # (pre-existing since 29.1) is deliberately NOT added here, keeping the
+        # provenance string byte-identical for circuits that only use soft-start.
+        sup = []
+        if vsense_max is not None:
+            sup.append(f"ilim={n(vsense_max)}")
+        if ton_min is not None:
+            sup.append(f"tonmin={self._fmt_num(ton_min)}s")
+        if fb_fold is not None:
+            sup.append(f"foldback<{n(fb_fold)}@{n(fold_ratio)}x")
+        if uvlo_rise is not None:
+            sup.append(f"uvlo={n(uvlo_rise)}/{n(uvlo_fall)}")
+        sup_str = (", " + ", ".join(sup)) if sup else ""
         self.model_provenance[ref] = ResolvedModel(
             ref, "cmcontroller", "sim_params",
-            f"{topology}_cmcontroller(vref={n(vref)}, fsw={self._fmt_hz(cp['FSW'])})",
+            f"{topology}_cmcontroller(vref={n(vref)}, "
+            f"fsw={self._fmt_hz(cp['FSW'])}{sup_str})",
         )
         logger.debug(
             f"{ref}: {topology} behavioral CLOSED-LOOP peak-current-mode controller "
             f"(vref={n(vref)}, fsw={self._fmt_hz(cp['FSW'])}, ri={ri}, mcslope="
             f"{mcslope}, dmax={dmax:g}"
-            f"{f', tss={self._fmt_num(tss)}s' if tss else ''}); cycle-accurate .tran "
-            f"needs use_initial_condition=True + initial_conditions={{{vout}:0}}. "
+            f"{f', tss={self._fmt_num(tss)}s' if tss else ''}{sup_str}); "
+            f"cycle-accurate .tran needs use_initial_condition=True + "
+            f"initial_conditions={{{vout}:0}}. "
             f"Behavioral emulation of datasheet specs -- NOT the encrypted silicon; "
             f"CCM; no thermal / gate-charge / protection corners beyond the "
             f"parameterized ones."

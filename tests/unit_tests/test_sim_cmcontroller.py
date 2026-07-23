@@ -258,6 +258,135 @@ def test_provenance_recorded():
     assert prov.name == "buck_cmcontroller(vref=0.8, fsw=500k)", prov.name
 
 
+# --- supervisory features (Stage 29.3) ------------------------------------ #
+
+
+@requires_sim
+def test_supervisory_off_by_default_is_byte_identical():
+    """With no supervisory param set, the emission is byte-identical to 29.1/29.2:
+    the reset is the bare current-comparator-OR-max-duty line, the set gate samples
+    the plain FSW clock, the gate is the bare latched Q, and none of the
+    current-limit / foldback / UVLO nodes appear. This is the additive-only gate."""
+    _setup()
+    u = _cmc_part(Sim_Device="CMCONTROLLER", Sim_Params=_BUCK_PARAMS)
+    net = _emit(u)
+    # the exact 29.1 reset / set-gate / gate lines (no leading blank, no extra OR)
+    assert ("BU1_rst U1_rstr 0 V = V(U1_isig) > V(VC) ? 5 : "
+            "(V(U1_rstd) > 2.5 ? 5 : 0)") in net, net
+    assert ("BU1_sg U1_sg 0 V = V(U1_clk) > 2.5 ? "
+            "(V(U1_rstf) > 2.5 ? 0 : 5) : 0") in net, net
+    assert "BU1_gate U1_gate 0 V = V(U1_qm) > 2.5 ? 5 : 0" in net, net
+    # no supervisory nodes emitted
+    for tok in ("U1_clkf", "U1_clksel", "U1_uvset", "U1_uvrst", "U1_run", "I(VU1_isns) >"):
+        assert tok not in net, (tok, net)
+
+
+@requires_sim
+def test_current_limit_ors_into_reset():
+    """VSENSE_MAX adds a cycle-by-cycle current-limit term to the reset: the latch
+    also resets when the RAW sensed current RI*I(isns) (slope comp excluded) exceeds
+    VSENSE_MAX, OR'd in after the PWM comparator and max-duty."""
+    _setup()
+    u = _cmc_part(
+        Sim_Device="CMCONTROLLER", Sim_Params=_BUCK_PARAMS + " vsense_max=0.11"
+    )
+    net = _emit(u)
+    assert ("BU1_rst U1_rstr 0 V = V(U1_isig) > V(VC) ? 5 : "
+            "(V(U1_rstd) > 2.5 ? 5 : (0.1*I(VU1_isns) > 0.11 ? 5 : 0))") in net, net
+
+
+@requires_sim
+def test_min_on_time_blanks_the_reset():
+    """TON_MIN blanks the reset for the leading TON_MIN of each cycle by gating the
+    whole reset off while V(ramp) < TON_MIN*FSW (here 100 ns / 2 us = 0.05)."""
+    _setup()
+    u = _cmc_part(
+        Sim_Device="CMCONTROLLER", Sim_Params=_BUCK_PARAMS + " ton_min=100n"
+    )
+    net = _emit(u)
+    assert ("BU1_rst U1_rstr 0 V = V(U1_ramp) < 0.05 ? 0 : "
+            "(V(U1_isig) > V(VC) ? 5 : (V(U1_rstd) > 2.5 ? 5 : 0))") in net, net
+
+
+@requires_sim
+def test_frequency_foldback_selects_slower_clock():
+    """FB_FOLD emits a second (folded) clock at FSW*FOLD_RATIO and a selector that
+    clocks the latch with it while V(FB) < FB_FOLD -- the two-state foldback. The set
+    gate then samples the SELECTED clock node, not the plain FSW clock."""
+    _setup()
+    u = _cmc_part(
+        Sim_Device="CMCONTROLLER",
+        Sim_Params=_BUCK_PARAMS + " fb_fold=1.2 fold_ratio=0.25",
+    )
+    net = _emit(u)
+    # folded clock at 500k*0.25 = 125 kHz -> period 8 us
+    assert "VU1_clkf U1_clkf 0 PULSE(0 5 0 " in net and " 8e-06)" in net, net
+    assert ("BU1_clksel U1_clksel 0 V = V(FB) < 1.2 ? V(U1_clkf) : V(U1_clk)"
+            in net), net
+    assert ("BU1_sg U1_sg 0 V = V(U1_clksel) > 2.5 ? "
+            "(V(U1_rstf) > 2.5 ? 0 : 5) : 0") in net, net
+
+
+@requires_sim
+def test_uvlo_gates_gate_with_hysteretic_run_latch():
+    """UVLO_RISE/UVLO_FALL emit a hysteretic run latch (the switch-held-memory SR
+    pattern) that ANDs into the gate: the gate is Q only while the run latch is set,
+    and the run latch sets above UVLO_RISE / resets below UVLO_FALL."""
+    _setup()
+    u = _cmc_part(
+        Sim_Device="CMCONTROLLER",
+        Sim_Params=_BUCK_PARAMS + " uvlo_rise=8 uvlo_fall=7",
+    )
+    net = _emit(u)
+    assert "BU1_uvset U1_uvset 0 V = V(VIN) > 8 ? 5 : 0" in net, net
+    assert "BU1_uvrst U1_uvrst 0 V = V(VIN) < 7 ? 5 : 0" in net, net
+    assert "SU1_uvs U1_hi U1_runm U1_uvset 0 SWLU1" in net, net
+    assert "SU1_uvr U1_runm 0 U1_uvrst 0 SWLU1" in net, net
+    assert re.search(r"CU1_uvr U1_runm 0 [\d.eE+-]+ IC=0", net), net
+    assert "BU1_run U1_run 0 V = V(U1_runm) > 2.5 ? 5 : 0" in net, net
+    assert ("BU1_gate U1_gate 0 V = V(U1_qm) > 2.5 ? "
+            "(V(U1_run) > 2.5 ? 5 : 0) : 0") in net, net
+
+
+@requires_sim
+def test_uvlo_fall_defaults_below_rise():
+    """UVLO_FALL defaults to 0.9*UVLO_RISE (hysteresis) when only UVLO_RISE is set."""
+    _setup()
+    u = _cmc_part(
+        Sim_Device="CMCONTROLLER", Sim_Params=_BUCK_PARAMS + " uvlo_rise=10"
+    )
+    net = _emit(u)
+    assert "BU1_uvset U1_uvset 0 V = V(VIN) > 10 ? 5 : 0" in net, net
+    assert "BU1_uvrst U1_uvrst 0 V = V(VIN) < 9 ? 5 : 0" in net, net
+
+
+@requires_sim
+def test_supervisory_features_recorded_in_provenance():
+    """The active NEW supervisory features are recorded in the provenance name (so the
+    netlist documents which protections it emulates); TSS (pre-existing) is not, so a
+    soft-start-only controller keeps the 29.1 provenance string byte-identical."""
+    _setup()
+    u = _cmc_part(
+        Sim_Device="CMCONTROLLER",
+        Sim_Params=_BUCK_PARAMS + " vsense_max=0.11 uvlo_rise=8",
+    )
+    _wire(u)
+    conv = SpiceConverter(_view())
+    conv.convert(strict=False)
+    name = conv.model_provenance["U1"].name
+    assert "ilim=0.11" in name and "uvlo=8/7.2" in name, name
+
+    # TSS-only keeps the bare 29.1 provenance string
+    _setup()
+    u2 = _cmc_part(
+        ref="U2", Sim_Device="CMCONTROLLER", Sim_Params=_BUCK_PARAMS + " tss=40u"
+    )
+    _wire(u2)
+    conv2 = SpiceConverter(_view())
+    conv2.convert(strict=False)
+    assert conv2.model_provenance["U2"].name == "buck_cmcontroller(vref=0.8, fsw=500k)"
+
+
 # --- validation ----------------------------------------------------------- #
 
 
@@ -453,3 +582,196 @@ def test_error_amp_vc_clamps_at_vhigh_on_overdrive():
     assert abs(vc_tail - vhigh) <= 0.1, ("VC did not clamp at VHIGH", vc_tail)
     # the clamp is a ceiling, not a wall the integrator blew through.
     assert float(vcv.max()) <= vhigh + 0.25, ("VC overshot the clamp", float(vcv.max()))
+
+
+# --- live supervisory features (Stage 29.3, gated) ------------------------ #
+
+_TARGET = 0.8 * (43.0 + 13.7) / 13.7  # ~3.31 V regulated rail (0.8 V ref divider)
+
+
+def _build_buck(u, *, rload="3.3", vin_src=None):
+    """Wire the standard 12 V -> 3.3 V buck power stage around a CMCONTROLLER part.
+
+    ``vin_src`` overrides the default 12 V VDC (e.g. a ramping VPULSE for UVLO). All
+    real external parts (L/Cout/divider/comp) are the same as the 29.1 canary."""
+    if vin_src is None:
+        vin_src = Part("Simulation_SPICE", "VDC", value="12", ref="V1")
+    L1 = Part("Device", "L", value="22u", ref="L1")
+    Co = Part("Device", "C", value="47u", ref="C1")
+    Rl = Part("Device", "R", value=rload, ref="RL")
+    Rt = Part("Device", "R", value="43k", ref="RT")
+    Rb = Part("Device", "R", value="13.7k", ref="RB")
+    Rc = Part("Device", "R", value="22k", ref="RC")
+    Cc = Part("Device", "C", value="2.2n", ref="CC")
+    vin, sw, vout, vc, ncc = (Net(n) for n in ("VIN", "SW", "VOUT", "VC", "NCC"))
+    fb, gnd = Net("FB"), Net("GND")
+    vin.connect(vin_src[1], u["VIN"])
+    gnd.connect(vin_src[2], u["GND"], Co[2], Rl[2], Rb[2], Cc[2])
+    sw.connect(u["SW"], L1[1])
+    vout.connect(L1[2], u["VOUT"], Co[1], Rl[1], Rt[1])
+    fb.connect(Rt[2], Rb[1], u["FB"])
+    vc.connect(u["VC"], Rc[1])
+    ncc.connect(Rc[2], Cc[1])
+
+
+def _tran(end_time, **kw):
+    from skidl.sim import simulate
+
+    per = 1.0 / 500e3
+    return simulate().transient_analysis(
+        step_time=per / 100, end_time=end_time, max_time=per / 50, stiff=True,
+        use_initial_condition=True, initial_conditions={"VOUT": 0}, **kw,
+    )
+
+
+def _iload(res):
+    """Inductor branch current I(L1) as a numpy array (ngspice branch 'll1')."""
+    import numpy as np
+
+    return np.asarray(res.analysis.branches["ll1"], dtype=float)
+
+
+@requires_sim
+def test_soft_start_bounds_inrush_no_overshoot():
+    """Live soft-start (TSS): the rail rises monotonically to target with the rise
+    time set by TSS and NO overshoot, and the startup inductor current is bounded --
+    a longer TSS lowers the peak inrush current vs a near-instant reference. This is
+    the Stage 29.3 soft-start behavior (a monotone reference ramp)."""
+    import numpy as np
+
+    # long soft-start
+    _setup()
+    u = _cmc_part(Sim_Device="CMCONTROLLER", Sim_Params=_BUCK_PARAMS + " tss=120u")
+    _build_buck(u)
+    try:
+        res = _tran(300e-6)
+    except Exception as e:  # noqa: BLE001
+        pytest.skip(f"ngspice not available: {type(e).__name__}: {str(e)[:80]}")
+    t = np.asarray(res.analysis.time, dtype=float)
+    vo = np.asarray(res.analysis["VOUT"], dtype=float)
+    assert np.isfinite(vo).all(), "diverged"
+    # reaches target, no overshoot beyond 5 %
+    assert abs(float(vo[t > t[-1] - 30e-6].mean()) - _TARGET) / _TARGET <= 0.05
+    assert float(vo.max()) <= _TARGET * 1.05, ("overshoot", float(vo.max()))
+    # rise time tracks TSS: VOUT crosses 90 % target near TSS, not long before it
+    cross = t[np.argmax(vo >= 0.9 * _TARGET)]
+    assert 0.6 * 120e-6 <= cross <= 2.2 * 120e-6, ("rise time not ~TSS", cross)
+    ipk_slow = float(np.max(np.abs(_iload(res))))
+
+    # near-instant reference draws a larger inrush peak
+    _setup()
+    u2 = _cmc_part(Sim_Device="CMCONTROLLER", Sim_Params=_BUCK_PARAMS + " tss=2u")
+    _build_buck(u2)
+    res2 = _tran(300e-6)
+    ipk_fast = float(np.max(np.abs(_iload(res2))))
+    assert ipk_slow < ipk_fast, ("soft-start did not lower inrush", ipk_slow, ipk_fast)
+
+
+@requires_sim
+def test_peak_current_limit_clamps_into_short():
+    """Live cycle-by-cycle current limit (VSENSE_MAX): into a hard short the peak
+    inductor current clamps at ~VSENSE_MAX/RI and the rail collapses (constant
+    current), instead of the ideal switch running the current away. With the limit
+    OFF the same short draws a materially larger peak current."""
+    import numpy as np
+
+    ri, vsmax = 0.1, 0.3            # -> ~3 A peak current limit
+    ilim = vsmax / ri
+    # limit ON, hard short
+    _setup()
+    u = _cmc_part(
+        Sim_Device="CMCONTROLLER",
+        Sim_Params=f"topology=buck fsw=500k vout=3.3 vin=12 vref=0.8 ri={ri} "
+        f"mcslope=0.1 tss=20u vsense_max={vsmax}",
+    )
+    _build_buck(u, rload="0.4")     # hard short: demands >> ilim at 3.3 V
+    try:
+        res = _tran(200e-6)
+    except Exception as e:  # noqa: BLE001
+        pytest.skip(f"ngspice not available: {type(e).__name__}: {str(e)[:80]}")
+    vo = np.asarray(res.analysis["VOUT"], dtype=float)
+    il = _iload(res)
+    assert np.isfinite(vo).all() and np.isfinite(il).all(), "diverged"
+    ipk_lim = float(np.max(np.abs(il)))
+    # peak inductor current clamps near the datasheet limit (cycle-by-cycle),
+    # allowing ripple/overshoot above the average trip point.
+    assert ipk_lim <= ilim * 1.6, ("current not limited", ipk_lim, ilim)
+    # the rail collapses under the short (constant-current, not regulating)
+    assert float(vo[-1]) < 0.7 * _TARGET, ("rail did not collapse", float(vo[-1]))
+
+    # limit OFF: the same short draws a larger peak
+    _setup()
+    u2 = _cmc_part(
+        Sim_Device="CMCONTROLLER",
+        Sim_Params=f"topology=buck fsw=500k vout=3.3 vin=12 vref=0.8 ri={ri} "
+        f"mcslope=0.1 tss=20u",
+    )
+    _build_buck(u2, rload="0.4")
+    res2 = _tran(200e-6)
+    ipk_free = float(np.max(np.abs(_iload(res2))))
+    assert ipk_lim < ipk_free, ("limit did not reduce peak", ipk_lim, ipk_free)
+
+
+@requires_sim
+def test_uvlo_holds_gate_off_below_threshold():
+    """Live UVLO: with VIN ramped 0 -> 12 V, the gate stays quiet while VIN is below
+    UVLO_RISE and only starts switching after VIN crosses it (hysteretic run latch)."""
+    import numpy as np
+
+    _setup()
+    u = _cmc_part(
+        Sim_Device="CMCONTROLLER",
+        Sim_Params=_BUCK_PARAMS + " tss=20u uvlo_rise=8 uvlo_fall=7",
+    )
+    # VIN ramps linearly 0 -> 12 V over 200 us (crosses 8 V at ~133 us), then holds.
+    vramp = Part("Simulation_SPICE", "VPULSE", value="0", ref="V1")
+    vramp.Sim_Params = "v1=0 v2=12 td=0 tr=200u tf=1u pw=1 per=2"
+    _build_buck(u, vin_src=vramp)
+    try:
+        res = _tran(360e-6)
+    except Exception as e:  # noqa: BLE001
+        pytest.skip(f"ngspice not available: {type(e).__name__}: {str(e)[:80]}")
+    t = np.asarray(res.analysis.time, dtype=float)
+    g = np.asarray(res.analysis["U1_gate"], dtype=float)
+    t_cross = 8.0 / 12.0 * 200e-6   # VIN = UVLO_RISE
+    # essentially no switching before the threshold (allow a stray edge from ramp)
+    pre = (t[:-1] < t_cross - 10e-6)
+    rises_pre = int(np.sum((g[:-1] < 2.5) & (g[1:] >= 2.5) & pre))
+    assert rises_pre <= 1, ("gate switched below UVLO", rises_pre)
+    # switching after the threshold
+    post = (t[:-1] > t_cross + 15e-6)
+    rises_post = int(np.sum((g[:-1] < 2.5) & (g[1:] >= 2.5) & post))
+    assert rises_post > 20, ("gate did not start above UVLO", rises_post)
+
+
+@requires_sim
+def test_frequency_foldback_slows_switching_under_low_fb():
+    """Live two-state frequency foldback: held into a sustained short (V(FB) far below
+    FB_FOLD), the latch is clocked by the folded clock, so the measured switching rate
+    is ~FSW*FOLD_RATIO instead of FSW. A current limit keeps the short current bounded."""
+    import numpy as np
+
+    _setup()
+    u = _cmc_part(
+        Sim_Device="CMCONTROLLER",
+        Sim_Params="topology=buck fsw=500k vout=3.3 vin=12 vref=0.8 ri=0.1 "
+        "mcslope=0.1 tss=10u vsense_max=0.3 fb_fold=0.4 fold_ratio=0.25",
+    )
+    _build_buck(u, rload="0.4")     # hard short holds FB well below 0.4
+    try:
+        res = _tran(240e-6)
+    except Exception as e:  # noqa: BLE001
+        pytest.skip(f"ngspice not available: {type(e).__name__}: {str(e)[:80]}")
+    t = np.asarray(res.analysis.time, dtype=float)
+    g = np.asarray(res.analysis["U1_gate"], dtype=float)
+    fb = np.asarray(res.analysis["FB"], dtype=float)
+    # confirm we are genuinely in foldback (FB below the threshold in the tail)
+    m = t > (t[-1] - 120e-6)
+    assert float(fb[m].mean()) < 0.4, ("not in foldback", float(fb[m].mean()))
+    tt, gt = t[m], g[m]
+    rises = int(np.sum((gt[:-1] < 2.5) & (gt[1:] >= 2.5)))
+    fsw_meas = rises / (tt[-1] - tt[0])
+    folded = 500e3 * 0.25           # 125 kHz
+    # the switching rate is the folded rate, clearly below the nominal FSW
+    assert abs(fsw_meas - folded) / folded <= 0.35, ("not folded", fsw_meas)
+    assert fsw_meas < 0.5 * 500e3, ("rate not reduced", fsw_meas)
