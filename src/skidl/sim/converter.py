@@ -3376,7 +3376,20 @@ class SpiceConverter:
                      into the current signal (default 0.1). Raise it if a D>0.5 run
                      subharmonic-oscillates (Basso Fig. 5c/d); aliased ``MC_SLOPE``;
           * ``REA``  finite error-amp DC-gain resistor on VC (default 1e6), a DC-path
-                     safety (the AC shaping is the user's real Rth/Cth);
+                     safety (the AC shaping is the user's real Rth/Cth). May instead
+                     be set implicitly via ``GAIN`` (below);
+          * ``GAIN`` error-amp DC open-loop gain in dB (Stage 29.2). When given (and
+                     ``REA`` is not), REA is derived as ``10^(GAIN/20)/GM`` so the
+                     gm-into-REA DC gain equals GAIN; an explicit REA always wins;
+          * ``VHIGH``/``VLOW``  error-amp output-swing clamps on VC (default 2.4 / 0.0
+                     V; Stage 29.2). The VC/ITH pin cannot exceed these internal rails
+                     -- the ceiling soft-start ramps up to and the anti-windup floor.
+                     Realized as soft diode clamps (never a hard voltage clamp, which
+                     would zero the integrator Jacobian);
+          * ``ISOURCE``/``ISINK``  error-amp source/sink current limits in amps
+                     (default 1e-3 each; Stage 29.2). The gm cell can only push/pull a
+                     finite current into the ITH pin -- clamped on the CURRENT
+                     (``min``/``max``), which slew-limits VC without floating the node;
           * ``RON``  emitted switch on-resistance in ohms (default 0.1);
           * ``DMAX`` max duty (default 0.9); a max-duty pulse force-resets the latch
                      past it, bounding inrush even before soft-start;
@@ -3400,13 +3413,27 @@ class SpiceConverter:
         if not fsw or fsw <= 0:
             return None
         topology = str(raw.get("TOPOLOGY", "buck")).strip().lower() or "buck"
+        gm = g("GM", 250e-6)
+        # Finite error-amp DC gain: an explicit REA wins; else derive from GAIN (dB)
+        # as 10^(GAIN/20)/GM so the gm-into-REA DC gain equals GAIN; else the default.
+        if "REA" in raw:
+            rea = g("REA", 1e6)
+        elif "GAIN" in raw:
+            gain_db = self._parse_si_number(raw["GAIN"])
+            rea = (10.0 ** (gain_db / 20.0)) / gm if (gain_db is not None and gm) else 1e6
+        else:
+            rea = 1e6
         return {
             "VREF": vref,
             "FSW": fsw,
-            "GM": g("GM", 250e-6),
+            "GM": gm,
             "RI": g("RI", 0.1),
             "MCSLOPE": g("MCSLOPE", g("MC_SLOPE", 0.1)),
-            "REA": g("REA", 1e6),
+            "REA": rea,
+            "VHIGH": g("VHIGH", 2.4),
+            "VLOW": g("VLOW", 0.0),
+            "ISOURCE": g("ISOURCE", 1e-3),
+            "ISINK": g("ISINK", 1e-3),
             "RON": g("RON", 0.1),
             "DMAX": g("DMAX", 0.9),
             "TSS": g("TSS", 0.0),
@@ -3836,8 +3863,10 @@ class SpiceConverter:
 
             oscillator   VCLK narrow SET pulse @ FSW; VRAMP 0->1 slope sawtooth;
                          VDUTY max-duty force-off pulse past DMAX
-            error amp    B_ea: I into VC = GM*(VREF - V(FB))  (reuses 28.D's gm cell)
+            error amp    B_ea: I into VC = clamp(GM*(VREF - V(FB)), -ISINK, ISOURCE)
+                         (28.D's gm cell, now source/sink-limited; Stage 29.2)
                          R_ea VC->GND REA (finite-DC-gain / DC-path safety)
+                         soft VHIGH/VLOW diode clamps bound the VC output swing
             sense+slope  V_isns (0 V) in the switch branch -> I(V_isns) = iL(on);
                          B_isig = RI*I(V_isns) + MCSLOPE*V(ramp)
             reset        B_rst = (isig > VC) OR (past DMAX), RC-slowed (Basso conv.)
@@ -3899,6 +3928,9 @@ class SpiceConverter:
             cp["VREF"], n(cp["GM"]), n(cp["REA"]), n(cp["RI"]),
             n(cp["MCSLOPE"]), n(cp["RON"]), cp["DMAX"], cp["TSS"],
         )
+        vhigh, vlow, isource, isink = (
+            n(cp["VHIGH"]), n(cp["VLOW"]), n(cp["ISOURCE"]), n(-cp["ISINK"]),
+        )
         per = 1.0 / cp["FSW"]
         tr = per * 1e-3            # narrow switch edge
         thi = per * 0.02           # narrow SET pulse
@@ -3934,9 +3966,18 @@ class SpiceConverter:
             f"0 {per:g})",
             f"V{ref}_duty {rstd} {gnd} PULSE(0 5 {per * dmax:g} {tr:g} {tr:g} "
             f"{dmax_off:g} {per:g})",
-            # ---- error amp: gm cell into the real external VC net (28.D cell) ----
-            f"B{ref}_ea {gnd} {vc} I = {gm}*({vref_expr} - V({fb}))",
+            # ---- error amp: gm cell into the real external VC net (28.D cell),
+            #      source/sink-limited (min/max on the CURRENT -- slew-limits VC
+            #      without floating the node) with soft VHIGH/VLOW output-swing
+            #      clamps (Basso Fig. 4; Stage 29.2). REA keeps the DC path. ----
+            f"B{ref}_ea {gnd} {vc} I = min(max({gm}*({vref_expr} - V({fb})), "
+            f"{isink}), {isource})",
             f"R{ref}_ea {vc} {gnd} {rea}",
+            f"V{ref}_vh {ref}_vh {gnd} {vhigh}",
+            f"D{ref}_hi {vc} {ref}_vh DCL{ref}",
+            f"V{ref}_vl {ref}_vl {gnd} {vlow}",
+            f"D{ref}_lo {ref}_vl {vc} DCL{ref}",
+            f".model DCL{ref} D(RS=10 N=0.01)",
             # ---- current sense (0 V in the switch branch) + slope-comp signal ----
             f"V{ref}_isns {swhi} {sw} 0",
             f"B{ref}_isig {isig} {gnd} V = {ri}*I(V{ref}_isns) + "
