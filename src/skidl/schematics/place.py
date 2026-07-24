@@ -98,6 +98,12 @@ def get_snap_pt(part_or_blk):
     """
     try:
         return part_or_blk.pins[0].pt
+    except IndexError:
+        # A part with no pins at all -- a mounting hole, fiducial or logo. There
+        # is no pin to align, but it is still a part that has to land on the
+        # sheet, so snap its own origin. Returning None here (or letting the
+        # IndexError escape, as it used to) aborts the whole render.
+        return Point(0, 0)
     except AttributeError:
         try:
             return part_or_blk.snap_pt
