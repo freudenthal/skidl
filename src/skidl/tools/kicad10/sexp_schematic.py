@@ -2954,6 +2954,30 @@ def _validate_with_kicad_cli(filepath):
 # ---------------------------------------------------------------------------
 
 
+def _restore_private_property_flags(sexp):
+    """Undo the mis-quoting of a symbol property's leading ``private`` KEYWORD.
+
+    A KiCad symbol property may carry a bare ``private`` flag before its name --
+    ``(property private "Name" "Value" ...)`` (common on the KLC graphical-note
+    properties that ship in library symbols such as ``Device:Crystal_GND23`` and
+    other 4-pin crystals). ``add_quotes`` quotes EVERY string of a ``property``
+    list from index 1, so it emits ``(property "private" ...)`` -- invalid, and
+    KiCad then FAILS TO LOAD the whole sheet, silently dropping every component on
+    it from the exported netlist. That was the root cause of the
+    ``stm32_bluepill`` / ``feather_rp2040`` "components missing from the drawing"
+    failure. Walk the tree and restore the bare flag. ``private`` is never an
+    actual property name (KiCad names are Reference / Value / Footprint / ki_* /
+    KLC_* ...), and the real name always follows it, so this is unambiguous.
+    Mutates ``sexp`` in place; call AFTER ``add_quotes``.
+    """
+    if isinstance(sexp, list):
+        if len(sexp) > 2 and sexp[0] == "property" and sexp[1] == '"private"':
+            sexp[1] = "private"
+        for item in sexp:
+            if isinstance(item, list):
+                _restore_private_property_flags(item)
+
+
 def _write_sexp_schematic(schematic, filepath):
     """Write an Sexp schematic object to a file with proper quoting.
 
@@ -2992,6 +3016,9 @@ def _write_sexp_schematic(schematic, filepath):
 
     schematic.add_quotes(need_quote)
     schematic.add_quotes(need_quote_alternate, stop_idx=2)
+    # add_quotes wrongly quotes the leading ``private`` keyword flag on KLC
+    # note-properties (e.g. Crystal_GND23); restore it so KiCad can load the sheet.
+    _restore_private_property_flags(schematic)
 
     with open(filepath, "w") as f:
         f.write(schematic.to_str())
