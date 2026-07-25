@@ -423,6 +423,11 @@ class SpiceConverter:
             return "resistor"
         if "Device:C" in symbol:
             return "capacitor"
+        # LEDs are diodes -- match BEFORE the inductor check, because "Device:LED"
+        # contains "Device:L" as a substring and would otherwise be misread as an
+        # inductor (and it is not caught by the "Device:D" diode branch either).
+        if "Device:LED" in symbol:
+            return "diode"
         if "Device:L" in symbol:
             return "inductor"
         if "Device:D" in symbol or "Diode:" in symbol:
@@ -453,12 +458,16 @@ class SpiceConverter:
         # resolve -- multi-winding parts fail terminal resolution with a clear error.
         if "Device:Transformer" in symbol:
             return "transformer"
-        if any(x in symbol.lower() for x in ["op", "amp", "lm", "tl"]):
-            return "opamp"
+        # Transistors before the op-amp heuristic: many transistor MPNs contain
+        # "lm"/"tl"/"op" as substrings (e.g. Transistor_FET:IRLML0030 contains
+        # "lm") and would otherwise be misread as op-amps (same trap the regulator
+        # checks above guard against).
         if "Transistor_BJT:" in symbol or "Device:Q" in symbol:
             return "bjt"
         if "Transistor_FET:" in symbol or "Device:M" in symbol:
             return "mosfet"
+        if any(x in symbol.lower() for x in ["op", "amp", "lm", "tl"]):
+            return "opamp"
         return None
 
     # KiCad ``Sim.Device`` device tokens -> our SPICE primitive kinds. Lets a
@@ -511,6 +520,15 @@ class SpiceConverter:
         "SPARKGAP": "trigsw",
         "DIAC": "trigsw",
         "AVSW": "trigsw",
+        # Optical coupling primitive: a behavioral photocurrent source whose value
+        # tracks a driving branch current (photocurrent = k * I(sense)). Models the
+        # LED-emitter -> photodiode-detector light path as a linear current scale
+        # so a sim can couple a driven LED's current to a photodiode front-end
+        # without a real optical channel. Two terminals (A/K); the controlling
+        # current is read from a named 0 V series sense source via Sim.Params.
+        "OPTOCOUPLER": "optocoupler",
+        "LEDPD": "optocoupler",
+        "PHOTOCOUPLER": "optocoupler",
         "NOT": "gate",
         "INV": "gate",
         "BUF": "gate",
@@ -665,6 +683,7 @@ class SpiceConverter:
             "dlatch": self._add_dlatch,
             "trigsw": self._add_trigsw,
             "gate": self._add_gate,
+            "optocoupler": self._add_optocoupler,
         }
         handler = handlers.get(self._kind(component))
         if handler is None:
@@ -2691,6 +2710,115 @@ class SpiceConverter:
             f"Added behavioral TRIGSW {ref} ({mode}): P={p} N={n_} "
             f"G={ctrl} vt={vt} gon={gon} rleak={rleak}"
         )
+
+    # Optical-coupling terminals (by pin NAME, or a Sim.Pins override). ``A`` is the
+    # photodiode output terminal (wired into the detector front-end, e.g. a TIA
+    # summing node); ``K`` is its return. A generic ``Device:D`` photodiode symbol
+    # exposes A/K directly.
+    _OPTO_A_NAMES = {"A", "ANODE", "AN", "OUT", "PD", "P", "+"}
+    _OPTO_K_NAMES = {"K", "CATHODE", "KA", "N", "RET", "-"}
+
+    def _add_optocoupler(self, component, ref: str, value: str):
+        """Behavioral optical coupler (Sim.Device=OPTOCOUPLER/LEDPD/PHOTOCOUPLER).
+
+        Models an emitter (a driven LED) -> detector (a photodiode) light path as a
+        LINEAR current scale: the photodiode delivers a photocurrent proportional to
+        the emitter's branch current, ``i_pd = K * I(<sense>)``. This lets a
+        simulation couple a real, driven LED's current to a photodiode front-end
+        (e.g. a transimpedance amp) without modeling an optical channel -- exactly
+        the "scale the LED current to approximate the detected intensity" idiom.
+
+        Terminals (by pin NAME, or a ``Sim.Pins`` override): ``A`` the photodiode
+        output terminal (into the detector, e.g. a TIA virtual-ground summing node),
+        ``K`` its return (typically GND). Positive photocurrent flows A->K *through*
+        the source, i.e. it is pulled OUT of node A -- so on an inverting shunt-
+        feedback TIA (A=summing node, K=GND) the output goes positive with intensity,
+        matching a fixed ``Simulation_SPICE:ISIN`` photocurrent source wired the same
+        way (see the SiPM-TIA canary).
+
+        Two ways to read the emitter current, so the coupler works on a REAL board
+        (not just a sim-only rig):
+
+          * **Current-sense** ``sense=<ref>`` -- the skidl *ref* of a
+            ``Simulation_SPICE:VDC`` (0 V) source in series with the emitter LED;
+            ``i_pd = K * I(V<sense>)``. Exact, but the 0 V source is sim-only (it is
+            stripped from the board, breaking that branch's continuity), so use this
+            only for a sim-only harness. The ngspice deck names a source ``V<ref>``
+            (PySpice prepends the ``V`` prefix), so ``sense=VLED`` -> ``I(VVLED)``;
+            pass the plain skidl ref.
+          * **Voltage-sense** ``gm=<S> vp=<net> vn=<net>`` -- a VCCS keyed on the
+            voltage across a REAL series sense resistor (e.g. the LED-branch shunt
+            the INA219 already reads): ``i_pd = GM * V(vp,vn)``. Nothing sim-only is
+            needed, so the SAME circuit renders to a board AND simulates. ``GM``
+            folds the photodiode responsivity, the optical loss, AND the shunt value
+            (``i_pd = K*I_led`` with ``V=I_led*Rshunt`` -> ``GM = K/Rshunt``). This
+            is the preferred mode for a board that must also fabricate.
+
+        ``Sim.Params``:
+          * ``K`` / ``GAIN`` -- current-sense coupling coefficient (A of photocurrent
+            per A of emitter current; default 1e-3).
+          * ``GM`` -- voltage-sense transconductance (A of photocurrent per V across
+            the sense resistor). Presence of ``GM`` selects voltage-sense mode.
+          * ``VP`` / ``VN`` -- sense-resistor + / - net names (voltage-sense).
+          * ``SENSE`` -- 0 V series-source ref (current-sense).
+
+        Emission (behavioral ``B`` current source, like the TRIGSW/LDO emitters)::
+
+            B<ref>_pd  A K  I = <K>  * I(V<sense>)      # current-sense
+            B<ref>_pd  A K  I = <GM> * V(vp,vn)         # voltage-sense
+
+        Provenance tier ``sim_params``.
+        """
+        nodes = self._logic_pin_nodes(component)
+        if nodes is None:
+            logger.warning(f"OPTOCOUPLER {ref}: no live pin map; skipping")
+            return
+        a = self._first_named(nodes, self._OPTO_A_NAMES)
+        k_node = self._first_named(nodes, self._OPTO_K_NAMES)
+        prm = self._parse_sim_params(self._sim_props(component).get("params"))
+        if a is None or k_node is None:
+            logger.warning(
+                f"OPTOCOUPLER {ref}: needs A/K terminals (by pin name or Sim.Pins); "
+                f"skipping (got A={a}, K={k_node})"
+            )
+            return
+
+        # Voltage-sense mode (preferred, board-fabricable) wins when GM is given.
+        if "GM" in prm:
+            gm = self._fmt_num(self._parse_si_number(prm.get("GM")) or 0.0)
+            vp = str(prm.get("VP", "")).strip()
+            vn = str(prm.get("VN", "")).strip()
+            if not vp or not vn:
+                logger.warning(
+                    f"OPTOCOUPLER {ref}: voltage-sense needs Sim.Params vp=<net> "
+                    f"vn=<net>; skipping (vp={vp!r}, vn={vn!r})"
+                )
+                return
+            vp = self.node_map.get(vp, vp)
+            vn = self.node_map.get(vn, vn)
+            expr = f"{gm}*V({vp},{vn})"
+            desc = f"opto_v(gm={gm}, vsense={vp},{vn})"
+        else:
+            gain = prm.get("K", prm.get("GAIN", "1e-3"))
+            gain = self._fmt_num(self._parse_si_number(gain) or 1e-3)
+            sense = str(prm.get("SENSE", "")).strip()
+            if not sense:
+                logger.warning(
+                    f"OPTOCOUPLER {ref}: needs either voltage-sense (gm/vp/vn) or "
+                    f"current-sense (sense=<0V source ref>); skipping"
+                )
+                return
+            # PySpice names a Simulation_SPICE:VDC ref "VLED" as deck element
+            # "VVLED", so prepend the V prefix (idempotent if already VV).
+            elem = sense if sense.upper().startswith("VV") else "V" + sense
+            expr = f"{gain}*I({elem})"
+            desc = f"opto_i(k={gain}, sense={elem})"
+
+        self.spice_circuit.raw_spice += f"\nB{ref}_pd {a} {k_node} I = {expr}"
+        self.model_provenance[ref] = ResolvedModel(
+            ref, "optocoupler", "sim_params", desc
+        )
+        logger.debug(f"Added behavioral OPTOCOUPLER {ref}: A={a} K={k_node} i_pd={expr}")
 
     def _gate_expr(self, op, his, vdd):
         """ngspice B-source expression for a logic gate over input predicates ``his``.
