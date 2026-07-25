@@ -26,6 +26,7 @@ from skidl.schematics.route import (
     _astar_pair,
     _colinear_foreign,
     _mst_edges,
+    _pt_on_foreign,
     _seg_hits_interior,
 )
 
@@ -124,6 +125,62 @@ def test_colinear_overlap_forbidden():
     assert path is not None
     for x0, y0, x1, y1 in _segments(path):
         assert not _colinear_foreign(x0, y0, x1, y1, "B", foreign_h, foreign_v)
+
+
+def test_pt_on_foreign_endpoint_and_body():
+    """(c2) A vertex landing ON a foreign ROUTED wire (endpoint OR body) is a
+    silent cross-net merge -- the abutting-riser / corner-on-wire short that
+    _colinear_foreign (positive-length overlap only) misses."""
+    # Net A owns a routed vertical riser at x=200, y in [0, 100], and a routed
+    # horizontal wire at y=200, x in [100, 300].
+    routed_v = {200: [(0, 100, "A")]}
+    routed_h = {200: [(100, 300, "A")]}
+    # A different net touching A's riser -- at an endpoint (abutting) or mid-body
+    # (a T-junction) -- both fuse in KiCad, so both are vetoed.
+    assert _pt_on_foreign(200, 100, "B", routed_h, routed_v) is True   # riser endpoint
+    assert _pt_on_foreign(200, 50, "B", routed_h, routed_v) is True    # riser body
+    assert _pt_on_foreign(200, 200, "B", routed_h, routed_v) is True   # wires' shared corner
+    assert _pt_on_foreign(150, 200, "B", routed_h, routed_v) is True   # horizontal body
+    # The SAME net may share its own geometry (no self-merge).
+    assert _pt_on_foreign(200, 50, "A", routed_h, routed_v) is False
+    # A point clear of every foreign routed wire is free.
+    assert _pt_on_foreign(200, 150, "B", routed_h, routed_v) is False
+    assert _pt_on_foreign(0, 0, "B", routed_h, routed_v) is False
+
+
+def test_router_veto_avoids_abutting_a_foreign_riser():
+    """(c3) With the endpoint-touch veto ON, a net routes AROUND a foreign riser
+    instead of abutting it end-to-end (the trinket mcu_block short mechanism).
+
+    Net A owns a routed vertical riser at x=200, y in [-100, 0]. Net B routes
+    from (0,0) to (200,-200): the cheapest path would drop straight down x=200,
+    abutting A's riser at the shared vertex (200,0) and fusing the two nets. The
+    veto forbids any B vertex landing on A's routed wire (its own goal exempt),
+    so B must detour to a different column."""
+    routed_h = {}
+    routed_v = {200: [(-100, 0, "A")]}
+    path = _astar_pair(
+        (0, 0), (200, -200), [], {}, {}, {}, net="B", margin=100, turn=50.0,
+        routed_h=routed_h, routed_v=routed_v,
+    )
+    assert path is not None
+    # No interior vertex of B lands on A's routed riser (goal (200,-200) is the
+    # only point allowed to sit on x=200, and it is below A's riser anyway).
+    for (vx, vy) in path[:-1]:
+        assert not _pt_on_foreign(vx, vy, "B", routed_h, routed_v), (vx, vy)
+
+
+def test_router_veto_exempts_own_goal_pin():
+    """(c4) The veto never blocks a net from reaching its OWN goal pin, even when
+    that pin happens to lie on a foreign routed wire (pins may share a point the
+    router does not get to move)."""
+    routed_v = {200: [(-100, 100, "A")]}
+    path = _astar_pair(
+        (0, 0), (200, 0), [], {}, {}, {}, net="B", margin=100, turn=50.0,
+        routed_h={}, routed_v=routed_v,
+    )
+    # The goal (200,0) is on A's riser but is the net's own endpoint -> reachable.
+    assert path is not None and path[-1] == (200, 0)
 
 
 def test_enclosed_pin_returns_none():

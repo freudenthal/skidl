@@ -212,6 +212,29 @@ def _colinear_foreign(x0, y0, x1, y1, net, foreign_h, foreign_v):
     return False
 
 
+def _pt_on_foreign(x, y, net, routed_h, routed_v):
+    """True if ``(x, y)`` lies ON a DIFFERENT net's already-routed segment.
+
+    Endpoint-inclusive (body OR endpoint): KiCad fuses two wires wherever a
+    vertex of one touches any point of the other, so a routed step whose
+    destination vertex lands on a foreign routed wire is a silent cross-net
+    merge -- exactly the abutting-riser / corner-on-wire short that
+    ``_colinear_foreign`` (positive-length overlap only) misses.
+
+    ``routed_h`` maps y -> list of (xlo, xhi, net); ``routed_v`` maps
+    x -> list of (ylo, yhi, net). Only A*-ROUTED segments are registered here
+    (never the pin->edge stubs), so pins are never boxed in by their own
+    approach stubs.
+    """
+    for xlo, xhi, onet in routed_h.get(y, ()):
+        if onet is not net and xlo <= x <= xhi:
+            return True
+    for ylo, yhi, onet in routed_v.get(x, ()):
+        if onet is not net and ylo <= y <= yhi:
+            return True
+    return False
+
+
 def _mst_edges(points):
     """Prim MST over world points; deterministic (dist, endpoints) tie-break.
 
@@ -249,6 +272,8 @@ def _astar_pair(
     extra_ys=(),
     margin=100,
     turn=50.0,
+    routed_h=None,
+    routed_v=None,
 ):
     """A* on a Hanan grid from world point ``a`` to ``b`` for ``net``.
 
@@ -335,6 +360,20 @@ def _astar_pair(
             if _seg_hits_interior(cx, cy, wx, wy, obstacles):
                 continue
             if _colinear_foreign(cx, cy, wx, wy, net, foreign_h, foreign_v):
+                continue
+            # Endpoint-touch veto: reject a destination vertex that lands ON a
+            # different net's already-ROUTED wire (endpoint or body) -- that is
+            # exactly where KiCad fuses two wires (the abutting-riser / corner-
+            # on-wire short). The net's own start/goal pins are exempt (they must
+            # remain reachable). Perpendicular crossings, where the step passes
+            # THROUGH a foreign wire without a vertex on it, stay legal: only the
+            # step's endpoint vertex is tested here.
+            if (
+                routed_h is not None
+                and (wx, wy) != b
+                and (wx, wy) != a
+                and _pt_on_foreign(wx, wy, net, routed_h, routed_v)
+            ):
                 continue
             cost = (
                 abs(wx - cx) + abs(wy - cy) + (turn if indir and indir != axis else 0.0)
@@ -1366,12 +1405,22 @@ class Router:
         # add_routing_points) keyed by axis+coord, for colinear-overlap veto.
         foreign_h = defaultdict(list)  # y -> list of (xlo, xhi, net)
         foreign_v = defaultdict(list)  # x -> list of (ylo, yhi, net)
+        # ROUTED-only registry (A*-drawn segments, NOT the pin->edge stubs), used
+        # by the endpoint-touch veto so a step vertex never lands on a foreign
+        # routed wire. Kept separate from foreign_h/foreign_v (which also carry
+        # the pin stubs) so pins are not boxed in by their own approach stubs.
+        routed_h = defaultdict(list)  # y -> list of (xlo, xhi, net)
+        routed_v = defaultdict(list)  # x -> list of (ylo, yhi, net)
 
-        def register(net, x0, y0, x1, y1):
+        def register(net, x0, y0, x1, y1, routed=False):
             if y0 == y1:
                 foreign_h[y0].append((min(x0, x1), max(x0, x1), net))
+                if routed:
+                    routed_h[y0].append((min(x0, x1), max(x0, x1), net))
             elif x0 == x1:
                 foreign_v[x0].append((min(y0, y1), max(y0, y1), net))
+                if routed:
+                    routed_v[x0].append((min(y0, y1), max(y0, y1), net))
 
         for net, segs in node.wires.items():
             for seg in segs:
@@ -1402,6 +1451,8 @@ class Router:
                     extra_ys=occ_ys,
                     margin=MARGIN,
                     turn=TURN,
+                    routed_h=routed_h,
+                    routed_v=routed_v,
                 )
                 if path is None:
                     ok = False
@@ -1421,6 +1472,14 @@ class Router:
                     f"labels and the other nets on this sheet remain wired"
                 )
                 net._stub = True
+                # Mark this as a ROUTER-FALLBACK stub (as opposed to an
+                # intentional power/high-fanout stub): a cross-sheet net that
+                # could not be wired still exits its sheet through labels, so it
+                # MUST keep its parent sheet pin -- otherwise the child's
+                # hierarchical_label dangles and the net fragments across sheets.
+                # The sheet-pin emitter (create_hierarchical_sheet_sexp) re-admits
+                # a boundary net carrying this flag despite its _stub.
+                net._route_fallback_stub = True
                 for pin in net.get_pins():
                     pin.stub = True
                 if deconflict:
@@ -1433,7 +1492,7 @@ class Router:
                 continue
             for x0, y0, x1, y1 in new_segs:
                 node.wires[net].append(Segment(Point(x0, y0), Point(x1, y1)))
-                register(net, x0, y0, x1, y1)
+                register(net, x0, y0, x1, y1, routed=True)
 
     def route(node, tool=None, **options):
         """Route the wires between part pins in this node and its children.

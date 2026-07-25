@@ -909,6 +909,16 @@ def gen_schematic(
     # the two agree on power nets (auto_stub_nets then only handles fanout).
     mark_power_nets(circuit, **options)
 
+    # Reserve left-edge sheet-pin height at PLACEMENT time whenever we will draw
+    # hierarchical sheet pins, so a pin-dense child sheet box is not packed on top
+    # of a neighbour (which coincides their sheet pins -> a silent cross-net
+    # short). Set after mark_power_nets so power nets (now _stub) are excluded from
+    # the pin count. Off (byte-identical) on the legacy / no-sheet-pin path.
+    from skidl.schematics import sch_node as _sch_node
+    _sch_node.RESERVE_SHEET_PIN_HEIGHT = bool(
+        options.get("hierarchical_sheet_pins", False)
+    )
+
     # Phase 1: Heuristic auto-stubbing before first generation pass.
     if options.get("auto_stub", False):
         auto_stub_nets(circuit, **options)

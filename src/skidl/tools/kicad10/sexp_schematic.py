@@ -1459,11 +1459,20 @@ def create_hierarchical_sheet_sexp(node, sheet_uuid, sheet_tx, parent_is_root=Tr
     if _EMIT_HIER_SHEET_PINS:
         pin_spacing = 2.54  # mm between pins (a grid multiple -> stays on-grid)
         stub_len = 2.54  # outward stub length
+        # A stubbed net normally renders as labels/power-symbols and needs no
+        # sheet pin -- EXCEPT a cross-sheet net that the A* router could not wire
+        # and fell back to labels (``_route_fallback_stub``): it still exits this
+        # sheet through a hierarchical_label, so it MUST keep its sheet pin or the
+        # child label dangles and the net fragments across sheets. Power nets stay
+        # excluded (they connect by global power symbols, not sheet pins).
         boundary_nets = [
             net
             for net in _hier_boundary_nets(node)
             if not _net_wants_power_symbol(net)
-            and not (getattr(net, "stub", False) or getattr(net, "_stub", False))
+            and (
+                not (getattr(net, "stub", False) or getattr(net, "_stub", False))
+                or getattr(net, "_route_fallback_stub", False)
+            )
         ]
         # Grow the box so all pins fit on the left edge (visual only).
         needed_h = pin_spacing * (len(boundary_nets) + 1)

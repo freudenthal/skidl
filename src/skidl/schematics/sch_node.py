@@ -15,6 +15,21 @@ from .route import Router
 Node subclass used for generating schematics.
 """
 
+# Set True by the KiCad-10 render path (gen_schematic) before placement, whenever
+# hierarchical sheet pins will be drawn. An unflattened child sheet then reserves
+# vertical space on its left edge for its sheet-pin rows, so the placer does not
+# pack a neighbouring sheet box into the space the pins will occupy. Without the
+# reservation a tall, pin-dense child (e.g. an MCU block) is placed at its small
+# parts-only bbox, then GROWN at emit time to fit its pins, overflowing into the
+# neighbour and coinciding two sheets' left-edge sheet pins -> a silent cross-net
+# short (the drawing-connectivity gate's esp32c3 failure). Off by default so the
+# legacy render path stays byte-identical.
+RESERVE_SHEET_PIN_HEIGHT = False
+
+# Sheet-pin pitch in the placer/router's mil units. MUST match the KiCad-10
+# emitter's ``pin_spacing`` (2.54 mm = 100 mil) in create_hierarchical_sheet_sexp.
+_SHEET_PIN_PITCH = 100
+
 
 @export_to_all
 # class SchNode(Node, Placer, Router):
@@ -307,6 +322,42 @@ class SchNode(Placer, Router):
                     boundary.append(net)
         return boundary
 
+    def _subtree_parts(self):
+        """Every part in this node and, recursively, all descendant nodes."""
+        parts = list(self.parts)
+        for child in self.children.values():
+            parts.extend(child._subtree_parts())
+        return parts
+
+    def subtree_boundary_pin_count(self):
+        """How many sheet PINS this node's box will draw on its left edge.
+
+        A sheet pin is drawn for every net crossing the node's SUBTREE boundary
+        (a pin inside the subtree AND a pin outside) that is NOT already stubbed
+        (power nets render as power symbols, no sheet pin). This mirrors the
+        emitter's ``_hier_boundary_nets`` filter closely enough to reserve the
+        right vertical space at placement time. Power nets are stubbed before
+        placement (mark_power_nets), so ``net._stub`` already excludes them here;
+        router-fallback stubs happen later and are (correctly) still counted.
+        """
+        sub_parts = self._subtree_parts()
+        sub_ids = {id(p) for p in sub_parts}
+        seen = set()
+        count = 0
+        for part in sub_parts:
+            for pin in part:
+                if not pin.is_connected():
+                    continue
+                net = pin.net
+                if id(net) in seen:
+                    continue
+                seen.add(id(net))
+                if getattr(net, "_stub", False):
+                    continue  # power / intentional stub: power symbol, no sheet pin
+                if any(id(p.part) not in sub_ids for p in net.pins):
+                    count += 1
+        return count
+
     def external_bbox(self):
         """Return the bounding box of a hierarchical sheet as seen by its parent node."""
         # An empty child node (materialised by the children defaultdict but never
@@ -318,6 +369,15 @@ class SchNode(Placer, Router):
         bbox = BBox(Point(0, 0), Point(500, 500))
         bbox.add(Point(len("File: " + sheet_filename) * self.filename_sz, 0))
         bbox.add(Point(len("Sheet: " + name) * self.name_sz, 0))
+
+        # Reserve vertical room for the left-edge sheet pins so the placer packs
+        # neighbouring boxes clear of them (see RESERVE_SHEET_PIN_HEIGHT). The
+        # emitter lays pins at ``_SHEET_PIN_PITCH * (i + 1)`` down from the box
+        # top, one per boundary net, so it needs ``pitch * (n + 1)`` of height.
+        if RESERVE_SHEET_PIN_HEIGHT:
+            n_pins = self.subtree_boundary_pin_count()
+            if n_pins:
+                bbox.add(Point(0, _SHEET_PIN_PITCH * (n_pins + 1)))
 
         # Pad the bounding box for extra spacing when placed.
         bbox = bbox.resize(Vector(100, 100))
