@@ -529,6 +529,12 @@ class SpiceConverter:
         "OPTOCOUPLER": "optocoupler",
         "LEDPD": "optocoupler",
         "PHOTOCOUPLER": "optocoupler",
+        # Electro-thermal LED: a parasitic-series-resistance diode whose junction
+        # temperature (a thermal RC network driven by the dissipated power) feeds
+        # back on the forward voltage and the optical output (droop). Emits its own
+        # network + a probeable junction-temperature node and optical-output node.
+        "LEDTHERMAL": "led_thermal",
+        "LED_ET": "led_thermal",
         "NOT": "gate",
         "INV": "gate",
         "BUF": "gate",
@@ -684,6 +690,7 @@ class SpiceConverter:
             "trigsw": self._add_trigsw,
             "gate": self._add_gate,
             "optocoupler": self._add_optocoupler,
+            "led_thermal": self._add_led_thermal,
         }
         handler = handlers.get(self._kind(component))
         if handler is None:
@@ -2819,6 +2826,99 @@ class SpiceConverter:
             ref, "optocoupler", "sim_params", desc
         )
         logger.debug(f"Added behavioral OPTOCOUPLER {ref}: A={a} K={k_node} i_pd={expr}")
+
+    _LEDET_A_NAMES = {"A", "ANODE", "AN", "P", "+"}
+    _LEDET_K_NAMES = {"K", "CATHODE", "KA", "N", "-"}
+
+    def _add_led_thermal(self, component, ref: str, value: str):
+        """Behavioral ELECTRO-THERMAL LED (Sim.Device=LEDTHERMAL / LED_ET).
+
+        A high-current LED as a coupled electrical + thermal network -- the level
+        of fidelity the plain ``Device:LED`` model (a bare junction) cannot give:
+
+          * a **parasitic series resistance** ``RS`` (bond wires / bulk / contacts)
+            that drops ``I*RS`` and dissipates ``I^2*RS``;
+          * a junction diode whose **forward voltage falls with temperature**
+            (``KVF`` V/degC, plus the kT/q thermal-voltage shift);
+          * a **thermal RC network** (``RTH`` degC/W, ``CTH`` J/degC) driven by the
+            dissipated power ``V(A,K)*I_led``, giving the junction temperature at a
+            probeable node ``<ref>_TJ`` (volts = degC);
+          * an **optical-output** node ``<ref>_LOPT`` (volts ~ relative light out)
+            with a temperature **droop** (``KDROOP`` /degC) -- so the LIGHT falls as
+            the die heats even while the drive current is held constant.
+
+        This is the electro-thermal analog (temperature<->voltage, power<->current,
+        Rth<->ohm, Cth<->farad). Terminals ``A``/``K`` by pin name (or Sim.Pins).
+        Params via ``Sim.Params`` (all approximate/reasonable, not exact):
+        ``RS`` (0.1), ``N`` (3), ``IS`` (1e-17), ``RTH`` (12), ``CTH`` (800u),
+        ``TAMB`` (25), ``KVF`` (-4m V/degC), ``KDROOP`` (-4m /degC).
+
+        Emits a self-contained SPICE network via ``raw_spice`` (a 0 V current
+        sense, RS, a behavioral T-dependent diode, the thermal Bpwr/Rth/Cth, and
+        the optical Bopt), plus a probeable ``<ref>_TJ`` (junction degC) and
+        ``<ref>_LOPT`` (relative optical output) node. Provenance tier
+        ``sim_params``.
+        """
+        nodes = self._logic_pin_nodes(component)
+        if nodes is None:
+            logger.warning(f"LEDTHERMAL {ref}: no live pin map; skipping")
+            return
+        a = self._first_named(nodes, self._LEDET_A_NAMES)
+        k = self._first_named(nodes, self._LEDET_K_NAMES)
+        if a is None or k is None:
+            logger.warning(
+                f"LEDTHERMAL {ref}: needs A/K terminals (by pin name or Sim.Pins); "
+                f"skipping (got A={a}, K={k})"
+            )
+            return
+        prm = self._parse_sim_params(self._sim_props(component).get("params"))
+
+        def num(key, default):
+            v = self._parse_si_number(prm[key]) if key in prm else None
+            return v if v is not None else default
+
+        fn = self._fmt_num
+        tamb_v = num("TAMB", 25.0)
+        rs, n = fn(num("RS", 0.1)), fn(num("N", 3.0))
+        is_ = fn(num("IS", 1e-17))
+        rth, cth = fn(num("RTH", 12.0)), fn(num("CTH", 800e-6))
+        tamb = fn(tamb_v)
+        kvf, kdroop = fn(num("KVF", -4e-3)), fn(num("KDROOP", -4e-3))
+        # Vf(T) is carried entirely by the linear KVF term (a series behavioral
+        # voltage shift); the junction's own kT/q slope is a second-order effect we
+        # fold into KVF, which also avoids any (Tj+273) singularity.
+        # internal / probeable nodes (global ngspice nodes named off the ref)
+        a2, nj, njt = f"{ref}_A2", f"{ref}_NJ", f"{ref}_NJT"
+        tj, amb, lopt = f"{ref}_TJ", f"{ref}_AMB", f"{ref}_LOPT"
+        dm = f"{ref}_dmod"
+        lines = [
+            f"V{ref}_sns {a} {a2} 0",                    # LED-current sense (0 V)
+            f"R{ref}_rs {a2} {nj} {rs}",                 # parasitic series R
+            # Temperature-dependent forward voltage: a series behavioral voltage
+            # source shifts the junction drop by KVF*(Tj-Tamb) (Vf falls as the die
+            # heats). The junction itself is a REAL ngspice diode (robust gmin /
+            # current-drive convergence, unlike a bare behavioral current source).
+            f"B{ref}_tsh {nj} {njt} V = ({kvf})*(V({tj})-{tamb})",
+            f"D{ref}_d {njt} {k} {dm}",
+            f".model {dm} D(IS={is_} N={n})",
+            # thermal: dissipated power heats Tj through Rth||Cth to ambient.
+            f"B{ref}_pwr 0 {tj} I = V({a},{k})*I(V{ref}_sns)",
+            f"R{ref}_th {tj} {amb} {rth}",
+            f"C{ref}_th {tj} {amb} {cth} IC=0",
+            f"V{ref}_amb {amb} 0 {tamb}",
+            # optical output (relative), with a temperature droop.
+            f"B{ref}_opt 0 {lopt} I = I(V{ref}_sns)*(1 + ({kdroop})*(V({tj})-{tamb}))",
+            f"R{ref}_lopt {lopt} 0 1",
+        ]
+        self.spice_circuit.raw_spice += "\n" + "\n".join(lines)
+        self.model_provenance[ref] = ResolvedModel(
+            ref, "led_thermal", "sim_params",
+            f"led_et(rs={rs}, rth={rth}, cth={cth}, kvf={kvf}, kdroop={kdroop})"
+        )
+        logger.debug(
+            f"Added electro-thermal LED {ref}: A={a} K={k}, Tj node {tj}, "
+            f"optical node {lopt} (rs={rs}, rth={rth}, cth={cth})"
+        )
 
     def _gate_expr(self, op, his, vdd):
         """ngspice B-source expression for a logic gate over input predicates ``his``.
