@@ -197,6 +197,15 @@ class SkidlConfig(Config):
             self["lib_search_paths"] = {
                 tool: tool_modules[tool].default_lib_paths() for tool in ALL_TOOLS
             }
+        else:
+            # Backfill defaults for any tools missing from a previously-stored
+            # config (e.g. a newly-supported KiCad version added after the config
+            # file was written) so their libraries can still be located.
+            for tool_name in ALL_TOOLS:
+                if tool_name not in self["lib_search_paths"]:
+                    self["lib_search_paths"][tool_name] = tool_modules[
+                        tool_name
+                    ].default_lib_paths()
 
         # If no configuration files were found, set base name of default backup part library.
         if "backup_lib_name" not in self:
@@ -213,6 +222,15 @@ class SkidlConfig(Config):
             self["footprint_search_paths"] = {
                 tool: [tool_modules[tool].get_fp_lib_tbl_dir()] for tool in ALL_TOOLS
             }
+        else:
+            # Backfill defaults for any tools missing from a previously-stored
+            # config (e.g. a newly-supported KiCad version) so their footprints
+            # can still be located.
+            for tool_name in ALL_TOOLS:
+                if tool_name not in self["footprint_search_paths"]:
+                    self["footprint_search_paths"][tool_name] = [
+                        tool_modules[tool_name].get_fp_lib_tbl_dir()
+                    ]
 
         # Cause the footprint cache to be invalidated if the footprint search path changes.
         def invalidate_footprint_cache(self, k, v):
