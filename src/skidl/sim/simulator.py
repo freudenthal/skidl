@@ -395,6 +395,13 @@ def _augment_ngspice_error(simulator, exc, uic=False):
         return exc
 
 
+# A step response whose settled level differs from its pre-step level by less
+# than this fraction of its own peak excursion did not really step -- it pulsed
+# and came back (a high-pass or band-pass). Overshoot and rise time, both
+# normalized by the step size, are undefined there and are reported as None.
+STEP_DEAD_FRACTION = 0.01
+
+
 class SimulationResult:
     """Container for SPICE simulation results with analysis capabilities."""
 
@@ -619,6 +626,95 @@ class SimulationResult:
                 return float(10 ** (fa + t * (fb - fa)))
         return None
 
+    def band_edges(
+        self,
+        node: str,
+        ref_db: float = -3.0,
+        input_magnitude: float = 1.0,
+        about: str = "peak",
+    ) -> Dict[str, Optional[float]]:
+        """Lower/upper ``ref_db`` band edges and the geometric center frequency.
+
+        Generalizes :meth:`cutoff_frequency` to responses with two edges. In the
+        default ``about="peak"`` mode the reference is the response peak and the
+        search starts at the peak sample, walking **outward in both directions**
+        -- so a band-pass yields both edges, a low-pass only ``f_high`` (nothing
+        below the peak ever falls ``ref_db``) and a high-pass only ``f_low``.
+        Interpolation is linear in log-frequency, the same convention
+        :meth:`cutoff_frequency` uses, so the two agree on a low-pass.
+
+        ``about="notch"`` is for a band-STOP, which the peak walk cannot
+        describe: its peak sits at one end of the sweep, so walking outward
+        finds a single edge and calls the other absent. In notch mode the
+        reference is the **passband** (the larger of the two sweep ends), the
+        target is still ``reference + ref_db``, and the walk starts at the
+        response **minimum** -- giving the two frequencies that bracket the
+        notch, whose separation is its -3 dB width.
+
+        Returns ``{"f_low", "f_high", "f_center"}``; a missing edge is ``None``,
+        and ``f_center = sqrt(f_low*f_high)`` only when **both** edges exist
+        (a one-sided band has no meaningful geometric center).
+
+        ``ref_db`` is taken literally: the default -3.0 dB is ~0.03 dB away from
+        the exact half-power point (-3.0103 dB), which moves a Q=1 edge by about
+        0.1 %. Both this method and ``skidl_eda.filters.analysis.band_edges``
+        use the same literal value, so a sim-vs-analytic comparison is unaffected;
+        pass ``ref_db=-3.0103`` when comparing against a half-power closed form.
+        """
+        import numpy as np
+
+        freq, magnitude_db, _ = self.bode(node, input_magnitude)
+        if len(freq) < 2:
+            raise ValueError(
+                f"band_edges needs at least 2 AC samples, got {len(freq)} "
+                f"(an empty/degenerate sweep measures nothing)"
+            )
+        if about not in ("peak", "notch"):
+            raise ValueError(f"about must be 'peak' or 'notch', got {about!r}")
+        if about == "peak":
+            start_i = int(np.argmax(magnitude_db))
+            reference = float(magnitude_db[start_i])
+        else:
+            start_i = int(np.argmin(magnitude_db))
+            reference = max(float(magnitude_db[0]), float(magnitude_db[-1]))
+        target = reference + ref_db
+
+        def _cross(step):
+            """First crossing of ``target`` walking outward from the start."""
+            i = start_i
+            while 0 <= i + step < len(freq):
+                a, b = magnitude_db[i], magnitude_db[i + step]
+                i += step
+                if a == b:
+                    continue
+                if (a - target) * (b - target) <= 0:
+                    fa, fb = np.log10(freq[i - step]), np.log10(freq[i])
+                    t = (target - a) / (b - a)
+                    return float(10 ** (fa + t * (fb - fa)))
+            return None
+
+        f_low = _cross(-1)
+        f_high = _cross(+1)
+        f_center = (
+            float(np.sqrt(f_low * f_high))
+            if (f_low is not None and f_high is not None)
+            else None
+        )
+        return {"f_low": f_low, "f_high": f_high, "f_center": f_center}
+
+    def nyquist(self, node: str, input_magnitude: float = 1.0):
+        """Nyquist locus of a node response: ``(freq, real, imag)`` ndarrays.
+
+        A thin, allocation-free view over the same complex response
+        :meth:`bode` renders in polar form -- plotting ``imag`` against ``real``
+        gives the Nyquist plot, and the returned ``freq`` labels each point.
+        """
+        import numpy as np
+
+        freq = self._frequency_array()
+        H = self._complex_node(node) / input_magnitude
+        return freq, np.real(H).astype(float), np.imag(H).astype(float)
+
     # -- loop-stability helpers (Stage 20.5) ------------------------------ #
 
     def loop_gain(self, fb_a: str, fb_b: str):
@@ -762,6 +858,88 @@ class SimulationResult:
             return None
         return float(t[last + 1])
 
+    def step_metrics(
+        self, node: str, t_step: float = 0.0, tail_frac: float = 0.2
+    ) -> Dict[str, Optional[float]]:
+        """Step-response figures for ``node``: final value, overshoot, rise/peak/settling.
+
+        ``t_step`` is when the stimulus edge occurs (default 0, i.e. the source
+        already steps at the start of the run). The pre-step level is the sample
+        at or immediately before ``t_step``; the step size is
+        ``final - initial``, and every figure below is referred to those two
+        levels so a non-unity or inverting DC gain measures correctly:
+
+        - ``final_value`` -- mean over the last ``tail_frac`` of the run
+          (:meth:`average`), the settled level.
+        - ``overshoot_pct`` -- ``(extreme - final) / |final - initial| * 100``,
+          where ``extreme`` is the furthest excursion *past* ``final`` in the
+          step's direction. ``0.0`` for a response that never overshoots
+          (an overdamped step reports 0, not a negative undershoot number).
+        - ``rise_time`` -- 10 % -> 90 % of the step, ``None`` if either level is
+          never reached.
+        - ``peak_time`` -- time of ``extreme``.
+        - ``settling_time`` -- :meth:`settling_time` at 2 % of ``final``.
+        - ``peak_excursion`` -- the largest ``|v - initial|`` after the step,
+          reported so a caller can see the scale the guard below judged against.
+
+        Overshoot and the timing figures are ``None`` when the response does
+        **not settle to a level distinct from where it started** -- a high-pass
+        or band-pass step rises and decays back to zero, so its step size is
+        zero and every figure normalized by it is meaningless. The test is
+        relative (step size under :data:`STEP_DEAD_FRACTION` of the peak
+        excursion), not an absolute epsilon: a high-pass tail sitting at 3e-8
+        instead of exactly 0 must still be recognized as "no step", and an
+        absolute epsilon let exactly that case through as a 3.6e9 % overshoot.
+        """
+        import numpy as np
+
+        t, v = self._node_series(node)
+        if len(t) < 3:
+            raise ValueError(
+                f"step_metrics needs at least 3 transient samples for '{node}', "
+                f"got {len(t)} (a degenerate run measures nothing)"
+            )
+        pre = np.where(t <= t_step)[0]
+        initial = float(v[pre[-1]]) if len(pre) else float(v[0])
+        final = self.average(node, tail_frac=tail_frac)
+        step = final - initial
+
+        post = t >= t_step
+        tp, vp = t[post], v[post]
+        excursion = float(np.max(np.abs(vp - initial))) if vp.size else 0.0
+        if abs(step) <= STEP_DEAD_FRACTION * excursion or excursion == 0.0:
+            return {
+                "final_value": final,
+                "overshoot_pct": None,
+                "rise_time": None,
+                "peak_time": None,
+                "settling_time": None,
+                "peak_excursion": excursion,
+            }
+
+        # Excursion past `final` in the step's direction (sign-aware, so an
+        # inverting stage's negative-going step is handled identically).
+        signed = (vp - final) * np.sign(step)
+        k = int(np.argmax(signed))
+        extreme, peak_time = float(vp[k]), float(tp[k])
+        overshoot_pct = max(0.0, float(signed[k]) / abs(step) * 100.0)
+
+        def _first_at(frac):
+            """First time the response reaches ``frac`` of the step."""
+            level = initial + frac * step
+            hit = np.where((vp - level) * np.sign(step) >= 0)[0]
+            return float(tp[hit[0]]) if len(hit) else None
+
+        t10, t90 = _first_at(0.1), _first_at(0.9)
+        return {
+            "final_value": final,
+            "overshoot_pct": overshoot_pct,
+            "rise_time": (t90 - t10) if (t10 is not None and t90 is not None) else None,
+            "peak_time": peak_time,
+            "settling_time": self.settling_time(node, final=final, tol=0.02),
+            "peak_excursion": excursion,
+        }
+
     def branch_current(self, name: str):
         """Branch current through an element (e.g. an inductor ``'L1'``) as an ndarray.
 
@@ -845,6 +1023,159 @@ class SimulationResult:
         plt.legend()
         plt.grid(True)
         plt.show()
+
+
+class NoiseResult:
+    """Container for an ngspice ``.noise`` small-signal result (Stage 9.7).
+
+    ``.noise`` does not fit :class:`SimulationResult`: it has no node dict, and
+    one run produces **two** ngspice plots -- ``noise1`` (the spectra against
+    frequency) and ``noise2`` (the band-integrated totals). PySpice's own result
+    path reads only the last plot, so it silently returns the totals and drops
+    the spectra; :meth:`CircuitSimulator.noise_analysis` fetches both by content
+    and hands them here.
+
+    .. rubric:: Units -- stated so every number is comparable
+
+    * :attr:`onoise_spectrum` / :attr:`inoise_spectrum` are **densities**:
+      V/sqrt(Hz) at the output, and referred to ``source`` at the input
+      (V/sqrt(Hz) for a voltage source, A/sqrt(Hz) for a current one). Measured
+      against the 4kTR anchor on 2026-08-09, not assumed: a bare 1 kohm deck at
+      25 C reads 4.05778e-9, and sqrt(4kTR) = 4.05779e-9.
+    * :attr:`onoise_total_v` / :attr:`inoise_total_v` are **rms** values
+      integrated by ngspice over the swept band, not densities.
+      ⚠ :attr:`inoise_total_v` is **grid-dependent**. Measured 2026-08-09
+      across 24 (deck, band, density) combinations: on a deck whose *output*
+      spectrum is flat it equals :meth:`integrated` to 1e-6 at every grid
+      density, but on an RC low-pass -- flat input-referred spectrum, rolled-off
+      output -- it reads HIGH by 1.16 % at 100 points/decade and 0.29 % at 400,
+      converging as the grid refines. :attr:`onoise_total_v` agreed with
+      :meth:`integrated` to better than 1e-4 in every case. So: **grade against
+      :meth:`integrated`** and treat the totals as the cross-check.
+
+    Attributes:
+        frequency: The sweep axis (Hz) as a real ndarray.
+        onoise_spectrum: Output noise density over :attr:`frequency`.
+        inoise_spectrum: Input-referred noise density over :attr:`frequency`.
+        onoise_total_v: ngspice's integrated output noise (rms) over the band.
+        inoise_total_v: ngspice's integrated input-referred noise (rms).
+        output: The output node the run measured.
+        source: The ngspice *element* name the input was referred to.
+        temperature: The run temperature in Celsius. Resistor thermal noise
+            follows the **run** temperature, not TNOM (measured 2026-08-09:
+            a 1 kohm reads 4.05778e-9 at 25 C and 4.68916e-9 at 125 C, each
+            matching sqrt(4*k*T_run*R) to 1e-6 relative).
+    """
+
+    def __init__(self, frequency, onoise_spectrum, inoise_spectrum,
+                 onoise_total_v, inoise_total_v, *, output, source,
+                 temperature):
+        import numpy as np
+
+        self.analysis_type = "noise"
+        self.frequency = np.real(np.asarray(frequency)).astype(float)
+        self.onoise_spectrum = np.real(np.asarray(onoise_spectrum)).astype(float)
+        self.inoise_spectrum = np.real(np.asarray(inoise_spectrum)).astype(float)
+        self.onoise_total_v = float(onoise_total_v)
+        self.inoise_total_v = float(inoise_total_v)
+        self.output = output
+        self.source = source
+        self.temperature = float(temperature)
+        self.warnings: List[str] = []
+
+        n = self.frequency.size
+        if n == 0:
+            raise ValueError(
+                "noise analysis returned an EMPTY frequency axis -- an "
+                "instrument that measured nothing must not read as one that "
+                "found everything"
+            )
+        for name, arr in (("onoise_spectrum", self.onoise_spectrum),
+                          ("inoise_spectrum", self.inoise_spectrum)):
+            if arr.size != n:
+                raise ValueError(
+                    f"noise analysis returned {arr.size} {name} point(s) "
+                    f"against {n} frequency point(s)"
+                )
+
+    def __len__(self):
+        return int(self.frequency.size)
+
+    def spot(self, frequency: float, which: str = "output") -> float:
+        """The noise density at ``frequency``, log-log interpolated.
+
+        Both axes span decades, so a linear interpolation between grid points
+        would be wrong by a visible amount on a sloped spectrum; the
+        interpolation is therefore done in log(f) against log(density).
+        ``which`` is ``"output"`` (default) or ``"input"``.
+
+        Raises when ``frequency`` is outside the swept band -- extrapolating a
+        noise density past the sweep is a fabricated number.
+        """
+        import numpy as np
+
+        spectrum = self._spectrum(which)
+        f = float(frequency)
+        lo, hi = float(self.frequency[0]), float(self.frequency[-1])
+        if not (min(lo, hi) <= f <= max(lo, hi)):
+            raise ValueError(
+                f"spot({f:g} Hz) is outside the swept band "
+                f"[{lo:g}, {hi:g}] Hz -- extrapolation is not a measurement"
+            )
+        if f <= 0:
+            raise ValueError("spot() needs a positive frequency (the axis is log)")
+        if np.any(spectrum <= 0):
+            # A zero-valued density has no logarithm; fall back to a linear
+            # interpolation rather than returning nan or -inf.
+            return float(np.interp(f, self.frequency, spectrum))
+        return float(
+            np.exp(
+                np.interp(
+                    np.log(f), np.log(self.frequency), np.log(spectrum)
+                )
+            )
+        )
+
+    def integrated(self, f_lo: float, f_hi: float,
+                   which: str = "output") -> float:
+        """Band-integrated noise in **Vrms**: ``sqrt(trapz(density^2, f))``.
+
+        The band is clipped to the swept range -- asking for more band than was
+        simulated raises rather than quietly integrating a shorter one.
+
+        On a flat spectrum this reproduces ``density*sqrt(BW)`` to 1e-4
+        relative, independently of the grid density -- which ngspice's own
+        ``inoise_total`` does not (see the class docstring).
+        """
+        import numpy as np
+
+        spectrum = self._spectrum(which)
+        f_lo, f_hi = float(f_lo), float(f_hi)
+        if f_hi <= f_lo:
+            raise ValueError(f"integrated() needs f_hi > f_lo, got {f_lo}..{f_hi}")
+        lo, hi = float(self.frequency[0]), float(self.frequency[-1])
+        if f_lo < lo - 1e-9 * abs(lo) or f_hi > hi + 1e-9 * abs(hi):
+            raise ValueError(
+                f"integrated({f_lo:g}, {f_hi:g}) exceeds the swept band "
+                f"[{lo:g}, {hi:g}] Hz -- widen the sweep instead"
+            )
+        mask = (self.frequency >= f_lo) & (self.frequency <= f_hi)
+        f = self.frequency[mask]
+        s = spectrum[mask]
+        if f.size < 2:
+            raise ValueError(
+                f"integrated({f_lo:g}, {f_hi:g}) selected {f.size} grid "
+                f"point(s); use more points per decade or a wider band"
+            )
+        trapz = getattr(np, "trapezoid", None) or np.trapz
+        return float(np.sqrt(trapz(s ** 2, f)))
+
+    def _spectrum(self, which: str):
+        if which == "output":
+            return self.onoise_spectrum
+        if which == "input":
+            return self.inoise_spectrum
+        raise ValueError(f"which must be 'output' or 'input', got {which!r}")
 
 
 class CircuitSimulator:
@@ -1115,6 +1446,154 @@ class CircuitSimulator:
         ))
 
         return SimulationResult(analysis, "ac")
+
+    def _resolve_noise_source(self, source: str) -> str:
+        """The ngspice *element* name for ``source``, or raise listing the sources.
+
+        ``.noise``'s ``src`` argument is the element name, and PySpice prefixes
+        every element with its type letter -- a part with ref ``V1`` is emitted
+        as element ``VV1``. Callers think in schematic refs, so accept either
+        and normalize. No existing caller in the workspace exercises a
+        named-source analysis (``dc_analysis`` has none), so this convention is
+        pinned here rather than assumed.
+        """
+        elements = [str(e.name) for e in self.spice_circuit.elements]
+        want = str(source).strip()
+        candidates = [want, f"V{want}", f"I{want}"]
+        for cand in candidates:
+            if cand in elements:
+                return cand
+        low = {e.lower(): e for e in elements}
+        for cand in candidates:
+            hit = low.get(cand.lower())
+            if hit is not None:
+                return hit
+        sources = [e for e in elements if e[:1].upper() in ("V", "I")]
+        raise ValueError(
+            f"noise source '{source}' is not an element in this deck "
+            f"(independent sources: {sorted(sources) or 'NONE'}; "
+            f"all elements: {sorted(elements)}). Pass the part's ref (e.g. "
+            f"'V1') or the emitted element name (e.g. 'VV1')."
+        )
+
+    @staticmethod
+    def _fetch_noise_plots(simulator):
+        """``(spectra_plot, totals_plot)`` from the shared ngspice instance.
+
+        One ``.noise`` run leaves **two** plots behind -- ``noise1`` carries
+        ``frequency``/``onoise_spectrum``/``inoise_spectrum`` and ``noise2``
+        carries ``onoise_total``/``inoise_total``. PySpice's ``_run`` returns
+        only ``last_plot`` (``noise2``), so the spectra would be silently lost.
+
+        Plots are matched by **content**, not by name: the names are ngspice's
+        run-numbered ones, and ``plot_names`` is newest-first, so the first plot
+        carrying each vector belongs to the run that just finished. Either one
+        missing RAISES -- a noise run that produced no spectrum is not a
+        measurement.
+        """
+        shared = getattr(simulator, "ngspice", None)
+        if shared is None:
+            raise RuntimeError(
+                "noise analysis needs the ngspice-shared backend (the running "
+                f"simulator {type(simulator).__name__} exposes no .ngspice "
+                "instance), because both noise plots must be fetched by name"
+            )
+        names = [n for n in shared.plot_names if str(n).startswith("noise")]
+        spectra = totals = None
+        for name in names:
+            plot = shared.plot(simulator, name)
+            if spectra is None and "onoise_spectrum" in plot:
+                spectra = plot
+            if totals is None and "onoise_total" in plot:
+                totals = plot
+            if spectra is not None and totals is not None:
+                break
+        missing = [
+            label
+            for label, plot in (("spectra (noise1)", spectra),
+                                ("totals (noise2)", totals))
+            if plot is None
+        ]
+        if missing:
+            raise RuntimeError(
+                f"noise analysis produced no {' and no '.join(missing)} plot "
+                f"(ngspice plots seen: {list(shared.plot_names)}). One .noise "
+                f"run must leave both; a missing one means the analysis did not "
+                f"run, not that it measured nothing."
+            )
+        return spectra, totals
+
+    def noise_analysis(
+        self,
+        output: str,
+        source: str,
+        start_freq: float,
+        stop_freq: float,
+        points: int = 20,
+        ref: Optional[str] = None,
+        temperature: float = 25,
+        options: Optional[Dict] = None,
+    ) -> NoiseResult:
+        """Run ngspice ``.noise`` and return both of its plots (Stage 9.7).
+
+        Args:
+            output: The node whose noise is measured (a circuit-synth net name,
+                e.g. ``"OUT"``); matched case-insensitively by ngspice.
+            source: The independent source the input-referred noise is referred
+                to. Either the part ref (``"V1"``) or the emitted element name
+                (``"VV1"``) -- see :meth:`_resolve_noise_source`.
+            start_freq: Sweep start in Hz.
+            stop_freq: Sweep stop in Hz.
+            points: Points **per decade** (the sweep is always ``dec``).
+            ref: The reference node for the output pair; defaults to ground.
+            temperature: Run temperature in Celsius. This is what sets resistor
+                thermal noise -- ``4*k*T_run*R``, not TNOM.
+            options: ngspice ``.options`` overrides (see ``_make_simulator``).
+
+        Returns:
+            :class:`NoiseResult` -- spectra in V/sqrt(Hz) plus ngspice's own
+            band-integrated rms totals.
+
+        Note:
+            Only **resistors** (and real semiconductor models) are noisy in
+            ngspice. B-sources, E/G controlled sources and independent V/I
+            sources contribute nothing, so a purely behavioral macromodel is
+            silent unless it is given an explicit noise generator -- which is
+            what the OPAMP macromodel's ``en`` parameter does.
+        """
+        import numpy as np
+
+        src = self._resolve_noise_source(source)
+        simulator = self._make_simulator(temperature, options)
+        ref_node = ref if ref is not None else str(self.spice_circuit.gnd)
+        self._run_analysis(
+            simulator,
+            lambda: simulator.noise(
+                str(output), str(ref_node), src, "dec", int(points),
+                float(start_freq), float(stop_freq),
+            ),
+        )
+        spectra, totals = self._fetch_noise_plots(simulator)
+
+        def _vec(plot, key):
+            vector = plot.get(key)
+            if vector is None:
+                raise RuntimeError(
+                    f"noise plot '{plot.plot_name}' has no '{key}' vector "
+                    f"(present: {sorted(plot)})"
+                )
+            return np.asarray(vector._data)
+
+        return NoiseResult(
+            _vec(spectra, "frequency"),
+            _vec(spectra, "onoise_spectrum"),
+            _vec(spectra, "inoise_spectrum"),
+            _vec(totals, "onoise_total").ravel()[0],
+            _vec(totals, "inoise_total").ravel()[0],
+            output=str(output),
+            source=src,
+            temperature=temperature,
+        )
 
     def transient_analysis(
         self,

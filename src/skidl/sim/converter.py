@@ -103,6 +103,74 @@ CMCONTROLLER_PROFILES = {
 }
 
 
+# Datasheet-anchored op-amp macromodel profiles, keyed by chip name (Stage 9.6).
+# Same contract as CMCONTROLLER_PROFILES: adding a chip is adding a row, not
+# code; an explicit Sim.Params key always OVERRIDES the profile; an unknown chip
+# name is a loud warning plus the defaults, never a silent wrong part.
+#
+# Keys are the ``_opamp_params`` names (see _OPAMP_PARAM_DEFAULTS for units).
+# Every value is a **typical**-column datasheet figure unless the comment says
+# otherwise, and SR is stored in V/s (datasheet V/us x 1e6).
+#
+# HONESTY: VOH/VOL are the output headroom from each rail, which datasheets
+# state under a specific load; the values here are the light-load figures and
+# are model design inputs, not guaranteed limits. They set where the behavioral
+# clamp sits, nothing more.
+# The ``en``/``inoise`` columns were added in Stage 9.7. Both are TYPICAL
+# input-referred densities read off the datasheet's own noise table, and the
+# frequency each is quoted at is in the row's comment -- a flat-band figure is
+# what the macromodel realizes, since it has no 1/f corner (D4). ⛔ A row whose
+# datasheet does not state a density leaves that key UNSET rather than carrying
+# a guess: an invented noise figure is worse than no noise figure, because the
+# model would still measure something.
+OPAMP_PROFILES = {
+    # TI TL072 (SLOS080) -- JFET input, dual. GBW 3 MHz typ, SR 13 V/us typ,
+    # large-signal differential voltage amplification 200 V/mV = 200k typ,
+    # Vio 3 mV typ, Ri 1e12 ohm typ. Output swings to about +-1.5 V of the
+    # rails at Vcc=+-15 V with RL=10k.
+    # Noise (SLOS080W section 5.9, the classic TL07xC/AC/BC/I/M die):
+    # e_N 18 nV/rtHz and i_N 10 fA/rtHz, both at Rs = 20 ohm, f = 1 kHz.
+    "TL072": dict(aol=200e3, gbw=3e6, sr=13e6, vos=3e-3, rin=1e12,
+                  rout=75.0, voh=1.5, vol=1.5, en=18e-9, inoise=10e-15),
+    # TI LM358 (SLOS068) -- bipolar, dual, single-supply capable. GBW 1 MHz,
+    # SR 0.5 V/us, large-signal gain 100 V/mV = 100k typ, Vio 2 mV typ,
+    # Ri ~2 Mohm. The output pulls to within ~20 mV of the NEGATIVE rail
+    # (that is the part's headline feature) but only to ~1.5 V of the positive.
+    # Noise (SLOS068AB): e_n 40 nV/rtHz at f = 1 kHz. The table states NO
+    # input current-noise density, so ``inoise`` is deliberately unset -- see
+    # the note above the table.
+    "LM358": dict(aol=100e3, gbw=1e6, sr=0.5e6, vos=2e-3, rin=2e6,
+                  rout=75.0, voh=1.5, vol=0.02, en=40e-9),
+    # TI LMC6482 (SNOS674) -- CMOS rail-to-rail in and out, dual. GBW 1.5 MHz,
+    # SR 1.3 V/us, Avol 1e6 typ, Vos 110 uV typ, CMOS input Ri ~1e13 ohm.
+    # Output within ~50 mV of either rail at light load.
+    # Noise (AC electrical characteristics): e_n 37 nV/rtHz at f = 1 kHz,
+    # Vcm = 1 V; i_n 0.03 pA/rtHz at f = 1 kHz.
+    "LMC6482": dict(aol=1e6, gbw=1.5e6, sr=1.3e6, vos=110e-6, rin=1e13,
+                    rout=200.0, voh=0.05, vol=0.05, en=37e-9, inoise=0.03e-12),
+    # TI LMC6061 (SNOS622) -- CMOS micropower, single. GBW 100 kHz,
+    # SR 0.035 V/us, Avol very high (1e6 used), Vos 100 uV typ, CMOS input.
+    # Rail-to-rail output, ~0.1 V headroom at light load. Its 100 kHz GBW is
+    # the bench's deliberate SLOW arm.
+    # Noise (AC electrical characteristics): e_n 83 nV/rtHz at f = 1 kHz;
+    # i_n 0.0002 pA/rtHz at f = 1 kHz -- the noisiest voltage arm on the
+    # bench and the quietest current one, which is what a micropower CMOS
+    # front end buys.
+    "LMC6061": dict(aol=1e6, gbw=100e3, sr=35e3, vos=100e-6, rin=1e13,
+                    rout=1e3, voh=0.1, vol=0.1, en=83e-9, inoise=0.0002e-12),
+    # ADI LT1364 -- dual 70 MHz, 1000 V/us current-feedback-fast voltage-
+    # feedback amplifier. Avol 316k (110 dB) typ, Vos 1.5 mV typ,
+    # Rin 10 Mohm, output swings to ~+-13.3 V on +-15 V rails.
+    # A vendor .subckt for this part also exists -- see the P7 sensitivity arm,
+    # which compares this profile row against it.
+    # Noise: e_n 9 nV/rtHz at f = 10 kHz over the +-2.5 V..+-15 V supply span.
+    # ``inoise`` is left unset: the datasheet's own table could not be read
+    # directly here, and a secondhand figure is not a citation.
+    "LT1364": dict(aol=316e3, gbw=70e6, sr=1e9, vos=1.5e-3, rin=10e6,
+                   rout=50.0, voh=1.3, vol=1.3, en=9e-9),
+}
+
+
 try:
     from PySpice.Spice.Netlist import Circuit as SpiceCircuit
     from PySpice.Unit import *
@@ -486,6 +554,11 @@ class SpiceConverter:
         "PMOS": "mosfet",
         "V": "voltage_source",
         "I": "current_source",
+        # Tunable behavioral op-amp macromodel (Stage 9.6). A DISTINCT kind from
+        # the ``_classify`` symbol-substring "opamp": that path (ideal VCVS, or
+        # the 1-pole ``Sim.Gbw`` model) is unchanged and stays the default, so
+        # nothing existing moves. The macromodel is opt-in via Sim.Device="OPAMP".
+        "OPAMP": "opamp_macro",
         "LDO": "ldo",
         "BUCK": "buck",
         "BOOST": "boost",
@@ -671,6 +744,7 @@ class SpiceConverter:
             "voltage_source": self._add_voltage_source,
             "current_source": self._add_current_source,
             "opamp": self._add_opamp,
+            "opamp_macro": self._add_opamp_macro,
             "ldo": self._add_ldo,
             "buck": self._add_buck,
             "boost": self._add_boost,
@@ -2125,6 +2199,615 @@ class SpiceConverter:
         return None, "generic"
 
     # ------------------------------------------------------------------ #
+    # Tunable op-amp macromodel: Sim.Device="OPAMP" (Stage 9.6)           #
+    # ------------------------------------------------------------------ #
+    #
+    # A Boyle-style behavioral macromodel, emitted only when a part opts in
+    # with Sim.Device="OPAMP". The ideal-VCVS and Sim.Gbw paths above are
+    # untouched, so no existing circuit changes behaviour.
+    #
+    #   V<ref>_os  inp_i inp   DC vos          ; offset in series with IN+
+    #   R<ref>_in  inp_i inn   rin             ; differential input resistance
+    #   B<ref>_gm  0 p1  I = min(max(GM*V(inp_i,inn), -ILIM), ILIM)
+    #   R<ref>_p1  p1 0  RP1
+    #   C<ref>_p1  p1 0  CP1                   ; dominant pole
+    #   [E<ref>_b2 p2a 0 p1 0 1 / R<ref>_p2 / C<ref>_p2]   ; optional 2nd pole
+    #   B<ref>_out o0 0  V = min(max(V(px), V(vneg)+vol), V(vpos)-voh)
+    #   R<ref>_out o0 out rout
+    #
+    # The three derived values fall out of fixing GM and asking for a given
+    # (aol, gbw, sr):
+    #
+    #   RP1  = aol/GM                 -> DC gain  GM*RP1 = aol
+    #   CP1  = GM/(2*pi*gbw)          -> pole at gbw/aol, so aol*fp1 = gbw
+    #   ILIM = sr*CP1                 -> dV(p1)/dt saturates at exactly sr
+    #
+    # Every nonlinearity therefore comes out of ONE mechanism (a B-source with
+    # min/max), which is the same expression family the LDO macromodel has run
+    # in production since Stage 20.1. ngspice's ``limit()`` is not used: min/max
+    # composition is the idiom already proven in this converter.
+
+    # Supply-pin name sets, upper-cased. A part whose negative supply pin is
+    # literally named GND (common on single-supply symbols) is accepted -- the
+    # clamp needs a node, and that node is the right one.
+    _OPAMP_VPOS_NAMES = {"V+", "VCC", "VDD", "VS+", "VCC+", "+V", "VP", "VS"}
+    _OPAMP_VNEG_NAMES = {"V-", "VEE", "VSS", "VS-", "VCC-", "-V", "VN", "GND"}
+
+    # Macromodel parameter defaults (SI). Slew rate is V/s: a 13 V/us part is
+    # sr=13Meg, NOT sr=13. rin defaults to 1 Tohm (a FET input); rout to 100
+    # ohm. fp2=0 means no second pole. voh/vol are headroom FROM each rail.
+    _OPAMP_PARAM_DEFAULTS = {
+        "aol": 200e3, "gbw": 1e6, "sr": 500e3, "vos": 0.0,
+        "rin": 1e12, "rout": 100.0, "fp2": 0.0, "voh": 1.5, "vol": 1.5,
+        "vclamp_hi": None, "vclamp_lo": None,
+        # Input-referred noise densities (Stage 9.7). BOTH default to None ->
+        # nothing extra is emitted -> the deck is byte-identical to the
+        # pre-9.7 one. A datasheet quotes en in nV/rtHz and in in fA or pA per
+        # rtHz, so write them with SI suffixes: en=18n, inoise=500f.
+        "en": None, "inoise": None,
+    }
+
+    #: Reference temperature the noise-generator resistors are sized at.
+    #: ngspice's resistor thermal noise follows the **run** temperature
+    #: (measured 2026-08-09: a 1 kohm reads 4.05778e-9 at 25 C and 4.68916e-9
+    #: at 125 C, each matching sqrt(4*k*T_run*R) to 1e-6 relative -- TNOM does
+    #: not enter). The resistor value has to be fixed at emission, before the
+    #: run temperature is known, so it is sized at 25 C -- which is
+    #: ``CircuitSimulator``'s default for every analysis. A run at another
+    #: temperature scales the realized ``en`` by sqrt(T_run/298.15).
+    _OPAMP_NOISE_TREF = 298.15
+    _BOLTZMANN = 1.380649e-23
+
+    # Fixed transconductance of the gain cell. Any value works (RP1 and CP1 are
+    # solved from it); 1 mS keeps RP1 and CP1 in a numerically comfortable range
+    # for the whole aol/gbw span the profiles cover.
+    _OPAMP_GM = 1e-3
+
+    def _opamp_macro_params(self, component, value):
+        """``(params, tier, profile_name)`` for the OPAMP macromodel.
+
+        Resolution order (design intent wins, then the datasheet row, then the
+        generic default): explicit ``Sim.Params`` keys > the ``OPAMP_PROFILES``
+        row named by ``Sim.Model`` or by the part's ``value`` > defaults.
+
+        Tier is ``sim_params`` when any explicit param was given,
+        ``datasheet_fit`` when a profile row supplied them, and ``generic``
+        when neither did. An unknown chip name warns loudly and falls through
+        to the defaults -- never a silent wrong part.
+        """
+        props = self._sim_props(component)
+        raw = self._parse_sim_params(props.get("params"))
+        chip = str(props.get("model") or value or "").strip()
+
+        prof, profile_name = {}, None
+        if chip:
+            key = chip.upper()
+            match = next((k for k in OPAMP_PROFILES if k.upper() == key), None)
+            if match is not None:
+                prof, profile_name = OPAMP_PROFILES[match], match
+            elif self._opamp_manufacturer_row(chip):
+                prof = self._opamp_manufacturer_row(chip)
+                profile_name = f"{chip} (ManufacturerModels)"
+            elif props.get("model"):
+                # An explicit Sim.Model naming an unknown chip is a mistake worth
+                # shouting about; a mere `value` miss is normal (the value is
+                # usually just the symbol name) and stays quiet.
+                logger.warning(
+                    f"Op-amp {getattr(component, 'ref', '?')}: no OPAMP_PROFILES "
+                    f"row for '{chip}' (known: {', '.join(sorted(OPAMP_PROFILES))})"
+                    f" -- falling back to the generic defaults"
+                )
+
+        params, explicit = {}, False
+        for key, default in self._OPAMP_PARAM_DEFAULTS.items():
+            up = key.upper()
+            if up in raw:
+                parsed = self._parse_si_number(raw[up])
+                if parsed is None:
+                    logger.warning(
+                        f"Op-amp {getattr(component, 'ref', '?')}: could not parse "
+                        f"Sim.Params {key}='{raw[up]}' -- using the fallback value"
+                    )
+                else:
+                    params[key] = parsed
+                    explicit = True
+                    continue
+            params[key] = prof.get(key, default)
+
+        unknown = sorted(set(raw) - {k.upper() for k in self._OPAMP_PARAM_DEFAULTS})
+        if unknown:
+            logger.warning(
+                f"Op-amp {getattr(component, 'ref', '?')}: ignoring unknown "
+                f"Sim.Params key(s) {unknown}; known: "
+                f"{', '.join(sorted(self._OPAMP_PARAM_DEFAULTS))}"
+            )
+
+        if explicit:
+            tier = "sim_params"
+        elif profile_name is not None:
+            tier = "datasheet_fit"
+        else:
+            tier = "generic"
+        return params, tier, profile_name
+
+    # ManufacturerModels parameter names -> our macromodel keys. Those rows
+    # (TL072_TI, LM358_TI, ...) have carried exactly this parameter set since
+    # Stage 9 but were unreachable: they are typed ``SUBCKT``, so ``_opamp_gbw``
+    # -- which looks in the *base* ModelLibrary for a row typed ``OPAMP`` --
+    # never saw them. Closing Stage 9.6 means wiring them in, not leaving a
+    # second dead table beside the live one.
+    #
+    # ``VNOISE`` -> ``en`` (Stage 9.7) is the last dangling wire in that table:
+    # the TL072_TI (18e-9) and AD8605_ADI (8e-9) rows have carried an
+    # input-referred voltage-noise density since Stage 9 with nothing reading
+    # it. ⚠ The LT1117_ADI row also has a ``VNOISE``, but it means something
+    # else entirely (output noise as a *fraction* of VOUT); it is kept out by
+    # the ``GBW`` guard in ``_opamp_manufacturer_row``, which is the same guard
+    # that keeps the TL431 row from resolving as an op-amp.
+    _OPAMP_MFR_PARAM_MAP = {
+        "AOL": "aol", "GBW": "gbw", "SR": "sr", "VOS": "vos",
+        "RIN": "rin", "ROUT": "rout", "VNOISE": "en",
+    }
+
+    @classmethod
+    def _opamp_manufacturer_row(cls, chip: str) -> dict:
+        """Macromodel params from a ``ManufacturerModels`` row, or ``{}``.
+
+        Matches ``chip`` against a row name exactly or with a manufacturer
+        suffix (``TL072`` finds ``TL072_TI``). A row must carry ``GBW`` to
+        count: that is the parameter that makes a row an amplifier. Testing for
+        "any of our keys" is not enough -- the TL431 shunt-reference row carries
+        a ``ROUT`` and would otherwise resolve as an all-default op-amp profile.
+        """
+        try:
+            from .manufacturer_models import get_manufacturer_models
+
+            models = get_manufacturer_models().models
+        except Exception:
+            return {}
+        key = chip.strip().upper()
+        row = None
+        for name, model in models.items():
+            up = name.upper()
+            if up == key or up.startswith(key + "_"):
+                row = model
+                break
+        if row is None:
+            return {}
+        params = getattr(row, "parameters", {}) or {}
+        if "GBW" not in params:
+            return {}
+        out = {}
+        for src, dst in cls._OPAMP_MFR_PARAM_MAP.items():
+            if src in params:
+                try:
+                    out[dst] = float(params[src])
+                except (TypeError, ValueError):
+                    continue
+        return out
+
+    def _opamp_supply_nodes(self, component):
+        """``(vpos_node, vneg_node)`` for an op-amp, either possibly ``None``.
+
+        Resolved by pin name first and pin function second (a ``power_in`` pin
+        whose name we do not recognize is still a supply, and its sign is taken
+        from the name's leading +/-). Only *connected* pins count: an unwired
+        supply pin is no rail at all, and the caller must not invent one.
+        """
+        pin_map = getattr(component, "_pins", None)
+        if not isinstance(pin_map, dict):
+            return None, None
+        vpos = vneg = None
+        for pin in pin_map.values():
+            net = getattr(pin, "net", None)
+            if net is None:
+                continue
+            name = (getattr(pin, "name", "") or "").strip().upper()
+            node = self.node_map.get(net.name, net.name)
+            if name in self._OPAMP_VPOS_NAMES and vpos is None:
+                vpos = node
+            elif name in self._OPAMP_VNEG_NAMES and vneg is None:
+                vneg = node
+        return vpos, vneg
+
+    def _add_opamp_macro(self, component, ref: str, value: str):
+        """Add a tunable behavioral op-amp (``Sim.Device="OPAMP"``).
+
+        Models, in one B-source family: input offset, differential input
+        resistance, DC open-loop gain, the dominant pole (hence GBW), slew-rate
+        limiting, an optional second pole, the rail-referred output clamp, and
+        open-loop output resistance.
+
+        Multi-unit symbols emit one macromodel per **wired** amplifier unit,
+        reusing ``_opamp_amp_units``/``_opamp_terminals`` exactly as the ideal
+        path does; the first unit keeps the plain ``ref``, later units get
+        ``{ref}u{unit}``. Supply pins are common to all units, so every section
+        clamps to the same rails.
+
+        Known limitations, stated rather than hidden: the supply pins are
+        **sensed, not loaded** -- the model draws no quiescent or signal current
+        from the rails, so it cannot be used to measure supply current or PSRR.
+        Input bias current, common-mode range, noise and output current limit
+        are likewise not modeled.
+        """
+        params, tier, profile_name = self._opamp_macro_params(component, value)
+        vpos, vneg = self._opamp_supply_nodes(component)
+
+        amp_units = self._opamp_amp_units(component)
+        pin_map = getattr(component, "_pins", None)
+        emitted, clamped = 0, None
+        if len(amp_units) > 1 and isinstance(pin_map, dict):
+            for unit in sorted(amp_units):
+                unit_pins = amp_units[unit]
+                if not any(
+                    getattr(pin, "net", None) is not None
+                    for num, pin in pin_map.items()
+                    if str(num) in unit_pins
+                ):
+                    continue  # unused spare section
+                terminals = self._opamp_terminals(component, pin_nums=unit_pins)
+                if terminals is None:
+                    logger.warning(
+                        f"Op-amp {ref} unit {unit} is partially wired (missing an "
+                        f"input or output terminal); skipping this section"
+                    )
+                    continue
+                out, in_plus, in_minus = terminals
+                elem_ref = ref if emitted == 0 else f"{ref}u{unit}"
+                clamped = self._emit_opamp_macro(
+                    elem_ref, out, in_plus, in_minus, params, vpos, vneg
+                )
+                emitted += 1
+
+        if emitted == 0:
+            terminals = self._opamp_terminals(component)
+            if terminals is None:
+                nodes = self._get_component_nodes(component)
+                if len(nodes) < 3:
+                    logger.warning(
+                        f"Op-amp {ref} needs at least 3 connections, got {len(nodes)}"
+                    )
+                    return
+                out, in_plus, in_minus = nodes[0], nodes[1], nodes[2]
+            else:
+                out, in_plus, in_minus = terminals
+            clamped = self._emit_opamp_macro(
+                ref, out, in_plus, in_minus, params, vpos, vneg
+            )
+            emitted = 1
+
+        name = (
+            f"opamp_macro(aol={self._fmt_num(params['aol'])},"
+            f"gbw={self._fmt_hz(params['gbw'])},sr={self._fmt_num(params['sr'])}"
+        )
+        if params.get("en"):
+            name += f",en={self._fmt_num(float(params['en']))}"
+        if params.get("inoise"):
+            name += f",inoise={self._fmt_num(float(params['inoise']))}"
+        if profile_name:
+            name += f",profile={profile_name}"
+        if not clamped:
+            # An unclamped op-amp swings without limit; that is a real
+            # difference in behaviour and belongs in the provenance string, not
+            # only in a log line someone may not read.
+            name += ",UNCLAMPED(no supply pins resolved)"
+        if emitted > 1:
+            name += f") x{emitted} units"
+        else:
+            name += ")"
+        self.model_provenance[ref] = ResolvedModel(
+            ref=ref, kind="opamp", tier=tier, name=name
+        )
+
+    def _emit_opamp_macro(self, ref, out, in_plus, in_minus, params,
+                          vpos, vneg) -> bool:
+        """Emit one macromodel section. Returns whether the output is clamped."""
+        gnd = self.spice_circuit.gnd
+        gm = self._OPAMP_GM
+        aol = float(params["aol"])
+        gbw = float(params["gbw"])
+        sr = float(params["sr"])
+
+        # A non-positive aol or gbw has no model: RP1 and CP1 are derived by
+        # division from them, and a zero would either divide by zero or emit a
+        # dead amplifier that simulates happily and measures nothing. Fall back
+        # to the defaults loudly rather than emit either.
+        for name, value in (("aol", aol), ("gbw", gbw)):
+            if value <= 0:
+                fallback = self._OPAMP_PARAM_DEFAULTS[name]
+                logger.warning(
+                    f"Op-amp {ref}: {name}={value:g} is not positive; using the "
+                    f"default {fallback:g} instead (a zero here emits an "
+                    f"amplifier with no gain, which simulates but measures nothing)"
+                )
+                if name == "aol":
+                    aol = fallback
+                else:
+                    gbw = fallback
+
+        rp1 = aol / gm
+        cp1 = gm / (2.0 * math.pi * gbw)
+        # sr <= 0 means "no slew limit", not "cannot move": clamping the gain
+        # cell's current to zero would freeze the output entirely.
+        ilim = sr * cp1 if sr > 0 else None
+
+        inp_i = f"{ref}_inp"
+        p1 = f"{ref}_p1"
+        o0 = f"{ref}_o0"
+
+        # Offset polarity: V(inp_i) = V(in+) + vos, so a follower with its
+        # non-inverting input grounded settles at +vos (the sign convention a
+        # datasheet's "input offset voltage" is quoted in).
+        #
+        # Voltage noise (Stage 9.7) inserts one more series term ahead of the
+        # offset source, so V(inp_i) = V(in+) + vn + vos. Everything else in
+        # the macromodel is a B-source, an E/G controlled source or an
+        # independent source -- all of which ngspice treats as NOISELESS -- so
+        # without this the model's only noise is rout's own 4kTR.
+        os_neg = self._emit_opamp_vnoise(ref, in_plus, params)
+        self.spice_circuit.V(f"{ref}_os", inp_i, os_neg, params["vos"] @ u_V)
+        self.spice_circuit.R(f"{ref}_in", inp_i, in_minus, params["rin"])
+        self._emit_opamp_inoise(ref, inp_i, in_minus, params)
+        drive = f"{self._fmt_num(gm)}*V({inp_i},{in_minus})"
+        if ilim is not None:
+            drive = (
+                f"min(max({drive}, {self._fmt_num(-ilim)}), {self._fmt_num(ilim)})"
+            )
+        self.spice_circuit.raw_spice += f"\nB{ref}_gm {gnd} {p1} I = {drive}"
+        self.spice_circuit.R(f"{ref}_p1", p1, gnd, rp1)
+        self.spice_circuit.C(f"{ref}_p1", p1, gnd, cp1)
+
+        px = p1
+        fp2 = float(params.get("fp2") or 0.0)
+        if fp2 > 0:
+            # Buffered so the second RC does not load the dominant pole.
+            p2a, p2 = f"{ref}_p2a", f"{ref}_p2"
+            cp2 = 1e-9
+            rp2 = 1.0 / (2.0 * math.pi * fp2 * cp2)
+            self.spice_circuit.VCVS(f"{ref}_b2", p2a, gnd, p1, gnd, 1.0)
+            self.spice_circuit.R(f"{ref}_p2", p2a, p2, rp2)
+            self.spice_circuit.C(f"{ref}_p2", p2, gnd, cp2)
+            px = p2
+
+        hi, lo = self._opamp_clamp_expressions(ref, params, vpos, vneg)
+        if hi is None:
+            expr = f"V({px})"
+            clamped = False
+        else:
+            expr = f"min(max(V({px}), {lo}), {hi})"
+            clamped = True
+        self.spice_circuit.raw_spice += f"\nB{ref}_out {o0} {gnd} V = {expr}"
+        self.spice_circuit.R(f"{ref}_out", o0, out, params["rout"])
+
+        logger.debug(
+            f"Added op-amp {ref} (OPAMP macromodel: aol={aol:g}, "
+            f"gbw={self._fmt_hz(gbw)}, sr={sr:g} V/s, RP1={rp1:g}, CP1={cp1:g}, "
+            f"ILIM={ilim}, clamped={clamped}): out={out}, in+={in_plus}, "
+            f"in-={in_minus}"
+        )
+        return clamped
+
+    @classmethod
+    def _opamp_noise_resistance(cls, density: float) -> float:
+        """The resistance whose thermal noise is ``density`` V/sqrt(Hz).
+
+        ``R = en^2 / (4*k*T)`` -- the Johnson-Nyquist relation read backwards.
+        18 nV/sqrt(Hz) at 25 C is 19.68 kohm.
+        """
+        return (density ** 2) / (4.0 * cls._BOLTZMANN * cls._OPAMP_NOISE_TREF)
+
+    def _emit_opamp_vnoise(self, ref, in_plus, params):
+        """Insert the ``en`` generator in series with the + input.
+
+        Returns the node the offset source's negative terminal must sit on --
+        ``in_plus`` itself when ``en`` is unset, so an unset ``en`` emits
+        **nothing** and the deck stays byte-identical to the pre-9.7 one.
+
+        .. rubric:: Mechanism -- a noisy resistor read by a noiseless source
+
+        ngspice generates thermal noise for *resistors*; the macromodel is
+        otherwise built from B/E/G and independent sources, every one of which
+        is silent under ``.noise``. So the generator is a resistor sized by
+        :meth:`_opamp_noise_resistance` sitting alone on a private node, sensed
+        by a **gain-1 VCVS** that adds its voltage into the input chain::
+
+            R{ref}_nv   {ref}_nv  0                 en^2/(4kT)
+            E{ref}_nv   {ref}_nvi in+  {ref}_nv  0  1.0
+
+        Three invariants this wiring keeps, and the reason the resistor is not
+        simply put in series in the input path instead:
+
+        * **no DC shift** -- ``{ref}_nv`` carries no source, so it sits at 0 V;
+        * **no signal loading** -- a VCVS's controlling port draws no current,
+          so nothing is drawn from ``in+`` and no impedance is added to it (a
+          series resistor would add ``R`` to the source impedance, which on the
+          LM358 profile's 2 Mohm ``rin`` is a 1 % divider error);
+        * **unity signal gain** -- the inserted source is gain 1, so the
+          signal path is arithmetically unchanged.
+
+        The addition is **smooth and linear**, which is deliberate: the
+        Stage 9.6 measured negative (a discontinuous B-source function reading
+        another node's voltage defeats ngspice's DC solve inside a feedback
+        loop) does not reach it.
+        """
+        en = params.get("en")
+        if en is None:
+            return in_plus
+        en = float(en)
+        if en <= 0:
+            logger.warning(
+                f"Op-amp {ref}: en={en:g} is not positive; emitting no voltage-"
+                f"noise generator (a zero-noise op-amp is the default already, "
+                f"and a negative density has no resistor)"
+            )
+            return in_plus
+        gnd = self.spice_circuit.gnd
+        nv, nvi = f"{ref}_nv", f"{ref}_nvi"
+        rn = self._opamp_noise_resistance(en)
+        self.spice_circuit.R(f"{ref}_nv", nv, gnd, rn)
+        self.spice_circuit.VCVS(f"{ref}_nv", nvi, in_plus, nv, gnd, 1.0)
+        logger.debug(
+            f"Op-amp {ref}: en={en:g} V/rtHz -> R{ref}_nv = {rn:g} ohm "
+            f"at T={self._OPAMP_NOISE_TREF:g} K"
+        )
+        return nvi
+
+    def _emit_opamp_inoise(self, ref, inp_i, in_minus, params):
+        """Emit the ``inoise`` input current-noise generator, if asked for.
+
+        Same trick one rung along: a **fixed** 1 kohm on a private node is the
+        noise source, and a VCCS scaled by ``inoise / sqrt(4kT*1k)`` turns its
+        voltage noise into a current injected across the input pair. The
+        resistor is fixed rather than solved so the emitted value stays in a
+        numerically comfortable range across the fA..pA span real parts cover.
+
+        Polarity is deliberately the same current into ``in+`` as out of
+        ``in-``: a datasheet's input current noise is a differential-mode
+        figure, and this is the form that develops ``inoise * R_source`` across
+        the feedback network the way the closed-form budget expects.
+
+        Emits nothing when ``inoise`` is unset (byte-identity).
+        """
+        inoise = params.get("inoise")
+        if inoise is None:
+            return
+        inoise = float(inoise)
+        if inoise <= 0:
+            logger.warning(
+                f"Op-amp {ref}: inoise={inoise:g} is not positive; emitting no "
+                f"current-noise generator"
+            )
+            return
+        gnd = self.spice_circuit.gnd
+        ni = f"{ref}_ni"
+        r_ref = 1e3
+        self.spice_circuit.R(f"{ref}_ni", ni, gnd, r_ref)
+        gain = inoise / math.sqrt(
+            4.0 * self._BOLTZMANN * self._OPAMP_NOISE_TREF * r_ref
+        )
+        # VCCS(name, out+, out-, ctrl+, ctrl-, transconductance): current flows
+        # from out+ through the source to out-, i.e. INTO in_minus and OUT of
+        # inp_i, so the pair sees a differential noise current.
+        self.spice_circuit.VCCS(f"{ref}_ni", inp_i, in_minus, ni, gnd, gain)
+        logger.debug(
+            f"Op-amp {ref}: inoise={inoise:g} A/rtHz -> G{ref}_ni gain "
+            f"{gain:g} S across a {r_ref:g} ohm reference"
+        )
+
+    def _dc_rail_voltage(self, node) -> Optional[float]:
+        """DC volts on ``node``, if a constant source drives it against ground.
+
+        Scans the source circuit for an independent DC voltage source with one
+        terminal on ``node`` and the other on ground, and returns its value with
+        the sign the node actually sits at (a -15 V rail is usually drawn as a
+        15 V source wired ground-to-rail, which returns -15.0).
+
+        ``None`` when the node is driven by anything else -- a regulator output,
+        a divider, another macromodel. The caller must then not pretend to know
+        the rail.
+        """
+        gnd_names = {"0", str(self.spice_circuit.gnd)}
+        for component in self._iter_components():
+            if self._sim_excluded(component):
+                continue
+            if self._kind(component) != "voltage_source":
+                continue
+            symbol = (self._attr(component, "symbol", "") or "").upper()
+            if not symbol.endswith(":VDC") and not symbol.endswith("VDC"):
+                continue  # only a constant source has a single DC value
+            nodes = self._get_component_nodes(component)
+            if len(nodes) < 2:
+                continue
+            plus, minus = str(nodes[0]), str(nodes[1])
+            # A source's value is normally written with its unit ("15V", "3.3v")
+            # -- ngspice tolerates that, but _parse_si_number reads the trailing
+            # 'v' as an SI prefix and gives up. Strip one trailing volt marker.
+            raw = self._attr(component, "value", None)
+            text = str(raw).strip() if raw is not None else ""
+            value = self._parse_si_number(text)
+            if value is None:
+                stripped = re.sub(r"(?i)\s*(volts?|v)$", "", text).strip()
+                if stripped != text:
+                    value = self._parse_si_number(stripped)
+            if value is None:
+                continue
+            if plus == str(node) and minus in gnd_names:
+                return float(value)
+            if minus == str(node) and plus in gnd_names:
+                return -float(value)
+        return None
+
+    def _opamp_clamp_expressions(self, ref, params, vpos, vneg):
+        """``(hi_expr, lo_expr)`` for the output clamp, or ``(None, None)``.
+
+        .. rubric:: Why the rails are resolved to NUMBERS here
+
+        The obvious expression -- ``min(max(V(px), V(vneg)+vol), V(vpos)-voh)``,
+        reading the rails live -- **does not solve a DC operating point** in
+        ngspice-shared once the op-amp sits in a feedback loop. Measured
+        2026-08-09 on a unity-gain follower, holding everything else fixed:
+
+        =========================================  =======
+        clamp expression                           ``.op``
+        =========================================  =======
+        ``V(p1)`` (no clamp)                       solves
+        ``min(max(V(p1), -13.5), 13.5)``           solves
+        ``min(V(p1), V(vpos)-1.5)``                FAILS
+        ``min(max(V(p1), V(vneg)+1.5), 13.5)``     FAILS
+        same, with the two-arg ``V(a,b)`` form     FAILS
+        ternary ``(a > b) ? .. : ..`` on nodes     FAILS
+        ``tanh(...)`` of the same node voltages    solves
+        =========================================  =======
+
+        So it is not parsing and not the nesting: a **discontinuous** function
+        (min/max/ternary) whose argument depends on another node's voltage
+        defeats the DC solver, while a smooth function of the same nodes is
+        fine. (``.tran`` solves either way, which is how the open-loop bench
+        passed while the follower's ``.op`` did not.) A smooth soft-clip was
+        rejected as the fix: any tanh sharp enough to reach the rail compresses
+        signals well below it, and this bench measures gain accuracy.
+
+        The clamp is therefore built from constants. Order: the DC value of a
+        constant source driving each supply pin; failing that the explicit
+        ``vclamp_hi``/``vclamp_lo`` params; failing that **no clamp at all**,
+        loudly. Guessing a rail would put a fabricated saturation level into a
+        measurement.
+
+        ⚠ Known limitation, and the price of the above: the clamp is fixed at
+        emission, so a rail that sags under load, or one generated by another
+        model in the same deck, does not move it. Such a rail resolves to
+        ``None`` and yields no clamp rather than a wrong one.
+        """
+        voh, vol = float(params["voh"]), float(params["vol"])
+        if vpos is not None and vneg is not None:
+            v_hi = self._dc_rail_voltage(vpos)
+            v_lo = self._dc_rail_voltage(vneg)
+            if v_hi is not None and v_lo is not None:
+                return (
+                    self._fmt_num(v_hi - voh),
+                    self._fmt_num(v_lo + vol),
+                )
+            logger.warning(
+                f"Op-amp {ref}: supply pins are wired (V+={vpos}, V-={vneg}) but "
+                f"their DC values could not be resolved from a constant source "
+                f"(V+={v_hi}, V-={v_lo}). ngspice cannot solve a DC operating "
+                f"point through a min/max clamp that reads a node voltage, so no "
+                f"clamp is emitted. Drive the rails with Simulation_SPICE:VDC, or "
+                f'set Sim.Params="vclamp_hi=.. vclamp_lo=.." explicitly.'
+            )
+        hi, lo = params.get("vclamp_hi"), params.get("vclamp_lo")
+        if hi is not None and lo is not None:
+            return self._fmt_num(float(hi)), self._fmt_num(float(lo))
+        if vpos is None or vneg is None:
+            logger.warning(
+                f"Op-amp {ref}: supply pins not both resolved "
+                f"(V+={vpos}, V-={vneg}) and no vclamp_hi/vclamp_lo given -- "
+                f"emitting an UNCLAMPED output. Wire the supply pins or set "
+                f'Sim.Params="vclamp_hi=.. vclamp_lo=.." to get rail saturation.'
+            )
+        return None, None
+
+    # ------------------------------------------------------------------ #
     # Linear regulators / LDOs: Tier-A behavioral macromodel (Stage 20.1) #
     # ------------------------------------------------------------------ #
 
@@ -2146,6 +2829,12 @@ class SpiceConverter:
         micro -- unlike the resistor-value parser, mega/kilo-scale regulator params
         are nonsensical here, so this small dedicated parser keeps ``m`` unambiguous.
         Plain decimals pass straight through. Returns None if unparseable.
+
+        ``g`` (giga) and ``t`` (tera) were added for the op-amp macromodel, whose
+        parameter set genuinely reaches that far -- an LT1364's 1000 V/us slew
+        rate is ``sr=1G`` and a FET input's resistance is ``rin=1T``. Purely
+        additive: both suffixes previously returned None and fell back to a
+        default, so no input that parsed before parses differently now.
         """
         if raw is None:
             return None
@@ -2160,6 +2849,8 @@ class SpiceConverter:
         if not m:
             return None
         mult = {
+            "t": 1e12,
+            "g": 1e9,
             "k": 1e3,
             "meg": 1e6,
             "m": 1e-3,

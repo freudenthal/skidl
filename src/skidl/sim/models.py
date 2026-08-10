@@ -577,44 +577,12 @@ def get_model_library() -> ModelLibrary:
     return MODEL_LIBRARY
 
 
-# Example: How to add manufacturer-specific models
-def load_manufacturer_models():
-    """Example of loading manufacturer-specific SPICE models."""
-
-    # TI Op-Amp Models
-    MODEL_LIBRARY.add_model(
-        SpiceModel(
-            name="LM358",
-            model_type="OPAMP",
-            parameters={
-                "GAIN": 100000,
-                "RIN": 2e6,
-                "ROUT": 75,
-                "GBW": 1e6,  # Gain-bandwidth product
-                "SR": 0.5e6,  # Slew rate V/s
-            },
-            description="Dual operational amplifier",
-            manufacturer="Texas Instruments",
-            datasheet_url="https://www.ti.com/lit/ds/symlink/lm358.pdf",
-        )
-    )
-
-    # STMicroelectronics Models
-    MODEL_LIBRARY.add_model(
-        SpiceModel(
-            name="STM32_GPIO",
-            model_type="DIGITAL",
-            parameters={
-                "VOH": 3.3,
-                "VOL": 0,
-                "IOH": 20e-3,
-                "IOL": 20e-3,
-                "CIN": 5e-12,
-            },
-            description="STM32 GPIO pin model",
-            manufacturer="STMicroelectronics",
-        )
-    )
+# Removed (Stage 9.6): ``load_manufacturer_models()``, an "example" loader that
+# nothing ever called. Its single OPAMP row (LM358) was the only OPAMP-typed
+# entry in this library, which is what made ``_opamp_gbw``'s library tier
+# unreachable in practice -- op-amp datasheet parameters now live in
+# ``converter.OPAMP_PROFILES``, with ``manufacturer_models.py``'s rows consulted
+# as a second tier. A dead path that looks live is worse than no path.
 
 
 # Resources for finding SPICE models:

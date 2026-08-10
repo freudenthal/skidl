@@ -41,6 +41,7 @@ __all__ = [
     "SpiceConverter",
     "CircuitSimulator",
     "SimulationResult",
+    "NoiseResult",
     "SimulationValidationError",
 ]
 
@@ -56,8 +57,9 @@ def simulate(circuit=None, compat=None):
 
     Returns:
         A ``CircuitSimulator`` exposing ``operating_point`` / ``dc_analysis`` /
-        ``ac_analysis`` / ``transient_analysis`` and the ``SimulationResult``
-        measurement helpers. Requires PySpice + a loadable ngspice.
+        ``ac_analysis`` / ``transient_analysis`` / ``noise_analysis`` and the
+        ``SimulationResult`` (``NoiseResult`` for ``.noise``) measurement
+        helpers. Requires PySpice + a loadable ngspice.
     """
     from .simulator import CircuitSimulator
 
@@ -71,7 +73,7 @@ def __getattr__(name):
         from . import converter
 
         return getattr(converter, name)
-    if name in ("CircuitSimulator", "SimulationResult"):
+    if name in ("CircuitSimulator", "SimulationResult", "NoiseResult"):
         from . import simulator
 
         return getattr(simulator, name)
